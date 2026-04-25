@@ -103,30 +103,273 @@ module ddr4_phy #(
     output wire                             o_idelayctrl_rdy
 );
 
+    // Command word bit-field positions (must match controller)
+    localparam CMD_LEN     = 29;
+    localparam CMD_CS_N    = 28,
+               CMD_ACT_N   = 27,
+               CMD_RAS_N   = 26,
+               CMD_CAS_N   = 25,
+               CMD_WE_N    = 24,
+               CMD_ODT     = 23,
+               CMD_CKE     = 22,
+               CMD_RESET_N = 21,
+               CMD_BG_START = 20,
+               CMD_BA_START = 18;
+
     // ═══════════════════════════════════════════════════════════════════
-    // Stub: wire output defaults
+    // §5 — Synchronous Reset
+    // 2-FF synchronizer: i_rst_n (async, active-low) → sync_rst (sync, active-high)
+    // Per UG571 §7.6: all SERDES/delay primitives share this reset.
+    // IDELAYCTRL reset is released separately (see §14).
     // ═══════════════════════════════════════════════════════════════════
-    assign o_dfi_init_complete  = 1'b0;
+    reg [1:0] rst_sync_q;
+    wire sync_rst;
+
+    always @(posedge i_ddr4_clk or negedge i_rst_n) begin
+        if (!i_rst_n)
+            rst_sync_q <= 2'b11;
+        else
+            rst_sync_q <= {rst_sync_q[0], 1'b0};
+    end
+    assign sync_rst = rst_sync_q[1];
+
+    // IDELAYCTRL reset: released after SERDES/delay primitives
+    reg [2:0] idelayctrl_rst_pipe_q;
+    wire idelayctrl_rst;
+
+    always @(posedge i_ref_clk or negedge i_rst_n) begin
+        if (!i_rst_n)
+            idelayctrl_rst_pipe_q <= 3'b111;
+        else
+            idelayctrl_rst_pipe_q <= {idelayctrl_rst_pipe_q[1:0], sync_rst};
+    end
+    assign idelayctrl_rst = idelayctrl_rst_pipe_q[2];
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Stubs: training request outputs (Phase 7), DM output (Phase 6)
+    // ═══════════════════════════════════════════════════════════════════
     assign o_dfi_rdlvl_req     = 1'b0;
     assign o_dfi_rdlvl_gate_req = 1'b0;
     assign o_dfi_wrlvl_req     = 1'b0;
-    assign o_idelayctrl_rdy    = 1'b0;
+    assign o_ddr4_dm_n         = {BYTE_LANES{1'b1}};
 
-    // DDR4 pins — idle/safe state
-    assign o_ddr4_ck_p    = 1'b0;
-    assign o_ddr4_ck_n    = 1'b1;
-    assign o_ddr4_reset_n = 1'b0;    //held in reset
-    assign o_ddr4_cke     = 1'b0;
-    assign o_ddr4_cs_n    = 1'b1;    //deselected
-    assign o_ddr4_act_n   = 1'b1;
-    assign o_ddr4_addr    = {17{1'b0}};
-    assign o_ddr4_ba      = {BA_BITS{1'b0}};
-    assign o_ddr4_bg      = {BG_BITS{1'b0}};
-    assign o_ddr4_odt     = 1'b0;
-    assign o_ddr4_dm_n    = {BYTE_LANES{1'b1}}; //mask off (high = no mask)
+    // dfi_init_complete: asserted when IDELAYCTRL is ready
+    wire idelayctrl_rdy_w;
+    assign o_dfi_init_complete = idelayctrl_rdy_w;
+    assign o_idelayctrl_rdy   = idelayctrl_rdy_w;
 
     // ═══════════════════════════════════════════════════════════════════
-    // Stub: reg output defaults (reset only)
+    // §6 — Clock Output Path
+    // OSERDESE3 (DATA_WIDTH=8, constant 01010101 toggle) → OBUFDS → CK/CK#
+    // ═══════════════════════════════════════════════════════════════════
+    wire ck_oserdes_out;
+
+    OSERDESE3 #(
+        .DATA_WIDTH(8),
+        .INIT(1'b0),
+        .IS_CLKDIV_INVERTED(1'b0),
+        .IS_CLK_INVERTED(1'b0),
+        .IS_RST_INVERTED(1'b0),
+        .SIM_DEVICE("ULTRASCALE_PLUS")
+    ) oserdes_ck (
+        .D(8'b01_01_01_01),
+        .OQ(ck_oserdes_out),
+        .T_OUT(),
+        .CLK(i_ddr4_clk),
+        .CLKDIV(i_controller_clk),
+        .RST(sync_rst),
+        .T(1'b0)
+    );
+
+    OBUFDS ck_buf (
+        .I(ck_oserdes_out),
+        .O(o_ddr4_ck_p),
+        .OB(o_ddr4_ck_n)
+    );
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §7 — Command/Address Output Path
+    // Each CA pin: OSERDESE3 (SDR 4:1, DATA_WIDTH=8) → OBUF
+    // D = {slot3, slot3, slot2, slot2, slot1, slot1, slot0, slot0}
+    // D[0] is transmitted first (UG571 Table 2-8)
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Pack DFI command inputs into per-slot command words for easy bit extraction
+    wire [CMD_LEN-1:0] dfi_cmd [3:0];
+
+    generate
+        genvar slot;
+        for (slot = 0; slot < 4; slot = slot + 1) begin : pack_cmd
+            assign dfi_cmd[slot] = {
+                i_dfi_cs_n[slot],
+                i_dfi_act_n[slot],
+                i_dfi_ras_n[slot],
+                i_dfi_cas_n[slot],
+                i_dfi_we_n[slot],
+                i_dfi_odt[slot],
+                i_dfi_cke[slot],
+                i_dfi_reset_n[slot],
+                i_dfi_bg[BG_BITS*slot +: BG_BITS],
+                i_dfi_bank[BA_BITS*slot +: BA_BITS],
+                i_dfi_address[17*slot +: 17]
+            };
+        end
+    endgenerate
+
+    // Address pins A[16:0]
+    generate
+        genvar abit;
+        for (abit = 0; abit < 17; abit = abit + 1) begin : gen_addr
+            wire addr_oserdes_out;
+
+            OSERDESE3 #(
+                .DATA_WIDTH(8),
+                .INIT(1'b0),
+                .IS_CLKDIV_INVERTED(1'b0),
+                .IS_CLK_INVERTED(1'b0),
+                .IS_RST_INVERTED(1'b0),
+                .SIM_DEVICE("ULTRASCALE_PLUS")
+            ) oserdes_addr (
+                .D({dfi_cmd[3][abit], dfi_cmd[3][abit],
+                    dfi_cmd[2][abit], dfi_cmd[2][abit],
+                    dfi_cmd[1][abit], dfi_cmd[1][abit],
+                    dfi_cmd[0][abit], dfi_cmd[0][abit]}),
+                .OQ(addr_oserdes_out),
+                .T_OUT(),
+                .CLK(i_ddr4_clk),
+                .CLKDIV(i_controller_clk),
+                .RST(sync_rst),
+                .T(1'b0)
+            );
+
+            OBUF addr_buf (.I(addr_oserdes_out), .O(o_ddr4_addr[abit]));
+        end
+    endgenerate
+
+    // Bank address BA[BA_BITS-1:0]
+    generate
+        genvar babit;
+        for (babit = 0; babit < BA_BITS; babit = babit + 1) begin : gen_ba
+            wire ba_oserdes_out;
+
+            OSERDESE3 #(
+                .DATA_WIDTH(8),
+                .INIT(1'b0),
+                .IS_CLKDIV_INVERTED(1'b0),
+                .IS_CLK_INVERTED(1'b0),
+                .IS_RST_INVERTED(1'b0),
+                .SIM_DEVICE("ULTRASCALE_PLUS")
+            ) oserdes_ba (
+                .D({dfi_cmd[3][CMD_BA_START-babit], dfi_cmd[3][CMD_BA_START-babit],
+                    dfi_cmd[2][CMD_BA_START-babit], dfi_cmd[2][CMD_BA_START-babit],
+                    dfi_cmd[1][CMD_BA_START-babit], dfi_cmd[1][CMD_BA_START-babit],
+                    dfi_cmd[0][CMD_BA_START-babit], dfi_cmd[0][CMD_BA_START-babit]}),
+                .OQ(ba_oserdes_out),
+                .T_OUT(),
+                .CLK(i_ddr4_clk),
+                .CLKDIV(i_controller_clk),
+                .RST(sync_rst),
+                .T(1'b0)
+            );
+
+            OBUF ba_buf (.I(ba_oserdes_out), .O(o_ddr4_ba[babit]));
+        end
+    endgenerate
+
+    // Bank group BG[BG_BITS-1:0]
+    generate
+        genvar bgbit;
+        for (bgbit = 0; bgbit < BG_BITS; bgbit = bgbit + 1) begin : gen_bg
+            wire bg_oserdes_out;
+
+            OSERDESE3 #(
+                .DATA_WIDTH(8),
+                .INIT(1'b0),
+                .IS_CLKDIV_INVERTED(1'b0),
+                .IS_CLK_INVERTED(1'b0),
+                .IS_RST_INVERTED(1'b0),
+                .SIM_DEVICE("ULTRASCALE_PLUS")
+            ) oserdes_bg (
+                .D({dfi_cmd[3][CMD_BG_START-bgbit], dfi_cmd[3][CMD_BG_START-bgbit],
+                    dfi_cmd[2][CMD_BG_START-bgbit], dfi_cmd[2][CMD_BG_START-bgbit],
+                    dfi_cmd[1][CMD_BG_START-bgbit], dfi_cmd[1][CMD_BG_START-bgbit],
+                    dfi_cmd[0][CMD_BG_START-bgbit], dfi_cmd[0][CMD_BG_START-bgbit]}),
+                .OQ(bg_oserdes_out),
+                .T_OUT(),
+                .CLK(i_ddr4_clk),
+                .CLKDIV(i_controller_clk),
+                .RST(sync_rst),
+                .T(1'b0)
+            );
+
+            OBUF bg_buf (.I(bg_oserdes_out), .O(o_ddr4_bg[bgbit]));
+        end
+    endgenerate
+
+    // Single-bit control pins: CS_n, ACT_n, CKE, ODT, RESET_n
+    // Helper macro pattern: OSERDESE3 → OBUF for a single command-word bit
+    generate
+        genvar cpin;
+        for (cpin = 0; cpin < 5; cpin = cpin + 1) begin : gen_ctrl
+            localparam integer CTRL_BIT = (cpin == 0) ? CMD_CS_N :
+                                          (cpin == 1) ? CMD_ACT_N :
+                                          (cpin == 2) ? CMD_CKE :
+                                          (cpin == 3) ? CMD_ODT :
+                                                        CMD_RESET_N;
+
+            wire ctrl_oserdes_out;
+
+            OSERDESE3 #(
+                .DATA_WIDTH(8),
+                .INIT((cpin == 0) ? 1'b1 : // CS_n idles high
+                      (cpin == 1) ? 1'b1 : // ACT_n idles high
+                                    1'b0),
+                .IS_CLKDIV_INVERTED(1'b0),
+                .IS_CLK_INVERTED(1'b0),
+                .IS_RST_INVERTED(1'b0),
+                .SIM_DEVICE("ULTRASCALE_PLUS")
+            ) oserdes_ctrl (
+                .D({dfi_cmd[3][CTRL_BIT], dfi_cmd[3][CTRL_BIT],
+                    dfi_cmd[2][CTRL_BIT], dfi_cmd[2][CTRL_BIT],
+                    dfi_cmd[1][CTRL_BIT], dfi_cmd[1][CTRL_BIT],
+                    dfi_cmd[0][CTRL_BIT], dfi_cmd[0][CTRL_BIT]}),
+                .OQ(ctrl_oserdes_out),
+                .T_OUT(),
+                .CLK(i_ddr4_clk),
+                .CLKDIV(i_controller_clk),
+                .RST(sync_rst),
+                .T(1'b0)
+            );
+
+            // Output buffer — connect to the right pin
+            if (cpin == 0) begin : cs_buf
+                OBUF obuf_cs (.I(ctrl_oserdes_out), .O(o_ddr4_cs_n));
+            end else if (cpin == 1) begin : act_buf
+                OBUF obuf_act (.I(ctrl_oserdes_out), .O(o_ddr4_act_n));
+            end else if (cpin == 2) begin : cke_buf
+                OBUF obuf_cke (.I(ctrl_oserdes_out), .O(o_ddr4_cke));
+            end else if (cpin == 3) begin : odt_buf
+                OBUF obuf_odt (.I(ctrl_oserdes_out), .O(o_ddr4_odt));
+            end else begin : rst_buf
+                OBUF obuf_rst (.I(ctrl_oserdes_out), .O(o_ddr4_reset_n));
+            end
+        end
+    endgenerate
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §14 — IDELAYCTRL
+    // Required for IDELAYE3/ODELAYE3 in TIME mode (UG571).
+    // Reset released after SERDES primitives per UG571 §7.6.
+    // ═══════════════════════════════════════════════════════════════════
+    (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
+    IDELAYCTRL idelayctrl_inst (
+        .REFCLK(i_ref_clk),
+        .RST(idelayctrl_rst),
+        .RDY(idelayctrl_rdy_w)
+    );
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Stub: reg output defaults (Phase 6+ fills in data path)
     // ═══════════════════════════════════════════════════════════════════
     always @(posedge i_controller_clk) begin
         if (!i_rst_n) begin
@@ -135,7 +378,8 @@ module ddr4_phy #(
             o_dfi_rdlvl_resp   <= {BYTE_LANES{1'b0}};
             o_dfi_wrlvl_resp   <= {BYTE_LANES{1'b0}};
         end else begin
-            // PHY logic goes here
+            // Phase 6: DQ/DQS data path
+            // Phase 7: Training FSM
         end
     end
 

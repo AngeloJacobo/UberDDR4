@@ -126,7 +126,38 @@ module ddr4_controller #(
                     CMD_WR   = 4'b1_100,
                     CMD_RD   = 4'b1_101,
                     CMD_NOP  = 4'b1_111,
-                    CMD_ZQCL = 4'b1_110;
+                    CMD_ZQCL = 4'b1_110,
+                    CMD_DES  = 4'b1_111; //same as NOP, cs_n=1 makes it DES
+
+    // ROM control field: {RST_DONE, USE_TIMER, A10, CKE, RESET_N}
+    localparam[4:0] CTL_CKE0_RST0 = 5'b01000, //power-on: CKE=0, RESET_n=0
+                    CTL_CKE0_RST1 = 5'b01001, //pre-CKE: CKE=0, RESET_n=1
+                    CTL_TIMER     = 5'b01011, //normal: CKE=1, RESET_n=1
+                    CTL_TIMER_A10 = 5'b01111, //+ A10=1: PRE ALL, ZQCL
+                    CTL_DONE      = 5'b11011; //RST_DONE: init complete
+
+    // ROM instruction bit fields (32 bits)
+    localparam ROM_RST_DONE  = 31,
+               ROM_USE_TIMER = 30,
+               ROM_A10       = 29,
+               ROM_CKE       = 28,
+               ROM_RESET_N   = 27;
+    //bits [26:23] = CMD, [22:20] = MRS_SELECT, [19:0] = timer/addr
+
+    // Named ROM address constants
+    localparam[5:0] ROM_ADDR_RD_CAL    = 22,
+                    ROM_ADDR_WL_CAL    = 27,
+                    ROM_ADDR_NORMAL    = 32,
+                    ROM_ADDR_REF_START = 33,
+                    ROM_ADDR_REF_END   = 35;
+
+    // MRS select — {BG0, BA1, BA0}
+    localparam[2:0] MRS_MR0 = 3'b000, MRS_MR1 = 3'b001, MRS_MR2 = 3'b010,
+                    MRS_MR3 = 3'b011, MRS_MR4 = 3'b100, MRS_MR5 = 3'b101,
+                    MRS_MR6 = 3'b110;
+
+    // Calibration window delay — large enough for training FSM
+    localparam integer CALIBRATION_DELAY = 1000;
 
     // Packed command word bit-field positions (29 bits, see PLAN §6.4)
     localparam CMD_CS_N     = 28,
@@ -413,14 +444,22 @@ module ddr4_controller #(
     // Packed command slots (internal, decomposed to DFI in §12)
     reg[CMD_LEN-1:0] cmd_d [SERDES_RATIO-1:0];
 
-    // ROM / init sequence (logic added in Phase 2)
+    // ROM / init sequence
+    reg[5:0] instruction_address;
     reg[DELAY_COUNTER_WIDTH-1:0] delay_counter;
     reg delay_counter_is_zero;
     reg pause_counter;
+    wire[31:0] rom_instruction;
+    wire rom_cmd_is_mrs;
+    wire rom_use_timer;
+
+    assign rom_instruction = read_rom_instruction(instruction_address);
+    assign rom_cmd_is_mrs  = (rom_instruction[26:23] == CMD_MRS);
+    assign rom_use_timer   = rom_instruction[ROM_USE_TIMER];
 
     // ── Static outputs (Phase 1 stubs) ──
     assign o_wb_ack = 1'b0; // driven by read ACK pipeline in Phase 5
-    assign o_dfi_init_start = 1'b0; // driven by ROM controller in Phase 2
+    assign o_dfi_init_start = ~reset_done; // request PHY init until ROM completes
     assign o_calib_complete = 1'b0; // driven by training pump in Phase 7
     assign o_calib_error = 1'b0;
 
@@ -452,6 +491,7 @@ module ddr4_controller #(
             o_wb_stall <= 1'b1;
             o_wb_data  <= {WB_DATA_BITS{1'b0}};
             reset_done <= 1'b0;
+            instruction_address <= 6'd0;
             bank_status_q <= {NUM_BANKS{1'b0}};
             delay_counter <= {DELAY_COUNTER_WIDTH{1'b0}};
             delay_counter_is_zero <= 1'b1;
@@ -469,12 +509,180 @@ module ddr4_controller #(
                 rrd_counter_q[bank_i] <= 0;
             end
         end else begin
-            // Phase 2: ROM controller + DFI mapping
+            // ═══════════════════════════════════════════════════════════
+            // §11 — Command Scheduler Placeholder (NOP defaults)
+            // All 4 slots default to DES (cs_n=1, NOP encoding).
+            // The ROM controller or scheduler overrides specific slots.
+            // ═══════════════════════════════════════════════════════════
+            for (bank_i = 0; bank_i < SERDES_RATIO; bank_i = bank_i + 1) begin
+                cmd_d[bank_i] <= {
+                    1'b1,       //cs_n = 1 (deselected)
+                    CMD_NOP,    //{act_n=1, ras_n=1, cas_n=1, we_n=1}
+                    1'b0,       //odt
+                    reset_done ? 1'b1 : rom_instruction[ROM_CKE],     //cke
+                    reset_done ? 1'b1 : rom_instruction[ROM_RESET_N], //reset_n
+                    2'b00,      //bg
+                    2'b00,      //ba
+                    17'b0       //addr
+                };
+            end
+
+            // ═══════════════════════════════════════════════════════════
+            // §10 — ROM Controller
+            // Drives init sequence: instruction_address advances when
+            // delay_counter expires and pause_counter is not set.
+            // ═══════════════════════════════════════════════════════════
+            if (!reset_done) begin
+                // Delay counter management
+                if (!delay_counter_is_zero) begin
+                    delay_counter <= delay_counter - 1'b1;
+                    delay_counter_is_zero <= (delay_counter == {{(DELAY_COUNTER_WIDTH-1){1'b0}}, 1'b1});
+                end else if (!pause_counter) begin
+                    // Issue the command from ROM on slot 0
+                    if (rom_cmd_is_mrs) begin
+                        // MRS: cs_n=0, CMD_MRS, bg/ba from MRS_SELECT, addr from instruction
+                        cmd_d[0] <= {
+                            1'b0,                        //cs_n = 0
+                            CMD_MRS,                     //{act_n=1, ras_n=0, cas_n=0, we_n=0}
+                            1'b0,                        //odt = 0
+                            1'b1,                        //cke = 1
+                            1'b1,                        //reset_n = 1
+                            1'b0, rom_instruction[22],   //bg[1:0] = {0, BG0}
+                            rom_instruction[21:20],      //ba[1:0]
+                            3'b000,                      //A16:A14 don't care for MRS
+                            rom_instruction[13:0]        //A13:A0 = MRS address
+                        };
+                    end else begin
+                        // Timer/command instruction
+                        cmd_d[0] <= {
+                            (rom_instruction[26:23] == CMD_DES) ? 1'b1 : 1'b0, //cs_n
+                            rom_instruction[26:23],      //cmd
+                            1'b0,                        //odt = 0
+                            rom_instruction[ROM_CKE],    //cke
+                            rom_instruction[ROM_RESET_N],//reset_n
+                            2'b00,                       //bg
+                            2'b00,                       //ba
+                            {6'b0, rom_instruction[ROM_A10], 10'b0} //A10 for PRE ALL, ZQCL
+                        };
+                    end
+
+                    // Load delay counter for timer instructions
+                    if (rom_use_timer) begin
+                        delay_counter <= rom_instruction[DELAY_COUNTER_WIDTH-1:0];
+                        delay_counter_is_zero <= (rom_instruction[DELAY_COUNTER_WIDTH-1:0] == 0);
+                    end
+
+                    // Check for RST_DONE
+                    if (rom_instruction[ROM_RST_DONE]) begin
+                        reset_done <= 1'b1;
+                    end
+
+                    // Advance instruction address
+                    if (instruction_address == ROM_ADDR_REF_END)
+                        instruction_address <= ROM_ADDR_REF_START;
+                    else
+                        instruction_address <= instruction_address + 1'b1;
+                end
+            end
             // Phase 4: Command scheduler + delay counters
             // Phase 5: Read ACK pipeline + refresh
             // Phase 7: Training command pump
+
+            // ═══════════════════════════════════════════════════════════
+            // §12 — DFI Signal Mapping
+            // Decompose packed cmd_d[] slots into flat DFI output vectors
+            // ═══════════════════════════════════════════════════════════
+            for (bank_i = 0; bank_i < SERDES_RATIO; bank_i = bank_i + 1) begin
+                o_dfi_cs_n[bank_i]    <= cmd_d[bank_i][CMD_CS_N];
+                o_dfi_act_n[bank_i]   <= cmd_d[bank_i][CMD_ACT_N];
+                o_dfi_ras_n[bank_i]   <= cmd_d[bank_i][CMD_RAS_N];
+                o_dfi_cas_n[bank_i]   <= cmd_d[bank_i][CMD_CAS_N];
+                o_dfi_we_n[bank_i]    <= cmd_d[bank_i][CMD_WE_N];
+                o_dfi_odt[bank_i]     <= cmd_d[bank_i][CMD_ODT];
+                o_dfi_cke[bank_i]     <= cmd_d[bank_i][CMD_CKE];
+                o_dfi_reset_n[bank_i] <= cmd_d[bank_i][CMD_RESET_N];
+                o_dfi_bg[BG_BITS*bank_i +: BG_BITS]   <= cmd_d[bank_i][CMD_BG_START:CMD_BG_START-(BG_BITS-1)];
+                o_dfi_bank[BA_BITS*bank_i +: BA_BITS]  <= cmd_d[bank_i][CMD_BA_START:CMD_BA_START-(BA_BITS-1)];
+                o_dfi_address[17*bank_i +: 17]         <= cmd_d[bank_i][16:0];
+            end
         end
     end
+
+    // ══════════════════════════════════════════════════════════════
+    // §9 — Reset/Refresh ROM
+    // 36 addresses (0–35): init sequence + calibration windows + refresh loop
+    // ══════════════════════════════════════════════════════════════
+
+    function [31:0] rom_timer(input [4:0] ctl, input [3:0] cmd, input integer timer);
+        rom_timer = {ctl, cmd, 3'b000, timer[19:0]};
+    endfunction
+
+    function [31:0] rom_mrs(input [2:0] mrs_sel, input [13:0] mrs_addr);
+        rom_mrs = {2'b00, mrs_addr[10], 2'b11, CMD_MRS, mrs_sel, 6'b0, mrs_addr};
+    endfunction
+
+    function [31:0] read_rom_instruction(input [5:0] addr);
+        case (addr)
+            6'd0:  read_rom_instruction = rom_timer(CTL_CKE0_RST0, CMD_NOP, ps_to_cycles(POWER_ON_RESET_HIGH_ps));
+            6'd1:  read_rom_instruction = rom_timer(CTL_CKE0_RST1, CMD_NOP, ps_to_cycles(INITIAL_CKE_LOW_ps));
+            6'd2:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_DES, ps_to_cycles(tXPR_ps));
+            6'd3:  read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_DIS);
+            6'd4:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
+            6'd5:  read_rom_instruction = rom_mrs  (MRS_MR6, MR6);
+            6'd6:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
+            6'd7:  read_rom_instruction = rom_mrs  (MRS_MR5, MR5);
+            6'd8:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
+            6'd9:  read_rom_instruction = rom_mrs  (MRS_MR4, MR4);
+            6'd10: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
+            6'd11: read_rom_instruction = rom_mrs  (MRS_MR2, MR2);
+            6'd12: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
+            6'd13: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_DIS);
+            6'd14: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
+            6'd15: read_rom_instruction = rom_mrs  (MRS_MR0, MR0);
+            6'd16: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));
+            6'd17: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_ZQCL, nCK_to_cycles(tZQinit_nCK));
+            6'd18: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tDLLK_nCK));
+            6'd19: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));
+            6'd20: read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_EN);
+            6'd21: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));
+            6'd22: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, CALIBRATION_DELAY);
+            6'd23: read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_DIS);
+            6'd24: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));
+            6'd25: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_EN);
+            6'd26: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tWLMRD_nCK));
+            6'd27: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, CALIBRATION_DELAY);
+            6'd28: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_DIS);
+            6'd29: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));
+            6'd30: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));
+            6'd31: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_REF, ps_to_cycles(tRFC_ps));
+            6'd32: read_rom_instruction = rom_timer(CTL_DONE,       CMD_NOP, 0);
+            6'd33: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));
+            6'd34: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_REF, ps_to_cycles(tRFC_ps));
+            6'd35: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tREFI_ps));
+            default: read_rom_instruction = rom_timer(CTL_TIMER, CMD_NOP, 0);
+        endcase
+    endfunction
+
+    // ══════════════════════════════════════════════════════════════
+    // §16 — Debug $display
+    // ══════════════════════════════════════════════════════════════
+`ifndef YOSYS
+    initial begin
+        $display("UberDDR4 Controller Configuration:");
+        $display("  CONTROLLER_CLK_PERIOD = %0d ps", CONTROLLER_CLK_PERIOD);
+        $display("  DDR4_CLK_PERIOD       = %0d ps", DDR4_CLK_PERIOD);
+        $display("  SERDES_RATIO          = %0d", SERDES_RATIO);
+        $display("  ROW_BITS=%0d COL_BITS=%0d BA_BITS=%0d BG_BITS=%0d DQ_BITS=%0d",
+                 ROW_BITS, COL_BITS, BA_BITS, BG_BITS, DQ_BITS);
+        $display("  BYTE_LANES=%0d DENSITY=%0d Gb", BYTE_LANES, DENSITY);
+        $display("  CL=%0d CWL=%0d WR=%0d", CL_nCK, CWL_nCK, WR_nCK);
+        $display("  READ_SLOT=%0d WRITE_SLOT=%0d ACT_SLOT=%0d PRE_SLOT=%0d",
+                 READ_SLOT, WRITE_SLOT, ACTIVATE_SLOT, PRECHARGE_SLOT);
+        $display("  ADDR_MAPPING=%0d WB_ADDR_BITS=%0d WB_DATA_BITS=%0d",
+                 ADDR_MAPPING, WB_ADDR_BITS, WB_DATA_BITS);
+        $display("  MICRON_SIM=%0d SKIP_CALIB=%0d", MICRON_SIM, SKIP_CALIB);
+    end
+`endif
 
     // ══════════════════════════════════════════════════════════════
     // §17 — Helper Functions
