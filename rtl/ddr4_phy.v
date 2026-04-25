@@ -260,10 +260,10 @@ module ddr4_phy #(
                 .IS_RST_INVERTED(1'b0),
                 .SIM_DEVICE("ULTRASCALE_PLUS")
             ) oserdes_ba (
-                .D({dfi_cmd[3][CMD_BA_START-babit], dfi_cmd[3][CMD_BA_START-babit],
-                    dfi_cmd[2][CMD_BA_START-babit], dfi_cmd[2][CMD_BA_START-babit],
-                    dfi_cmd[1][CMD_BA_START-babit], dfi_cmd[1][CMD_BA_START-babit],
-                    dfi_cmd[0][CMD_BA_START-babit], dfi_cmd[0][CMD_BA_START-babit]}),
+                .D({dfi_cmd[3][CMD_BA_START-(BA_BITS-1)+babit], dfi_cmd[3][CMD_BA_START-(BA_BITS-1)+babit],
+                    dfi_cmd[2][CMD_BA_START-(BA_BITS-1)+babit], dfi_cmd[2][CMD_BA_START-(BA_BITS-1)+babit],
+                    dfi_cmd[1][CMD_BA_START-(BA_BITS-1)+babit], dfi_cmd[1][CMD_BA_START-(BA_BITS-1)+babit],
+                    dfi_cmd[0][CMD_BA_START-(BA_BITS-1)+babit], dfi_cmd[0][CMD_BA_START-(BA_BITS-1)+babit]}),
                 .OQ(ba_oserdes_out),
                 .T_OUT(),
                 .CLK(i_ddr4_clk),
@@ -290,10 +290,10 @@ module ddr4_phy #(
                 .IS_RST_INVERTED(1'b0),
                 .SIM_DEVICE("ULTRASCALE_PLUS")
             ) oserdes_bg (
-                .D({dfi_cmd[3][CMD_BG_START-bgbit], dfi_cmd[3][CMD_BG_START-bgbit],
-                    dfi_cmd[2][CMD_BG_START-bgbit], dfi_cmd[2][CMD_BG_START-bgbit],
-                    dfi_cmd[1][CMD_BG_START-bgbit], dfi_cmd[1][CMD_BG_START-bgbit],
-                    dfi_cmd[0][CMD_BG_START-bgbit], dfi_cmd[0][CMD_BG_START-bgbit]}),
+                .D({dfi_cmd[3][CMD_BG_START-(BG_BITS-1)+bgbit], dfi_cmd[3][CMD_BG_START-(BG_BITS-1)+bgbit],
+                    dfi_cmd[2][CMD_BG_START-(BG_BITS-1)+bgbit], dfi_cmd[2][CMD_BG_START-(BG_BITS-1)+bgbit],
+                    dfi_cmd[1][CMD_BG_START-(BG_BITS-1)+bgbit], dfi_cmd[1][CMD_BG_START-(BG_BITS-1)+bgbit],
+                    dfi_cmd[0][CMD_BG_START-(BG_BITS-1)+bgbit], dfi_cmd[0][CMD_BG_START-(BG_BITS-1)+bgbit]}),
                 .OQ(bg_oserdes_out),
                 .T_OUT(),
                 .CLK(i_ddr4_clk),
