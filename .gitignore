@@ -1,0 +1,33 @@
+# Synthesis outputs
+*.bit
+*.bin
+*.mcs
+*.ltx
+*.dcp
+.Xil/
+
+# Simulation
+xsim.dir/
+*.jou
+*.log
+*.pb
+*.wdb
+*.str
+waves.shm/
+trace.vcd
+
+# Vivado project files
+*.xpr
+*.runs/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.sim/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
