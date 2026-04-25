@@ -168,8 +168,8 @@ module ddr4_controller #(
                CMD_ODT      = 23,
                CMD_CKE      = 22,
                CMD_RESET_N  = 21,
-               CMD_BG_START = 19, //bg[1:0] at [20:19]
-               CMD_BA_START = 17; //ba[1:0] at [18:17]
+               CMD_BG_START = 20, //bg[1:0] at [20:19]
+               CMD_BA_START = 18; //ba[1:0] at [18:17]
                //addr[16:0] at [16:0]
 
     /************************************************************
