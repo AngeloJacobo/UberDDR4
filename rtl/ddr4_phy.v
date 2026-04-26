@@ -188,18 +188,30 @@ module ddr4_phy #(
     );
 
     // ═══════════════════════════════════════════════════════════════════
-    // §7 — Command/Address Output Path
+    // §7 — Command/Address Output Path (DFI 3.1 §3.2, each ctrl cycle = 4 DDR4 UI)
     // Each CA pin: OSERDESE3 (SDR 4:1, DATA_WIDTH=8) → OBUF
     // D = {slot3, slot3, slot2, slot2, slot1, slot1, slot0, slot0}
     // D[0] is transmitted first (UG571 Table 2-8)
     // ═══════════════════════════════════════════════════════════════════
 
     // Pack DFI command inputs into per-slot command words for easy bit extraction
+    // DDR4 pin mux (JESD79-4D Table 35): physical pins A16/A15/A14 carry
+    // {RAS_n, CAS_n, WE_n} when ACT_n=1, or row address bits when ACT_n=0.
+    // The DFI interface keeps these as separate signals; the PHY muxes them
+    // onto the address bus here (UBERDDR4_PLAN §8.3, SPEC §2.3).
     wire [CMD_LEN-1:0] dfi_cmd [3:0];
 
     generate
         genvar slot;
         for (slot = 0; slot < 4; slot = slot + 1) begin : pack_cmd
+            wire [16:0] muxed_addr;
+            assign muxed_addr = {
+                i_dfi_act_n[slot] ? i_dfi_ras_n[slot] : i_dfi_address[17*slot + 16],
+                i_dfi_act_n[slot] ? i_dfi_cas_n[slot] : i_dfi_address[17*slot + 15],
+                i_dfi_act_n[slot] ? i_dfi_we_n[slot]  : i_dfi_address[17*slot + 14],
+                i_dfi_address[17*slot +: 14]
+            };
+
             assign dfi_cmd[slot] = {
                 i_dfi_cs_n[slot],
                 i_dfi_act_n[slot],
@@ -211,7 +223,7 @@ module ddr4_phy #(
                 i_dfi_reset_n[slot],
                 i_dfi_bg[BG_BITS*slot +: BG_BITS],
                 i_dfi_bank[BA_BITS*slot +: BA_BITS],
-                i_dfi_address[17*slot +: 17]
+                muxed_addr
             };
         end
     endgenerate
@@ -321,8 +333,8 @@ module ddr4_phy #(
 
             OSERDESE3 #(
                 .DATA_WIDTH(8),
-                .INIT((cpin == 0) ? 1'b1 : // CS_n idles high
-                      (cpin == 1) ? 1'b1 : // ACT_n idles high
+                .INIT((cpin == 0) ? 1'b1 : // CS_n idles high (JESD79-4D Table 35, DES)
+                      (cpin == 1) ? 1'b1 : // ACT_n idles high (JESD79-4D Table 35, DES)
                                     1'b0),
                 .IS_CLKDIV_INVERTED(1'b0),
                 .IS_CLK_INVERTED(1'b0),

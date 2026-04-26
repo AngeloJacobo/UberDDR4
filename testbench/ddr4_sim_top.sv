@@ -208,6 +208,7 @@ module ddr4_sim_top;
     reg [16*8-1:0] dbg_rom_phase;
     reg [8*8-1:0]  dbg_dfi_cmd;
     reg [8*8-1:0]  dbg_ddr4_cmd;
+    reg [8*8-1:0]  dbg_micron_cmd;
 
     always @* begin
         case (u_dut.u_controller.instruction_address)
@@ -291,6 +292,34 @@ module ddr4_sim_top;
         end
     end
 
+    // Micron-side command decode — reads the DDR4_if interface signals that
+    // feed directly into the encrypted Micron model. Proves what the model
+    // actually receives after the PHY's OSERDESE3 → OBUF chain.
+    wire micron_cs_n  = u_ddr4_mem.iDDR4_0.CS_n;
+    wire micron_act_n = u_ddr4_mem.iDDR4_0.ACT_n;
+    wire micron_ras   = u_ddr4_mem.iDDR4_0.RAS_n_A16;
+    wire micron_cas   = u_ddr4_mem.iDDR4_0.CAS_n_A15;
+    wire micron_we    = u_ddr4_mem.iDDR4_0.WE_n_A14;
+
+    always @* begin
+        if (micron_cs_n)
+            dbg_micron_cmd = "DES";
+        else if (!micron_act_n)
+            dbg_micron_cmd = "ACT";
+        else begin
+            case ({micron_ras, micron_cas, micron_we})
+                3'b000:  dbg_micron_cmd = "MRS";
+                3'b001:  dbg_micron_cmd = "REF";
+                3'b010:  dbg_micron_cmd = "PRE";
+                3'b100:  dbg_micron_cmd = "WR";
+                3'b101:  dbg_micron_cmd = "RD";
+                3'b110:  dbg_micron_cmd = "ZQCL";
+                3'b111:  dbg_micron_cmd = "NOP";
+                default: dbg_micron_cmd = "???";
+            endcase
+        end
+    end
+
     // ═══════════════════════════════════════════════════════════════════
     // Monitoring and Test Control
     // ═══════════════════════════════════════════════════════════════════
@@ -306,9 +335,37 @@ module ddr4_sim_top;
         end
     end
 
+    // Monitor REF commands on the DFI interface (phase-independent — works for
+    // ROM-driven refresh, command-scheduler refresh, or any future source).
+    // Uses the existing dbg_dfi_cmd decode which checks DFI phase-0 signals.
+    integer ref_count;
+    realtime ref_time_prev;
+    realtime ref_time_curr;
+    initial ref_count = 0;
+    initial ref_time_prev = 0;
+    initial ref_time_curr = 0;
+
+    always @(posedge controller_clk) begin
+        if (reset_done_seen && dbg_dfi_cmd == "REF") begin
+            ref_time_prev = ref_time_curr;
+            ref_time_curr = $realtime;
+            ref_count = ref_count + 1;
+            if (ref_count >= 2) begin
+                $display("[%0t] REF #%0d — interval = %0t (tREFI = 7800.000ns)",
+                         $realtime, ref_count, ref_time_curr - ref_time_prev);
+            end else begin
+                $display("[%0t] REF #%0d", $realtime, ref_count);
+            end
+        end
+    end
+
+    localparam NUM_REFRESH_CYCLES = 5;
+
     initial begin
         wait (reset_done_seen);
-        repeat (100) @(posedge controller_clk);
+        wait (ref_count >= NUM_REFRESH_CYCLES);
+        repeat (10) @(posedge controller_clk);
+        $display("[%0t] PASS: %0d refresh cycles observed", $realtime, ref_count);
         $display("[%0t] Simulation finished successfully", $realtime);
         $finish;
     end

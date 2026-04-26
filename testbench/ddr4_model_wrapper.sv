@@ -1,4 +1,5 @@
 ////////////////////////////////////////////////////////////////////////////////
+`default_nettype none
 //
 // Filename: ddr4_model_wrapper.sv
 // Project:  UberDDR4 - An Open Source DDR4 Controller

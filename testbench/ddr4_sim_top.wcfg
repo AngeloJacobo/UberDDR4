@@ -5,295 +5,284 @@
    <db_ref_list>
       <db_ref path="ddr4_sim_top_behav.wdb" id="1">
          <top_modules>
+            <top_module name="arch_package" />
             <top_module name="ddr4_sim_top" />
             <top_module name="glbl" />
+            <top_module name="proj_package" />
          </top_modules>
       </db_ref>
    </db_ref_list>
    <zoom_setting>
-      <ZoomStartTime time="0 ps"/>
-      <ZoomEndTime time="10000000 ps"/>
-      <Cursor1Time time="0 ps"/>
+      <ZoomStartTime time="17,047.864 ns"></ZoomStartTime>
+      <ZoomEndTime time="17,117.580 ns"></ZoomEndTime>
+      <Cursor1Time time="17,054.744 ns"></Cursor1Time>
    </zoom_setting>
    <column_width_setting>
-      <NameColumnWidth column_width="220"/>
-      <ValueColumnWidth column_width="100"/>
+      <NameColumnWidth column_width="220"></NameColumnWidth>
+      <ValueColumnWidth column_width="96"></ValueColumnWidth>
    </column_width_setting>
-   <WVObjectSize size="50" />
-
-   <!-- ════════════════════════════════════════════════════════════ -->
-   <!-- Group 1: Clocks & Reset                                     -->
-   <!-- ════════════════════════════════════════════════════════════ -->
+   <WVObjectSize size="8" />
+   <wave_markers>
+      <marker label="" time="8938395" />
+      <marker label="" time="17118267" />
+      <marker label="" time="24917835" />
+   </wave_markers>
    <wvobject type="group" fp_name="group:Clocks &amp; Reset">
       <obj_property name="label">Clocks &amp; Reset</obj_property>
-      <obj_property name="isExpanded"/>
-
-      <wvobject fp_name="/ddr4_sim_top/ddr4_clk" type="logic">
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/ddr4_clk">
          <obj_property name="ElementShortName">ddr4_clk</obj_property>
          <obj_property name="ObjectShortName">ddr4_clk</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/controller_clk" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/controller_clk">
          <obj_property name="ElementShortName">controller_clk</obj_property>
          <obj_property name="ObjectShortName">controller_clk</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ref_clk" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/ref_clk">
          <obj_property name="ElementShortName">ref_clk</obj_property>
          <obj_property name="ObjectShortName">ref_clk</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/rst_n" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/rst_n">
          <obj_property name="ElementShortName">rst_n</obj_property>
          <obj_property name="ObjectShortName">rst_n</obj_property>
       </wvobject>
    </wvobject>
-
-   <!-- ════════════════════════════════════════════════════════════ -->
-   <!-- Group 2: Debug Decode (human-readable ASCII strings)        -->
-   <!-- ════════════════════════════════════════════════════════════ -->
    <wvobject type="group" fp_name="group:Debug Decode">
       <obj_property name="label">Debug Decode</obj_property>
-      <obj_property name="isExpanded"/>
-
-      <wvobject fp_name="/ddr4_sim_top/dbg_rom_phase" type="array">
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="array" fp_name="/ddr4_sim_top/dbg_rom_phase">
          <obj_property name="ElementShortName">dbg_rom_phase[127:0]</obj_property>
          <obj_property name="ObjectShortName">dbg_rom_phase[127:0]</obj_property>
          <obj_property name="Radix">ASCIIRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/dbg_dfi_cmd" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/dbg_dfi_cmd">
          <obj_property name="ElementShortName">dbg_dfi_cmd[63:0]</obj_property>
          <obj_property name="ObjectShortName">dbg_dfi_cmd[63:0]</obj_property>
          <obj_property name="Radix">ASCIIRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/dbg_ddr4_cmd" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/dbg_ddr4_cmd">
          <obj_property name="ElementShortName">dbg_ddr4_cmd[63:0]</obj_property>
          <obj_property name="ObjectShortName">dbg_ddr4_cmd[63:0]</obj_property>
          <obj_property name="Radix">ASCIIRADIX</obj_property>
       </wvobject>
+      <wvobject type="array" fp_name="/ddr4_sim_top/dbg_micron_cmd">
+         <obj_property name="ElementShortName">dbg_micron_cmd[63:0]</obj_property>
+         <obj_property name="ObjectShortName">dbg_micron_cmd[63:0]</obj_property>
+         <obj_property name="Radix">ASCIIRADIX</obj_property>
+      </wvobject>
    </wvobject>
-
-   <!-- ════════════════════════════════════════════════════════════ -->
-   <!-- Group 3: Init ROM (Controller Internals)                    -->
-   <!-- ════════════════════════════════════════════════════════════ -->
    <wvobject type="group" fp_name="group:Init ROM (Controller)">
       <obj_property name="label">Init ROM (Controller)</obj_property>
-      <obj_property name="isExpanded"/>
-
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/instruction_address" type="array">
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/instruction_address">
          <obj_property name="ElementShortName">instruction_address[5:0]</obj_property>
          <obj_property name="ObjectShortName">instruction_address[5:0]</obj_property>
          <obj_property name="Radix">UNSIGNEDDECRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/delay_counter" type="array">
-         <obj_property name="ElementShortName">delay_counter</obj_property>
-         <obj_property name="ObjectShortName">delay_counter</obj_property>
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/delay_counter">
+         <obj_property name="ElementShortName">delay_counter[19:0]</obj_property>
+         <obj_property name="ObjectShortName">delay_counter[19:0]</obj_property>
          <obj_property name="Radix">UNSIGNEDDECRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/delay_counter_is_zero" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/delay_counter_is_zero">
          <obj_property name="ElementShortName">delay_counter_is_zero</obj_property>
          <obj_property name="ObjectShortName">delay_counter_is_zero</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/pause_counter" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/pause_counter">
          <obj_property name="ElementShortName">pause_counter</obj_property>
          <obj_property name="ObjectShortName">pause_counter</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/reset_done" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/reset_done">
          <obj_property name="ElementShortName">reset_done</obj_property>
          <obj_property name="ObjectShortName">reset_done</obj_property>
       </wvobject>
    </wvobject>
-
-   <!-- ════════════════════════════════════════════════════════════ -->
-   <!-- Group 3: DFI Control (Controller → PHY)                    -->
-   <!-- ════════════════════════════════════════════════════════════ -->
    <wvobject type="group" fp_name="group:DFI Control">
       <obj_property name="label">DFI Control (Controller → PHY)</obj_property>
-      <obj_property name="isExpanded"/>
-
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_cs_n" type="array">
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_cs_n">
          <obj_property name="ElementShortName">o_dfi_cs_n[3:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_cs_n[3:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_act_n" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_act_n">
          <obj_property name="ElementShortName">o_dfi_act_n[3:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_act_n[3:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_ras_n" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_ras_n">
          <obj_property name="ElementShortName">o_dfi_ras_n[3:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_ras_n[3:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_cas_n" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_cas_n">
          <obj_property name="ElementShortName">o_dfi_cas_n[3:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_cas_n[3:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_we_n" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_we_n">
          <obj_property name="ElementShortName">o_dfi_we_n[3:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_we_n[3:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_cke" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_cke">
          <obj_property name="ElementShortName">o_dfi_cke[3:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_cke[3:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_reset_n" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_reset_n">
          <obj_property name="ElementShortName">o_dfi_reset_n[3:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_reset_n[3:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_odt" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_odt">
          <obj_property name="ElementShortName">o_dfi_odt[3:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_odt[3:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_address" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_address">
          <obj_property name="ElementShortName">o_dfi_address[67:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_address[67:0]</obj_property>
          <obj_property name="Radix">HEXRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_bank" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_bank">
          <obj_property name="ElementShortName">o_dfi_bank[7:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_bank[7:0]</obj_property>
          <obj_property name="Radix">HEXRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_bg" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_bg">
          <obj_property name="ElementShortName">o_dfi_bg[7:0]</obj_property>
          <obj_property name="ObjectShortName">o_dfi_bg[7:0]</obj_property>
          <obj_property name="Radix">HEXRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_init_start" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_init_start">
          <obj_property name="ElementShortName">o_dfi_init_start</obj_property>
          <obj_property name="ObjectShortName">o_dfi_init_start</obj_property>
       </wvobject>
    </wvobject>
-
-   <!-- ════════════════════════════════════════════════════════════ -->
-   <!-- Group 4: DFI Status & Training                             -->
-   <!-- ════════════════════════════════════════════════════════════ -->
    <wvobject type="group" fp_name="group:DFI Status &amp; Training">
       <obj_property name="label">DFI Status &amp; Training</obj_property>
-      <obj_property name="isExpanded"/>
-
-      <wvobject fp_name="/ddr4_sim_top/u_dut/dfi_init_start" type="logic">
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/dfi_init_start">
          <obj_property name="ElementShortName">dfi_init_start</obj_property>
          <obj_property name="ObjectShortName">dfi_init_start</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/dfi_init_complete" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/dfi_init_complete">
          <obj_property name="ElementShortName">dfi_init_complete</obj_property>
          <obj_property name="ObjectShortName">dfi_init_complete</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_rdlvl_en" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_rdlvl_en">
          <obj_property name="ElementShortName">o_dfi_rdlvl_en</obj_property>
          <obj_property name="ObjectShortName">o_dfi_rdlvl_en</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_rdlvl_gate_en" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_rdlvl_gate_en">
          <obj_property name="ElementShortName">o_dfi_rdlvl_gate_en</obj_property>
          <obj_property name="ObjectShortName">o_dfi_rdlvl_gate_en</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_wrlvl_en" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_wrlvl_en">
          <obj_property name="ElementShortName">o_dfi_wrlvl_en</obj_property>
          <obj_property name="ObjectShortName">o_dfi_wrlvl_en</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_wrlvl_strobe" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_wrlvl_strobe">
          <obj_property name="ElementShortName">o_dfi_wrlvl_strobe</obj_property>
          <obj_property name="ObjectShortName">o_dfi_wrlvl_strobe</obj_property>
       </wvobject>
    </wvobject>
-
-   <!-- ════════════════════════════════════════════════════════════ -->
-   <!-- Group 5: DDR4 Interface (PHY → SDRAM)                      -->
-   <!-- ════════════════════════════════════════════════════════════ -->
    <wvobject type="group" fp_name="group:DDR4 Interface (PHY → SDRAM)">
       <obj_property name="label">DDR4 Interface (PHY → SDRAM)</obj_property>
-      <obj_property name="isExpanded"/>
-
-      <wvobject fp_name="/ddr4_sim_top/ddr4_ck_p" type="logic">
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="array" fp_name="/ddr4_sim_top/dbg_rom_phase">
+         <obj_property name="ElementShortName">dbg_rom_phase[127:0]</obj_property>
+         <obj_property name="ObjectShortName">dbg_rom_phase[127:0]</obj_property>
+         <obj_property name="Radix">ASCIIRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/ddr4_sim_top/dbg_ddr4_cmd">
+         <obj_property name="ElementShortName">dbg_ddr4_cmd[63:0]</obj_property>
+         <obj_property name="ObjectShortName">dbg_ddr4_cmd[63:0]</obj_property>
+         <obj_property name="Radix">ASCIIRADIX</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/ddr4_ck_p">
          <obj_property name="ElementShortName">ddr4_ck_p</obj_property>
          <obj_property name="ObjectShortName">ddr4_ck_p</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_ck_n" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/ddr4_ck_n">
          <obj_property name="ElementShortName">ddr4_ck_n</obj_property>
          <obj_property name="ObjectShortName">ddr4_ck_n</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_reset_n" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/ddr4_reset_n">
          <obj_property name="ElementShortName">ddr4_reset_n</obj_property>
          <obj_property name="ObjectShortName">ddr4_reset_n</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_cke" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/ddr4_cke">
          <obj_property name="ElementShortName">ddr4_cke</obj_property>
          <obj_property name="ObjectShortName">ddr4_cke</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_cs_n" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/ddr4_cs_n">
          <obj_property name="ElementShortName">ddr4_cs_n</obj_property>
          <obj_property name="ObjectShortName">ddr4_cs_n</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_act_n" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/ddr4_act_n">
          <obj_property name="ElementShortName">ddr4_act_n</obj_property>
          <obj_property name="ObjectShortName">ddr4_act_n</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_addr" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/ddr4_addr">
          <obj_property name="ElementShortName">ddr4_addr[16:0]</obj_property>
          <obj_property name="ObjectShortName">ddr4_addr[16:0]</obj_property>
          <obj_property name="Radix">HEXRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_ba" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/ddr4_ba">
          <obj_property name="ElementShortName">ddr4_ba[1:0]</obj_property>
          <obj_property name="ObjectShortName">ddr4_ba[1:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_bg" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/ddr4_bg">
          <obj_property name="ElementShortName">ddr4_bg[1:0]</obj_property>
          <obj_property name="ObjectShortName">ddr4_bg[1:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_odt" type="logic">
+      <wvobject type="logic" fp_name="/ddr4_sim_top/ddr4_odt">
          <obj_property name="ElementShortName">ddr4_odt</obj_property>
          <obj_property name="ObjectShortName">ddr4_odt</obj_property>
       </wvobject>
    </wvobject>
-
-   <!-- ════════════════════════════════════════════════════════════ -->
-   <!-- Group 6: DDR4 Data Path                                    -->
-   <!-- ════════════════════════════════════════════════════════════ -->
    <wvobject type="group" fp_name="group:DDR4 Data Path">
       <obj_property name="label">DDR4 Data Path</obj_property>
-      <obj_property name="isExpanded"/>
-
-      <wvobject fp_name="/ddr4_sim_top/ddr4_dq" type="array">
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="array" fp_name="/ddr4_sim_top/ddr4_dq">
          <obj_property name="ElementShortName">ddr4_dq[15:0]</obj_property>
          <obj_property name="ObjectShortName">ddr4_dq[15:0]</obj_property>
          <obj_property name="Radix">HEXRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_dqs_p" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/ddr4_dqs_p">
          <obj_property name="ElementShortName">ddr4_dqs_p[1:0]</obj_property>
          <obj_property name="ObjectShortName">ddr4_dqs_p[1:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_dqs_n" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/ddr4_dqs_n">
          <obj_property name="ElementShortName">ddr4_dqs_n[1:0]</obj_property>
          <obj_property name="ObjectShortName">ddr4_dqs_n[1:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
-      <wvobject fp_name="/ddr4_sim_top/ddr4_dm_n" type="array">
+      <wvobject type="array" fp_name="/ddr4_sim_top/ddr4_dm_n">
          <obj_property name="ElementShortName">ddr4_dm_n[1:0]</obj_property>
          <obj_property name="ObjectShortName">ddr4_dm_n[1:0]</obj_property>
          <obj_property name="Radix">BINARYRADIX</obj_property>
       </wvobject>
    </wvobject>
-
-   <!-- ════════════════════════════════════════════════════════════ -->
-   <!-- Group 7: Test Status                                       -->
-   <!-- ════════════════════════════════════════════════════════════ -->
    <wvobject type="group" fp_name="group:Test Status">
       <obj_property name="label">Test Status</obj_property>
-      <obj_property name="isExpanded"/>
-
-      <wvobject fp_name="/ddr4_sim_top/reset_done_seen" type="logic">
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/reset_done_seen">
          <obj_property name="ElementShortName">reset_done_seen</obj_property>
          <obj_property name="ObjectShortName">reset_done_seen</obj_property>
       </wvobject>
    </wvobject>
-
 </wave_config>

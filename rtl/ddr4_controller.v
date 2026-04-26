@@ -187,7 +187,7 @@ module ddr4_controller #(
                          (DDR4_CLK_PERIOD >= 937)   ? 33_000 : //DDR4-2133
                                                       32_000;  //DDR4-2400+
 
-    // tRCD/tRP: worst-case speed grade per bin (Table 173)
+    // tRCD/tRP: worst-case speed grade per bin (JESD79-4D Table 173)
     localparam tRCD_ps = (DDR4_CLK_PERIOD >= 1_250) ? 13_750 : //DDR4-1600 (L grade)
                          (DDR4_CLK_PERIOD >= 937)   ? 13_130 : //DDR4-1866/2133 (P grade)
                          (DDR4_CLK_PERIOD >= 833)   ? 14_160 : //DDR4-2400 (U grade)
@@ -196,15 +196,15 @@ module ddr4_controller #(
 
     localparam tRP_ps  = tRCD_ps; //symmetric for standard grades
     localparam tRC_ps  = tRAS_ps + tRP_ps;
-    localparam tWR_ps  = 15_000; //fixed for DDR4
-    localparam tRTP_ps = max_fn(DDR4_CLK_PERIOD * 4, 7_500);
+    localparam tWR_ps  = 15_000; //JESD79-4D §4.30 — always 15ns for DDR4
+    localparam tRTP_ps = max_fn(DDR4_CLK_PERIOD * 4, 7_500); //JESD79-4D §4.28 — max(4nCK, 7.5ns)
 
     // Bank-group-dependent timing — the key DDR4 addition
     localparam tCCD_L_ps = max_fn(DDR4_CLK_PERIOD * 5,
         (DDR4_CLK_PERIOD >= 1_250) ? 6_250 :  //DDR4-1600
         (DDR4_CLK_PERIOD >= 937)   ? 5_355 :  //DDR4-1866/2133
                                      5_000);   //DDR4-2400+
-    localparam tCCD_S_nCK = 4; //always 4nCK across BGs
+    localparam tCCD_S_nCK = 4; //JESD79-4D Table 169 — always 4nCK across BGs
     localparam tWTR_L_ps = max_fn(DDR4_CLK_PERIOD * 4, 7_500);
     localparam tWTR_S_ps = max_fn(DDR4_CLK_PERIOD * 2, 2_500);
 
@@ -233,14 +233,14 @@ module ddr4_controller #(
             ((DDR4_CLK_PERIOD >= 1_250) ? 25_000 :
              (DDR4_CLK_PERIOD >= 1_071) ? 23_000 : 21_000));
 
-    // MRS / init timing
-    localparam tMRD_nCK    = 8;
-    localparam tMOD_ps     = max_fn(DDR4_CLK_PERIOD * 24, 15_000);
-    localparam tZQinit_nCK = 1024;
-    localparam tZQoper_nCK = 512;
-    localparam tZQCS_nCK   = 128;
+    // MRS / init timing (JESD79-4D Table 3)
+    localparam tMRD_nCK    = 8;  //JESD79-4D Table 3 — 8nCK all speed bins
+    localparam tMOD_ps     = max_fn(DDR4_CLK_PERIOD * 24, 15_000); //JESD79-4D Table 3 — max(24nCK, 15ns)
+    localparam tZQinit_nCK = 1024; //JESD79-4D §4.18, Table 135
+    localparam tZQoper_nCK = 512;  //JESD79-4D §4.18, Table 135
+    localparam tZQCS_nCK   = 128;  //JESD79-4D §4.18, Table 135
 
-    // DLL lock (speed dependent)
+    // DLL lock — JESD79-4D §4.21, Table 141
     localparam tDLLK_nCK = (DDR4_CLK_PERIOD >= 1_071) ? 597 :
                            (DDR4_CLK_PERIOD >= 833)   ? 768 : 1024;
 
@@ -249,19 +249,20 @@ module ddr4_controller #(
                           (DENSITY == 8)  ? 350_000 :
                           (DENSITY == 4)  ? 260_000 :
                                             160_000;
-    localparam tREFI_ps = 7_800_000; //7.8µs, standard temp
+    localparam tREFI_ps = 7_800_000; //JESD79-4D §4.15 — 7.8µs at ≤85°C
 
-    // Write leveling
+    // Write leveling — JESD79-4D §4.26, Table 157
     localparam tWLMRD_nCK   = 40;
     localparam tWLDQSEN_nCK = 25;
 
-    // Init (shortened for sim)
-    localparam POWER_ON_RESET_HIGH_ps = MICRON_SIM ? 10_000 : 200_000_000;
-    localparam INITIAL_CKE_LOW_ps     = MICRON_SIM ? 10_000 : 500_000_000;
+    // Init — JESD79-4D §3.3 Figure 7 (shortened for sim when MICRON_SIM=1)
+    localparam POWER_ON_RESET_HIGH_ps = MICRON_SIM ? 10_000 : 200_000_000; //tPW_RESET ≥200µs
+    localparam INITIAL_CKE_LOW_ps     = MICRON_SIM ? 10_000 : 500_000_000; //≥500µs after RESET_n deassert
     localparam tXPR_ps = max_fn(5 * DDR4_CLK_PERIOD, tRFC_ps + 10_000);
 
     // ═══════════════════════════════════════
     // §4 — Command Slot Assignment
+    // DFI 3.1 §3.2 — slot assignment for 4-phase command interface
     // ═══════════════════════════════════════
     localparam integer READ_SLOT      = get_slot(CMD_RD);
     localparam integer WRITE_SLOT     = get_slot(CMD_WR);
@@ -270,6 +271,7 @@ module ddr4_controller #(
 
     // ═══════════════════════════════════════════════════════════════
     // §5 — Computed Delay Counters (controller clock cycles)
+    // Derived from JESD79-4D timing params via find_delay()
     // Each value = minimum controller cycles to wait between commands
     // ═══════════════════════════════════════════════════════════════
 
@@ -284,7 +286,7 @@ module ddr4_controller #(
         find_delay(ps_to_nCK(tRP_ps), PRECHARGE_SLOT, ACTIVATE_SLOT);
     localparam ACTIVATE_TO_PRECHARGE_DELAY =
         find_delay(ps_to_nCK(tRAS_ps), ACTIVATE_SLOT, PRECHARGE_SLOT);
-    // read-to-write turnaround (global, all banks — ODT needs to switch)
+    // read-to-write turnaround — JESD79-4D §4.12: CL + BL/2 + tRPST - CWL
     localparam READ_TO_WRITE_DELAY =
         find_delay(CL_nCK + 4 + 2 - CWL_nCK, READ_SLOT, WRITE_SLOT);
 
@@ -318,6 +320,14 @@ module ddr4_controller #(
     // ROM delay counter width — enough for longest init timer
     localparam DELAY_COUNTER_WIDTH = 20;
 
+    // Refresh loop timer — adjusted so REF-to-REF ≤ tREFI (JESD79-4D §4.15)
+    // Loop: PRE(33) → REF(34) → idle(35) → PRE(33)
+    // Period = (T_RP + 1) + (T_RFC + 1) + (T_REFI + 1) controller cycles
+    //        = T_RP + T_RFC + T_REFI + 3
+    // Using floor(tREFI/CTRL_CLK) guarantees period ≤ tREFI for all configs.
+    localparam REFRESH_TREFI_TIMER = tREFI_ps / CONTROLLER_CLK_PERIOD
+                                     - 3 - ps_to_cycles(tRP_ps) - ps_to_cycles(tRFC_ps);
+
     // ════════════════════════════════════════════════════
     // §6 — Mode Register Construction
     // JEDEC JESD79-4D Tables 13–31, Appendix B
@@ -326,7 +336,7 @@ module ddr4_controller #(
     localparam[2:0] cwl_enc = CWL_encoding(CWL_nCK[4:0]);
     localparam[3:0] wr_enc  = WR_RTP_encoding(WR_nCK);
 
-    // MR0: BL8, CAS Latency, DLL Reset, Write Recovery (Table 13)
+    // MR0: BL8, CAS Latency, DLL Reset, Write Recovery (JESD79-4D Table 13)
     localparam[13:0] MR0 = {
         wr_enc[3],        //A13: WR/RTP bit 3
         cl_enc[4],        //A12: CL bit 4
@@ -339,7 +349,7 @@ module ddr4_controller #(
         2'b00             //A1:A0: BL = BL8 fixed
     };
 
-    // MR1: DLL, RTT_NOM, output driver, write leveling (Table 16)
+    // MR1: DLL, RTT_NOM, output driver, write leveling (JESD79-4D Table 16)
     localparam[13:0] MR1_WL_DIS = {
         1'b0,             //A13: reserved
         1'b0,             //A12: Qoff = enabled
@@ -360,7 +370,7 @@ module ddr4_controller #(
         1'b1
     };
 
-    // MR2: CWL, RTT_WR (Table 19)
+    // MR2: CWL, RTT_WR (JESD79-4D Table 19)
     localparam[13:0] MR2 = {
         1'b0,             //A13: reserved
         1'b0,             //A12: Write CRC = off
@@ -371,14 +381,14 @@ module ddr4_controller #(
         3'b000            //A2:A0: reserved
     };
 
-    // MR3: MPR (Table 22)
+    // MR3: MPR (JESD79-4D Table 22)
     localparam[13:0] MR3_MPR_DIS = 14'b00_00_000_0_0_0_00_00;
-    localparam[13:0] MR3_MPR_EN  = 14'b00_00_000_0_0_1_00_00; //A2=1
+    localparam[13:0] MR3_MPR_EN  = 14'b00_00_000_0_0_0_01_00; //A2=1 (MPR enable)
 
-    // MR4: preamble, temperature (Table 26) — all defaults for V1
+    // MR4: preamble, temperature (JESD79-4D Table 26) — all defaults for V1
     localparam[13:0] MR4 = 14'b00_0_000_00_0_0_0_000;
 
-    // MR5: DM, DBI, RTT_PARK (Table 28)
+    // MR5: DM, DBI, RTT_PARK (JESD79-4D Table 28)
     localparam[0:0] DM_ENABLED = (DQ_BITS != 4); //x4 has no DM_n
     localparam[13:0] MR5 = {
         1'b0,             //A13: reserved
@@ -391,7 +401,7 @@ module ddr4_controller #(
         3'b000            //A2:A0: CA Parity Latency = off
     };
 
-    // MR6: VrefDQ, tCCD_L (Table 31)
+    // MR6: VrefDQ, tCCD_L (JESD79-4D Table 31)
     localparam[2:0] tCCD_L_enc = (ps_to_nCK(tCCD_L_ps) <= 4) ? 3'b000 :
                                   (ps_to_nCK(tCCD_L_ps) == 5) ? 3'b001 :
                                   (ps_to_nCK(tCCD_L_ps) == 6) ? 3'b010 :
@@ -405,11 +415,6 @@ module ddr4_controller #(
         6'b011001         //A5:A0: VrefDQ ≈ 76% (step 25, Range 1)
     };
 
-    // MRS select — {BG0, BA1, BA0} per JESD79-4D Table 10
-    localparam[2:0] MR0_SEL = 3'b000, MR1_SEL = 3'b001, MR2_SEL = 3'b010,
-                    MR3_SEL = 3'b011, MR4_SEL = 3'b100, MR5_SEL = 3'b101,
-                    MR6_SEL = 3'b110;
-
     // ═══════════════════════════════════════
     // §7 — Address Mapping
     // ═══════════════════════════════════════
@@ -418,7 +423,7 @@ module ddr4_controller #(
     //
     // ADDR_MAPPING=0: {row, bg, ba, col} — legacy sequential
     // ADDR_MAPPING=1: {row, ba, col_hi, bg, col_lo=0} — BG-interleaved (default)
-    //   Sequential WB accesses hit different bank groups → exploit tCCD_S over tCCD_L
+    //   Sequential WB accesses hit different bank groups → exploit tCCD_S < tCCD_L (JESD79-4D §4.7)
     localparam COL_USED    = COL_BITS - COL_LOW; //column bits present in WB address
     localparam COL_HI_BITS = (ADDR_MAPPING == 1) ? (COL_USED - BG_BITS) : COL_USED;
 
@@ -449,6 +454,8 @@ module ddr4_controller #(
     reg[DELAY_COUNTER_WIDTH-1:0] delay_counter;
     reg delay_counter_is_zero;
     reg pause_counter;
+    reg rom_cke_hold;
+    reg rom_reset_n_hold;
     wire[31:0] rom_instruction;
     wire rom_cmd_is_mrs;
     wire rom_use_timer;
@@ -456,6 +463,10 @@ module ddr4_controller #(
     assign rom_instruction = read_rom_instruction(instruction_address);
     assign rom_cmd_is_mrs  = (rom_instruction[26:23] == CMD_MRS);
     assign rom_use_timer   = rom_instruction[ROM_USE_TIMER];
+
+    wire init_firing  = delay_counter_is_zero && !pause_counter;
+    wire init_cke     = init_firing ? (rom_cmd_is_mrs ? 1'b1 : rom_instruction[ROM_CKE])     : rom_cke_hold;
+    wire init_reset_n = init_firing ? (rom_cmd_is_mrs ? 1'b1 : rom_instruction[ROM_RESET_N]) : rom_reset_n_hold;
 
     // ── Static outputs (Phase 1 stubs) ──
     assign o_wb_ack = 1'b0; // driven by read ACK pipeline in Phase 5
@@ -496,6 +507,11 @@ module ddr4_controller #(
             delay_counter <= {DELAY_COUNTER_WIDTH{1'b0}};
             delay_counter_is_zero <= 1'b1;
             pause_counter <= 1'b0;
+            rom_cke_hold <= 1'b0;
+            rom_reset_n_hold <= 1'b0;
+            for (bank_i = 0; bank_i < SERDES_RATIO; bank_i = bank_i + 1) begin
+                cmd_d[bank_i] <= {1'b1, CMD_NOP, 1'b0, 1'b0, 1'b0, 2'b00, 2'b00, 17'b0};
+            end
             for (bank_i = 0; bank_i < NUM_BANKS; bank_i = bank_i + 1) begin
                 bank_active_row_q[bank_i] <= {ROW_BITS{1'b0}};
                 delay_before_precharge_counter_q[bank_i] <= 0;
@@ -519,8 +535,8 @@ module ddr4_controller #(
                     1'b1,       //cs_n = 1 (deselected)
                     CMD_NOP,    //{act_n=1, ras_n=1, cas_n=1, we_n=1}
                     1'b0,       //odt
-                    reset_done ? 1'b1 : rom_instruction[ROM_CKE],     //cke
-                    reset_done ? 1'b1 : rom_instruction[ROM_RESET_N], //reset_n
+                    reset_done ? 1'b1 : init_cke,     //cke (muxed: rom_instruction on fire, hold on countdown)
+                    reset_done ? 1'b1 : init_reset_n, //reset_n (muxed: rom_instruction on fire, hold on countdown)
                     2'b00,      //bg
                     2'b00,      //ba
                     17'b0       //addr
@@ -528,11 +544,11 @@ module ddr4_controller #(
             end
 
             // ═══════════════════════════════════════════════════════════
-            // §10 — ROM Controller
-            // Drives init sequence: instruction_address advances when
-            // delay_counter expires and pause_counter is not set.
+            // §10 — ROM Controller (implements JESD79-4D §3.3 init FSM)
+            // Drives init sequence, then continues running the refresh
+            // loop (addrs 33-35) after init completes.
             // ═══════════════════════════════════════════════════════════
-            if (!reset_done) begin
+            if (!reset_done || instruction_address >= ROM_ADDR_REF_START) begin
                 // Delay counter management
                 if (!delay_counter_is_zero) begin
                     delay_counter <= delay_counter - 1'b1;
@@ -566,6 +582,16 @@ module ddr4_controller #(
                         };
                     end
 
+                    // Latch CKE/RESET_N for the duration of this ROM phase.
+                    // MRS instructions always have CKE=1, RESET_N=1.
+                    if (rom_cmd_is_mrs) begin
+                        rom_cke_hold     <= 1'b1;
+                        rom_reset_n_hold <= 1'b1;
+                    end else begin
+                        rom_cke_hold     <= rom_instruction[ROM_CKE];
+                        rom_reset_n_hold <= rom_instruction[ROM_RESET_N];
+                    end
+
                     // Load delay counter for timer instructions
                     if (rom_use_timer) begin
                         delay_counter <= rom_instruction[DELAY_COUNTER_WIDTH-1:0];
@@ -589,7 +615,7 @@ module ddr4_controller #(
             // Phase 7: Training command pump
 
             // ═══════════════════════════════════════════════════════════
-            // §12 — DFI Signal Mapping
+            // §12 — DFI Signal Mapping (DFI 3.1 §3.2, 4-phase, 1:4 ratio)
             // Decompose packed cmd_d[] slots into flat DFI output vectors
             // ═══════════════════════════════════════════════════════════
             for (bank_i = 0; bank_i < SERDES_RATIO; bank_i = bank_i + 1) begin
@@ -609,7 +635,7 @@ module ddr4_controller #(
     end
 
     // ══════════════════════════════════════════════════════════════
-    // §9 — Reset/Refresh ROM
+    // §9 — Reset/Refresh ROM (JESD79-4D §3.3, Figure 7)
     // 36 addresses (0–35): init sequence + calibration windows + refresh loop
     // ══════════════════════════════════════════════════════════════
 
@@ -623,42 +649,55 @@ module ddr4_controller #(
 
     function [31:0] read_rom_instruction(input [5:0] addr);
         case (addr)
-            6'd0:  read_rom_instruction = rom_timer(CTL_CKE0_RST0, CMD_NOP, ps_to_cycles(POWER_ON_RESET_HIGH_ps));
-            6'd1:  read_rom_instruction = rom_timer(CTL_CKE0_RST1, CMD_NOP, ps_to_cycles(INITIAL_CKE_LOW_ps));
-            6'd2:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_DES, ps_to_cycles(tXPR_ps));
-            6'd3:  read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_DIS);
-            6'd4:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
-            6'd5:  read_rom_instruction = rom_mrs  (MRS_MR6, MR6);
-            6'd6:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
-            6'd7:  read_rom_instruction = rom_mrs  (MRS_MR5, MR5);
-            6'd8:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
-            6'd9:  read_rom_instruction = rom_mrs  (MRS_MR4, MR4);
-            6'd10: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
-            6'd11: read_rom_instruction = rom_mrs  (MRS_MR2, MR2);
-            6'd12: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
-            6'd13: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_DIS);
-            6'd14: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK));
-            6'd15: read_rom_instruction = rom_mrs  (MRS_MR0, MR0);
-            6'd16: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));
-            6'd17: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_ZQCL, nCK_to_cycles(tZQinit_nCK));
-            6'd18: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tDLLK_nCK));
-            6'd19: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));
-            6'd20: read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_EN);
-            6'd21: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));
-            6'd22: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, CALIBRATION_DELAY);
-            6'd23: read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_DIS);
-            6'd24: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));
-            6'd25: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_EN);
-            6'd26: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tWLMRD_nCK));
-            6'd27: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, CALIBRATION_DELAY);
-            6'd28: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_DIS);
-            6'd29: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));
-            6'd30: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));
-            6'd31: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_REF, ps_to_cycles(tRFC_ps));
-            6'd32: read_rom_instruction = rom_timer(CTL_DONE,       CMD_NOP, 0);
-            6'd33: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));
-            6'd34: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_REF, ps_to_cycles(tRFC_ps));
-            6'd35: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tREFI_ps));
+            // ── Power-on reset (JESD79-4D §3.3, Figure 7) ──
+            6'd0:  read_rom_instruction = rom_timer(CTL_CKE0_RST0, CMD_NOP, ps_to_cycles(POWER_ON_RESET_HIGH_ps)); // RESET_n=0, CKE=0, wait ≥200µs
+            6'd1:  read_rom_instruction = rom_timer(CTL_CKE0_RST1, CMD_NOP, ps_to_cycles(INITIAL_CKE_LOW_ps));     // RESET_n=1, CKE=0, wait ≥500µs
+            6'd2:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_DES, ps_to_cycles(tXPR_ps));                // CKE=1, deselect, wait tXPR
+
+            // ── Mode register writes (MR3→MR6→MR5→MR4→MR2→MR1→MR0) ──
+            6'd3:  read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_DIS);                          // MR3: MPR off
+            6'd4:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK)); // wait tMRD
+            6'd5:  read_rom_instruction = rom_mrs  (MRS_MR6, MR6);                                  // MR6: VrefDQ, tCCD_L
+            6'd6:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK)); // wait tMRD
+            6'd7:  read_rom_instruction = rom_mrs  (MRS_MR5, MR5);                                  // MR5: DM, RTT_PARK
+            6'd8:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK)); // wait tMRD
+            6'd9:  read_rom_instruction = rom_mrs  (MRS_MR4, MR4);                                  // MR4: preamble, temp readout
+            6'd10: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK)); // wait tMRD
+            6'd11: read_rom_instruction = rom_mrs  (MRS_MR2, MR2);                                  // MR2: CWL, RTT_WR
+            6'd12: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK)); // wait tMRD
+            6'd13: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_DIS);                           // MR1: DLL on, drive, RTT_NOM, WL off
+            6'd14: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK)); // wait tMRD
+            6'd15: read_rom_instruction = rom_mrs  (MRS_MR0, MR0);                                  // MR0: BL8, CL, DLL reset, WR
+            6'd16: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));    // wait tMOD
+
+            // ── ZQCL + DLL lock ──
+            6'd17: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_ZQCL, nCK_to_cycles(tZQinit_nCK)); // ZQCL (A10=1), wait tZQinit
+            6'd18: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tDLLK_nCK));    // wait tDLLK (DLL lock)
+            6'd19: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));        // PRE ALL (A10=1), wait tRP
+
+            // ── Read calibration window (MPR mode, JESD79-4D §4.25) ──
+            6'd20: read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_EN);                              // MR3: MPR enable (A2=1)
+            6'd21: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));    // wait tMOD
+            6'd22: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, CALIBRATION_DELAY);        // read leveling window
+            6'd23: read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_DIS);                             // MR3: MPR disable
+            6'd24: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));    // wait tMOD
+
+            // ── Write leveling window (JESD79-4D §4.26) ──
+            6'd25: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_EN);                               // MR1: write leveling on (A7=1)
+            6'd26: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tWLMRD_nCK)); // wait tWLMRD
+            6'd27: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, CALIBRATION_DELAY);        // write leveling window
+            6'd28: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_DIS);                              // MR1: write leveling off
+            6'd29: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));    // wait tMOD
+
+            // ── Final refresh + done ──
+            6'd30: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));  // PRE ALL, wait tRP
+            6'd31: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_REF, ps_to_cycles(tRFC_ps)); // REF, wait tRFC
+            6'd32: read_rom_instruction = rom_timer(CTL_DONE,       CMD_NOP, 0);                     // reset_done=1, init complete
+
+            // ── Refresh loop (repeats 33→34→35→33) ──
+            6'd33: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));   // PRE ALL, wait tRP
+            6'd34: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_REF, ps_to_cycles(tRFC_ps));  // REF, wait tRFC
+            6'd35: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, REFRESH_TREFI_TIMER);    // NOP, wait adjusted tREFI
             default: read_rom_instruction = rom_timer(CTL_TIMER, CMD_NOP, 0);
         endcase
     endfunction
@@ -668,19 +707,105 @@ module ddr4_controller #(
     // ══════════════════════════════════════════════════════════════
 `ifndef YOSYS
     initial begin
-        $display("UberDDR4 Controller Configuration:");
-        $display("  CONTROLLER_CLK_PERIOD = %0d ps", CONTROLLER_CLK_PERIOD);
+        $display("══════════════════════════════════════════════════════════════");
+        $display("UberDDR4 Controller Configuration");
+        $display("══════════════════════════════════════════════════════════════");
+
+        $display("── Device ──");
         $display("  DDR4_CLK_PERIOD       = %0d ps", DDR4_CLK_PERIOD);
+        $display("  CONTROLLER_CLK_PERIOD = %0d ps", CONTROLLER_CLK_PERIOD);
         $display("  SERDES_RATIO          = %0d", SERDES_RATIO);
-        $display("  ROW_BITS=%0d COL_BITS=%0d BA_BITS=%0d BG_BITS=%0d DQ_BITS=%0d",
-                 ROW_BITS, COL_BITS, BA_BITS, BG_BITS, DQ_BITS);
-        $display("  BYTE_LANES=%0d DENSITY=%0d Gb", BYTE_LANES, DENSITY);
-        $display("  CL=%0d CWL=%0d WR=%0d", CL_nCK, CWL_nCK, WR_nCK);
-        $display("  READ_SLOT=%0d WRITE_SLOT=%0d ACT_SLOT=%0d PRE_SLOT=%0d",
-                 READ_SLOT, WRITE_SLOT, ACTIVATE_SLOT, PRECHARGE_SLOT);
-        $display("  ADDR_MAPPING=%0d WB_ADDR_BITS=%0d WB_DATA_BITS=%0d",
-                 ADDR_MAPPING, WB_ADDR_BITS, WB_DATA_BITS);
-        $display("  MICRON_SIM=%0d SKIP_CALIB=%0d", MICRON_SIM, SKIP_CALIB);
+        $display("  ROW_BITS              = %0d", ROW_BITS);
+        $display("  COL_BITS              = %0d", COL_BITS);
+        $display("  BA_BITS               = %0d", BA_BITS);
+        $display("  BG_BITS               = %0d", BG_BITS);
+        $display("  DQ_BITS               = %0d", DQ_BITS);
+        $display("  BYTE_LANES            = %0d", BYTE_LANES);
+        $display("  DENSITY               = %0d Gb", DENSITY);
+        $display("  PAGE_SIZE             = %0d bytes", PAGE_SIZE);
+        $display("  NUM_BANKS             = %0d", NUM_BANKS);
+        $display("  NUM_BG                = %0d", NUM_BG);
+
+        $display("── Latency ──");
+        $display("  CL                    = %0d nCK", CL_nCK);
+        $display("  CWL                   = %0d nCK", CWL_nCK);
+        $display("  WR                    = %0d nCK", WR_nCK);
+
+        $display("── Core Timing ──");
+        $display("  tRAS                  = %0d ps (%0d nCK)", tRAS_ps, ps_to_nCK(tRAS_ps));
+        $display("  tRCD                  = %0d ps (%0d nCK)", tRCD_ps, ps_to_nCK(tRCD_ps));
+        $display("  tRP                   = %0d ps (%0d nCK)", tRP_ps, ps_to_nCK(tRP_ps));
+        $display("  tRC                   = %0d ps (%0d nCK)", tRC_ps, ps_to_nCK(tRC_ps));
+        $display("  tWR                   = %0d ps (%0d nCK)", tWR_ps, ps_to_nCK(tWR_ps));
+        $display("  tRTP                  = %0d ps (%0d nCK)", tRTP_ps, ps_to_nCK(tRTP_ps));
+
+        $display("── Bank-Group Timing ──");
+        $display("  tCCD_L                = %0d ps (%0d nCK)", tCCD_L_ps, ps_to_nCK(tCCD_L_ps));
+        $display("  tCCD_S                = %0d nCK", tCCD_S_nCK);
+        $display("  tWTR_L                = %0d ps (%0d nCK)", tWTR_L_ps, ps_to_nCK(tWTR_L_ps));
+        $display("  tWTR_S                = %0d ps (%0d nCK)", tWTR_S_ps, ps_to_nCK(tWTR_S_ps));
+        $display("  tRRD_L                = %0d ps (%0d nCK)", tRRD_L_ps, ps_to_nCK(tRRD_L_ps));
+        $display("  tRRD_S                = %0d ps (%0d nCK)", tRRD_S_ps, ps_to_nCK(tRRD_S_ps));
+        $display("  tFAW                  = %0d ps (%0d nCK, %0d ctrl)", tFAW_ps, ps_to_nCK(tFAW_ps), TFAW_CYCLES);
+
+        $display("── Init/MRS Timing ──");
+        $display("  tMRD                  = %0d nCK (%0d ctrl)", tMRD_nCK, nCK_to_cycles(tMRD_nCK));
+        $display("  tMOD                  = %0d ps (%0d ctrl)", tMOD_ps, ps_to_cycles(tMOD_ps));
+        $display("  tZQinit               = %0d nCK (%0d ctrl)", tZQinit_nCK, nCK_to_cycles(tZQinit_nCK));
+        $display("  tDLLK                 = %0d nCK (%0d ctrl)", tDLLK_nCK, nCK_to_cycles(tDLLK_nCK));
+        $display("  tXPR                  = %0d ps (%0d ctrl)", tXPR_ps, ps_to_cycles(tXPR_ps));
+        $display("  tWLMRD                = %0d nCK (%0d ctrl)", tWLMRD_nCK, nCK_to_cycles(tWLMRD_nCK));
+        $display("  POWER_ON_RESET        = %0d ps (%0d ctrl)", POWER_ON_RESET_HIGH_ps, ps_to_cycles(POWER_ON_RESET_HIGH_ps));
+        $display("  INITIAL_CKE_LOW       = %0d ps (%0d ctrl)", INITIAL_CKE_LOW_ps, ps_to_cycles(INITIAL_CKE_LOW_ps));
+
+        $display("── Refresh ──");
+        $display("  tRFC                  = %0d ps (%0d ctrl)", tRFC_ps, ps_to_cycles(tRFC_ps));
+        $display("  tREFI                 = %0d ps (%0d ctrl)", tREFI_ps, ps_to_cycles(tREFI_ps));
+        $display("  Refresh loop period   = %0d ctrl (%0d ps)",
+                 ps_to_cycles(tRP_ps) + ps_to_cycles(tRFC_ps) + REFRESH_TREFI_TIMER + 3,
+                 (ps_to_cycles(tRP_ps) + ps_to_cycles(tRFC_ps) + REFRESH_TREFI_TIMER + 3)
+                 * CONTROLLER_CLK_PERIOD);
+
+        $display("── Computed Delays (controller cycles) ──");
+        $display("  ACT->RD/WR            = %0d", ACTIVATE_TO_READWRITE_DELAY);
+        $display("  RD->PRE               = %0d", READ_TO_PRECHARGE_DELAY);
+        $display("  WR->PRE               = %0d", WRITE_TO_PRECHARGE_DELAY);
+        $display("  PRE->ACT              = %0d", PRECHARGE_TO_ACTIVATE_DELAY);
+        $display("  ACT->PRE              = %0d", ACTIVATE_TO_PRECHARGE_DELAY);
+        $display("  RD->WR                = %0d", READ_TO_WRITE_DELAY);
+        $display("  CAS->CAS (same BG)    = %0d", CAS_TO_CAS_DELAY_SAME_BG);
+        $display("  CAS->CAS (diff BG)    = %0d", CAS_TO_CAS_DELAY_DIFF_BG);
+        $display("  WR->RD (same BG)      = %0d", WRITE_TO_READ_DELAY_SAME_BG);
+        $display("  WR->RD (diff BG)      = %0d", WRITE_TO_READ_DELAY_DIFF_BG);
+        $display("  ACT->ACT (same BG)    = %0d", ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG);
+        $display("  ACT->ACT (diff BG)    = %0d", ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG);
+        $display("  tFAW                  = %0d", TFAW_CYCLES);
+
+        $display("── Slot Assignment ──");
+        $display("  READ_SLOT             = %0d", READ_SLOT);
+        $display("  WRITE_SLOT            = %0d", WRITE_SLOT);
+        $display("  ACTIVATE_SLOT         = %0d", ACTIVATE_SLOT);
+        $display("  PRECHARGE_SLOT        = %0d", PRECHARGE_SLOT);
+
+        $display("── Address Mapping ──");
+        $display("  ADDR_MAPPING          = %0d", ADDR_MAPPING);
+        $display("  WB_ADDR_BITS          = %0d", WB_ADDR_BITS);
+        $display("  WB_DATA_BITS          = %0d", WB_DATA_BITS);
+        $display("  COL_LOW               = %0d", COL_LOW);
+
+        $display("── Mode Registers ──");
+        $display("  MR0                   = 14'h%04h", MR0);
+        $display("  MR1 (WL off)          = 14'h%04h", MR1_WL_DIS);
+        $display("  MR2                   = 14'h%04h", MR2);
+        $display("  MR3 (MPR off)         = 14'h%04h", MR3_MPR_DIS);
+        $display("  MR4                   = 14'h%04h", MR4);
+        $display("  MR5                   = 14'h%04h", MR5);
+        $display("  MR6                   = 14'h%04h", MR6);
+
+        $display("── Sim Flags ──");
+        $display("  MICRON_SIM            = %0d", MICRON_SIM);
+        $display("  SKIP_CALIB            = %0d", SKIP_CALIB);
+        $display("══════════════════════════════════════════════════════════════");
     end
 `endif
 
@@ -709,7 +834,8 @@ module ddr4_controller #(
         nCK_to_cycles = (nck + SERDES_RATIO - 1) / SERDES_RATIO;
     endfunction
 
-    // find_delay: minimum controller cycles between a command in start_slot
+    // find_delay: slot-aware delay for DFI 3.1 4-phase packing.
+    // Minimum controller cycles between a command in start_slot
     // and a command in end_slot, given a required gap of delay_nCK DDR cycles.
     // The actual DDR gap is: (4 - start_slot) + end_slot + 4*k
     function integer find_delay(input integer delay_nCK, input integer start_slot, input integer end_slot);
@@ -722,9 +848,9 @@ module ddr4_controller #(
         end
     endfunction
 
-    // get_slot: assign each command type to one of 4 SERDES slots per controller cycle.
-    // Read/Write slots are derived from CL/CWL mod 4; Activate and Precharge fill
-    // the remaining slots avoiding collisions.
+    // get_slot: assign each command type to one of 4 DFI slots per controller cycle
+    // (DFI 3.1 §3.2). Read/Write slots derived from CL/CWL mod 4; Activate and
+    // Precharge fill the remaining slots avoiding collisions.
     function integer get_slot(input [3:0] cmd);
         integer delay;
         reg [2:0] slot_number, read_slot, write_slot;
@@ -814,7 +940,7 @@ module ddr4_controller #(
         end
     endfunction
 
-    // CL_encoding: 5-bit scattered MR0 CAS Latency field {A12, A6, A5, A4, A2}
+    // CL_encoding: JESD79-4D Table 13 — MR0 CAS Latency {A12, A6:A4, A2}
     function [4:0] CL_encoding(input [5:0] cl_nck);
         case (cl_nck)
             6'd9:  CL_encoding = 5'b0_000_0;
@@ -843,7 +969,7 @@ module ddr4_controller #(
         endcase
     endfunction
 
-    // CWL_encoding: MR2 A5:A3 (3-bit field)
+    // CWL_encoding: JESD79-4D Table 19 — MR2 A5:A3
     function [2:0] CWL_encoding(input [4:0] cwl_nck);
         case (cwl_nck)
             5'd9:  CWL_encoding = 3'b000;
@@ -858,7 +984,7 @@ module ddr4_controller #(
         endcase
     endfunction
 
-    // WR_RTP_encoding: MR0 {A13, A11, A10, A9}
+    // WR_RTP_encoding: JESD79-4D Table 13 — MR0 {A13, A11:A9}
     function [3:0] WR_RTP_encoding(input integer wr_nck);
         case (wr_nck)
             10:      WR_RTP_encoding = 4'b0_000;
