@@ -96,6 +96,35 @@ module ddr4_sim_top;
     wire [BYTE_LANES-1:0] ddr4_dqs_p, ddr4_dqs_n;
 
     // ═══════════════════════════════════════════════════════════════════
+    // Wishbone / BIST Tie-Offs (static zero, init to 'z per convention)
+    // ═══════════════════════════════════════════════════════════════════
+    reg                      wb_cyc;
+    reg                      wb_stb;
+    reg                      wb_we;
+    reg [EXT_ADDR_BITS-1:0]  wb_addr;
+    reg [WB_DATA_BITS-1:0]   wb_data;
+    reg [WB_SEL_BITS-1:0]    wb_sel;
+    reg                      bist_start;
+
+    initial begin
+        wb_cyc     = 'z;
+        wb_stb     = 'z;
+        wb_we      = 'z;
+        wb_addr    = 'z;
+        wb_data    = 'z;
+        wb_sel     = 'z;
+        bist_start = 'z;
+        #1;
+        wb_cyc     = 1'b0;
+        wb_stb     = 1'b0;
+        wb_we      = 1'b0;
+        wb_addr    = {EXT_ADDR_BITS{1'b0}};
+        wb_data    = {WB_DATA_BITS{1'b0}};
+        wb_sel     = {WB_SEL_BITS{1'b0}};
+        bist_start = 1'b0;
+    end
+
+    // ═══════════════════════════════════════════════════════════════════
     // DUT — ddr4_top with MICRON_SIM=1 (shortened init delays)
     // and SKIP_CALIB=1 (no PHY training in Phase 3)
     // ═══════════════════════════════════════════════════════════════════
@@ -117,12 +146,12 @@ module ddr4_sim_top;
         .i_ddr4_clk       (ddr4_clk),
         .i_ref_clk        (ref_clk),
         .i_rst_n          (rst_n),
-        .i_wb_cyc          (1'b0),
-        .i_wb_stb          (1'b0),
-        .i_wb_we           (1'b0),
-        .i_wb_addr         ({EXT_ADDR_BITS{1'b0}}),
-        .i_wb_data         ({WB_DATA_BITS{1'b0}}),
-        .i_wb_sel          ({WB_SEL_BITS{1'b0}}),
+        .i_wb_cyc          (wb_cyc),
+        .i_wb_stb          (wb_stb),
+        .i_wb_we           (wb_we),
+        .i_wb_addr         (wb_addr),
+        .i_wb_data         (wb_data),
+        .i_wb_sel          (wb_sel),
         .o_wb_stall        (),
         .o_wb_ack          (),
         .o_wb_data         (),
@@ -140,7 +169,7 @@ module ddr4_sim_top;
         .io_ddr4_dq        (ddr4_dq),
         .io_ddr4_dqs_p     (ddr4_dqs_p),
         .io_ddr4_dqs_n     (ddr4_dqs_n),
-        .i_bist_start      (1'b0),
+        .i_bist_start      (bist_start),
         .o_bist_busy       (),
         .o_bist_pass       (),
         .o_bist_fail       (),
@@ -172,6 +201,95 @@ module ddr4_sim_top;
         .io_ddr4_dqs_n  (ddr4_dqs_n),
         .io_ddr4_dm_n   (ddr4_dm_n)
     );
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Human-Readable Debug Signals (display with ASCII radix in viewer)
+    // ═══════════════════════════════════════════════════════════════════
+    reg [16*8-1:0] dbg_rom_phase;
+    reg [8*8-1:0]  dbg_dfi_cmd;
+    reg [8*8-1:0]  dbg_ddr4_cmd;
+
+    always @* begin
+        case (u_dut.u_controller.instruction_address)
+            6'd0:    dbg_rom_phase = "POWER_ON_RESET";
+            6'd1:    dbg_rom_phase = "CKE_LOW";
+            6'd2:    dbg_rom_phase = "tXPR_WAIT";
+            6'd3:    dbg_rom_phase = "MRS MR3";
+            6'd4:    dbg_rom_phase = "tMRD_WAIT";
+            6'd5:    dbg_rom_phase = "MRS MR6";
+            6'd6:    dbg_rom_phase = "tMRD_WAIT";
+            6'd7:    dbg_rom_phase = "MRS MR5";
+            6'd8:    dbg_rom_phase = "tMRD_WAIT";
+            6'd9:    dbg_rom_phase = "MRS MR4";
+            6'd10:   dbg_rom_phase = "tMRD_WAIT";
+            6'd11:   dbg_rom_phase = "MRS MR2";
+            6'd12:   dbg_rom_phase = "tMRD_WAIT";
+            6'd13:   dbg_rom_phase = "MRS MR1";
+            6'd14:   dbg_rom_phase = "tMRD_WAIT";
+            6'd15:   dbg_rom_phase = "MRS MR0";
+            6'd16:   dbg_rom_phase = "tMOD_WAIT";
+            6'd17:   dbg_rom_phase = "ZQCL";
+            6'd18:   dbg_rom_phase = "DLL_LOCK";
+            6'd19:   dbg_rom_phase = "PRE_ALL";
+            6'd20:   dbg_rom_phase = "MPR_ENABLE";
+            6'd21:   dbg_rom_phase = "tMOD_WAIT";
+            6'd22:   dbg_rom_phase = "READ_CAL";
+            6'd23:   dbg_rom_phase = "MPR_DISABLE";
+            6'd24:   dbg_rom_phase = "tMOD_WAIT";
+            6'd25:   dbg_rom_phase = "WL_ENABLE";
+            6'd26:   dbg_rom_phase = "tWLMRD_WAIT";
+            6'd27:   dbg_rom_phase = "WRITE_CAL";
+            6'd28:   dbg_rom_phase = "WL_DISABLE";
+            6'd29:   dbg_rom_phase = "tMOD_WAIT";
+            6'd30:   dbg_rom_phase = "PRE_ALL";
+            6'd31:   dbg_rom_phase = "REFRESH";
+            6'd32:   dbg_rom_phase = "INIT_DONE";
+            6'd33:   dbg_rom_phase = "REF_PRE_ALL";
+            6'd34:   dbg_rom_phase = "REF_REFRESH";
+            6'd35:   dbg_rom_phase = "REF_IDLE";
+            default: dbg_rom_phase = "???";
+        endcase
+    end
+
+    always @* begin
+        if (u_dut.u_controller.o_dfi_cs_n[0])
+            dbg_dfi_cmd = "DES";
+        else if (!u_dut.u_controller.o_dfi_act_n[0])
+            dbg_dfi_cmd = "ACT";
+        else begin
+            case ({u_dut.u_controller.o_dfi_ras_n[0],
+                   u_dut.u_controller.o_dfi_cas_n[0],
+                   u_dut.u_controller.o_dfi_we_n[0]})
+                3'b000:  dbg_dfi_cmd = "MRS";
+                3'b001:  dbg_dfi_cmd = "REF";
+                3'b010:  dbg_dfi_cmd = u_dut.u_controller.o_dfi_address[10] ? "PRE ALL" : "PRE";
+                3'b100:  dbg_dfi_cmd = "WR";
+                3'b101:  dbg_dfi_cmd = "RD";
+                3'b110:  dbg_dfi_cmd = u_dut.u_controller.o_dfi_address[10] ? "ZQCL" : "ZQCS";
+                3'b111:  dbg_dfi_cmd = "NOP";
+                default: dbg_dfi_cmd = "???";
+            endcase
+        end
+    end
+
+    always @* begin
+        if (ddr4_cs_n)
+            dbg_ddr4_cmd = "DES";
+        else if (!ddr4_act_n)
+            dbg_ddr4_cmd = "ACT";
+        else begin
+            case ({ddr4_addr[16], ddr4_addr[15], ddr4_addr[14]})
+                3'b000:  dbg_ddr4_cmd = "MRS";
+                3'b001:  dbg_ddr4_cmd = "REF";
+                3'b010:  dbg_ddr4_cmd = ddr4_addr[10] ? "PRE ALL" : "PRE";
+                3'b100:  dbg_ddr4_cmd = "WR";
+                3'b101:  dbg_ddr4_cmd = "RD";
+                3'b110:  dbg_ddr4_cmd = ddr4_addr[10] ? "ZQCL" : "ZQCS";
+                3'b111:  dbg_ddr4_cmd = "NOP";
+                default: dbg_ddr4_cmd = "???";
+            endcase
+        end
+    end
 
     // ═══════════════════════════════════════════════════════════════════
     // Monitoring and Test Control
