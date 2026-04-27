@@ -285,4 +285,92 @@
          <obj_property name="ObjectShortName">reset_done_seen</obj_property>
       </wvobject>
    </wvobject>
+   <wvobject type="group" fp_name="group:WB Interface">
+      <obj_property name="label">WB Interface</obj_property>
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/wb_cyc">
+         <obj_property name="ElementShortName">wb_cyc</obj_property>
+         <obj_property name="ObjectShortName">wb_cyc</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/wb_stb">
+         <obj_property name="ElementShortName">wb_stb</obj_property>
+         <obj_property name="ObjectShortName">wb_stb</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/wb_we">
+         <obj_property name="ElementShortName">wb_we</obj_property>
+         <obj_property name="ObjectShortName">wb_we</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/ddr4_sim_top/wb_addr">
+         <obj_property name="ElementShortName">wb_addr[23:0]</obj_property>
+         <obj_property name="ObjectShortName">wb_addr[23:0]</obj_property>
+         <obj_property name="Radix">HEXRADIX</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/wb_stall">
+         <obj_property name="ElementShortName">wb_stall</obj_property>
+         <obj_property name="ObjectShortName">wb_stall</obj_property>
+      </wvobject>
+   </wvobject>
+   <wvobject type="group" fp_name="group:Pipeline State">
+      <obj_property name="label">Pipeline State</obj_property>
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/stage1_pending">
+         <obj_property name="ElementShortName">stage1_pending</obj_property>
+         <obj_property name="ObjectShortName">stage1_pending</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/stage2_pending">
+         <obj_property name="ElementShortName">stage2_pending</obj_property>
+         <obj_property name="ObjectShortName">stage2_pending</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/ddr4_sim_top/u_dut/u_controller/stage2_we">
+         <obj_property name="ElementShortName">stage2_we</obj_property>
+         <obj_property name="ObjectShortName">stage2_we</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/stage2_bank">
+         <obj_property name="ElementShortName">stage2_bank[3:0]</obj_property>
+         <obj_property name="ObjectShortName">stage2_bank[3:0]</obj_property>
+         <obj_property name="Radix">UNSIGNEDRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/stage2_row">
+         <obj_property name="ElementShortName">stage2_row</obj_property>
+         <obj_property name="ObjectShortName">stage2_row</obj_property>
+         <obj_property name="Radix">HEXRADIX</obj_property>
+      </wvobject>
+   </wvobject>
+   <wvobject type="group" fp_name="group:Bank Tracking">
+      <obj_property name="label">Bank Tracking</obj_property>
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/bank_status_q">
+         <obj_property name="ElementShortName">bank_status_q[15:0]</obj_property>
+         <obj_property name="ObjectShortName">bank_status_q[15:0]</obj_property>
+         <obj_property name="Radix">BINARYRADIX</obj_property>
+      </wvobject>
+   </wvobject>
+   <wvobject type="group" fp_name="group:Delay Counters (Bank 0, BG 0)">
+      <obj_property name="label">Delay Counters (Bank 0, BG 0)</obj_property>
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/delay_before_activate_counter_q[0]">
+         <obj_property name="ElementShortName">delay_before_activate_counter_q[0]</obj_property>
+         <obj_property name="ObjectShortName">delay_before_activate_counter_q[0]</obj_property>
+         <obj_property name="Radix">UNSIGNEDRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/delay_before_write_counter_q[0]">
+         <obj_property name="ElementShortName">delay_before_write_counter_q[0]</obj_property>
+         <obj_property name="ObjectShortName">delay_before_write_counter_q[0]</obj_property>
+         <obj_property name="Radix">UNSIGNEDRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/ccd_counter_q[0]">
+         <obj_property name="ElementShortName">ccd_counter_q[0]</obj_property>
+         <obj_property name="ObjectShortName">ccd_counter_q[0]</obj_property>
+         <obj_property name="Radix">UNSIGNEDRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/rrd_counter_q[0]">
+         <obj_property name="ElementShortName">rrd_counter_q[0]</obj_property>
+         <obj_property name="ObjectShortName">rrd_counter_q[0]</obj_property>
+         <obj_property name="Radix">UNSIGNEDRADIX</obj_property>
+      </wvobject>
+   </wvobject>
 </wave_config>

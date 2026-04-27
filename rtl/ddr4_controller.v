@@ -474,6 +474,341 @@ module ddr4_controller #(
     assign o_calib_complete = 1'b0; // driven by training pump in Phase 7
     assign o_calib_error = 1'b0;
 
+    // ═══════════════════════════════════════════════════════════════════
+    // §7.5 — Address Decode
+    // WB address → {row, bg, ba, col} per ADDR_MAPPING (PLAN §6.12)
+    // ADDR_MAPPING=0: {row, bg, ba, col} — sequential
+    // ADDR_MAPPING=1: {row, ba, col, bg} — BG-interleaved (default)
+    // ═══════════════════════════════════════════════════════════════════
+    wire[COL_BITS-1:0]        wb_col;
+    wire[BA_BITS-1:0]         wb_ba;
+    wire[BG_BITS-1:0]         wb_bg;
+    wire[ROW_BITS-1:0]        wb_row;
+    wire[BG_BITS+BA_BITS-1:0] wb_bank;
+    wire[WB_ADDR_BITS-1:0]    wb_addr_next = i_wb_addr + 1'b1;
+    wire[BG_BITS-1:0]         wb_next_bg;
+    wire[BA_BITS-1:0]         wb_next_ba;
+    wire[ROW_BITS-1:0]        wb_next_row;
+    wire[BG_BITS+BA_BITS-1:0] wb_next_bank;
+
+    generate
+        if (ADDR_MAPPING == 0) begin : addr_map_0
+            assign wb_col = {i_wb_addr[COL_USED-1:0], {COL_LOW{1'b0}}};
+            assign wb_ba  = i_wb_addr[COL_USED +: BA_BITS];
+            assign wb_bg  = i_wb_addr[COL_USED + BA_BITS +: BG_BITS];
+            assign wb_row = i_wb_addr[COL_USED + BA_BITS + BG_BITS +: ROW_BITS];
+            assign wb_next_bg  = wb_addr_next[COL_USED + BA_BITS +: BG_BITS];
+            assign wb_next_ba  = wb_addr_next[COL_USED +: BA_BITS];
+            assign wb_next_row = wb_addr_next[COL_USED + BA_BITS + BG_BITS +: ROW_BITS];
+        end else begin : addr_map_1
+            // BG at lowest position — sequential WB accesses cycle through bank groups,
+            // exploiting tCCD_S < tCCD_L for streaming workloads (JESD79-4D §4.7)
+            assign wb_bg  = i_wb_addr[BG_BITS-1:0];
+            assign wb_col = {i_wb_addr[BG_BITS +: COL_USED], {COL_LOW{1'b0}}};
+            assign wb_ba  = i_wb_addr[BG_BITS + COL_USED +: BA_BITS];
+            assign wb_row = i_wb_addr[BG_BITS + COL_USED + BA_BITS +: ROW_BITS];
+            assign wb_next_bg  = wb_addr_next[BG_BITS-1:0];
+            assign wb_next_ba  = wb_addr_next[BG_BITS + COL_USED +: BA_BITS];
+            assign wb_next_row = wb_addr_next[BG_BITS + COL_USED + BA_BITS +: ROW_BITS];
+        end
+    endgenerate
+    assign wb_bank      = {wb_bg, wb_ba};
+    assign wb_next_bank = {wb_next_bg, wb_next_ba};
+
+    // ── Stage 1 pipeline registers ──
+    reg                       stage1_pending;
+    reg                       stage1_we;
+    reg[WB_DATA_BITS-1:0]    stage1_data;
+    reg[WB_SEL_BITS-1:0]     stage1_dm;
+    reg[COL_BITS-1:0]        stage1_col;
+    reg[BA_BITS-1:0]         stage1_ba;
+    reg[BG_BITS-1:0]         stage1_bg;
+    reg[ROW_BITS-1:0]        stage1_row;
+    reg[BG_BITS+BA_BITS-1:0] stage1_bank;
+    reg[BG_BITS+BA_BITS-1:0] stage1_next_bank; // anticipation: pre-ACT target
+    reg[ROW_BITS-1:0]        stage1_next_row;
+
+    // ── Stage 2 pipeline registers (scheduling logic added in Phase 4B) ──
+    reg                       stage2_pending;
+    reg                       stage2_we;
+    reg[WB_DATA_BITS-1:0]    stage2_data;
+    reg[WB_SEL_BITS-1:0]     stage2_dm;
+    reg[COL_BITS-1:0]        stage2_col;
+    reg[BA_BITS-1:0]         stage2_ba;
+    reg[BG_BITS-1:0]         stage2_bg;
+    reg[ROW_BITS-1:0]        stage2_row;
+    reg[BG_BITS+BA_BITS-1:0] stage2_bank;
+
+    // ── tFAW sliding window (PLAN §6.5.3) — blocks 5th ACT within window ──
+    reg[$clog2(TFAW_CYCLES):0] activate_timestamp_q [3:0];
+    reg[1:0]                   activate_index_q;
+
+    // ── Combinational next-state (decremented each cycle, loaded by scheduler in 4B) ──
+    reg[$clog2(MAX_PRECHARGE_DELAY):0] delay_before_precharge_counter_d [NUM_BANKS-1:0];
+    reg[$clog2(MAX_ACTIVATE_DELAY):0]  delay_before_activate_counter_d  [NUM_BANKS-1:0];
+    reg[$clog2(MAX_WRITE_DELAY):0]     delay_before_write_counter_d     [NUM_BANKS-1:0];
+    reg[$clog2(MAX_READ_DELAY):0]      delay_before_read_counter_d      [NUM_BANKS-1:0];
+    reg[NUM_BANKS-1:0]                 bank_status_d;
+    reg[ROW_BITS-1:0]                  bank_active_row_d [NUM_BANKS-1:0];
+    reg[$clog2(MAX_CCD_DELAY):0]       ccd_counter_d [NUM_BG-1:0];
+    reg[$clog2(MAX_WTR_DELAY):0]       wtr_counter_d [NUM_BG-1:0];
+    reg[$clog2(MAX_RRD_DELAY):0]       rrd_counter_d [NUM_BG-1:0];
+    reg[$clog2(TFAW_CYCLES):0]         activate_timestamp_d [3:0];
+
+    // Scheduler runs during the tREFI idle window: instruction_address has
+    // wrapped back to REF_START but the delay counter is still counting down.
+    // During PRE ALL (addr 33 fire) and REF (addr 34), the scheduler is blocked.
+    wire refresh_idle = (instruction_address == ROM_ADDR_REF_START)
+                        && !delay_counter_is_zero;
+    wire refresh_active = reset_done && !refresh_idle;
+
+    // Detect ROM PRE ALL — clears all bank status (addrs 19, 30, 33)
+    wire rom_firing = delay_counter_is_zero && !pause_counter
+                      && (!reset_done || instruction_address >= ROM_ADDR_REF_START);
+    wire rom_precharge_all = rom_firing && !rom_cmd_is_mrs
+                             && (rom_instruction[26:23] == CMD_PRE)
+                             && rom_instruction[ROM_A10];
+
+    wire wb_accept = i_wb_cyc && i_wb_stb && !o_wb_stall;
+
+    // ── Scheduler decision flags (set in §11c, used by sequential block) ──
+    reg cmd_odt;
+    reg stage2_update;
+    reg sched_precharge;
+    reg sched_activate;
+    reg sched_write;
+    reg sched_read;
+    reg sched_anticipate;
+
+    // tFAW: block 5th ACT if oldest timestamp hasn't expired
+    wire tfaw_blocked = |activate_timestamp_q[activate_index_q];
+
+    // Next-bank BG extraction for anticipation
+    wire[BG_BITS-1:0] stage1_next_bg = stage1_next_bank[BG_BITS+BA_BITS-1:BA_BITS];
+
+    // Row padding to 17 bits for ACT command construction (SPEC §3.3)
+    wire[16:0] stage2_row_padded     = {{(17-ROW_BITS){1'b0}}, stage2_row};
+    wire[16:0] stage1_next_row_padded = {{(17-ROW_BITS){1'b0}}, stage1_next_row};
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §11a — Combinational Counter Decrement
+    // Saturating decrement: (|counter) is 1 when nonzero, 0 when zero.
+    // Phase 4B: scheduler overrides _d values to load counters on issue.
+    // ═══════════════════════════════════════════════════════════════════
+    integer ci;
+    always @* begin
+        for (ci = 0; ci < NUM_BANKS; ci = ci + 1) begin
+            delay_before_precharge_counter_d[ci] = delay_before_precharge_counter_q[ci]
+                - (|delay_before_precharge_counter_q[ci]);
+            delay_before_activate_counter_d[ci] = delay_before_activate_counter_q[ci]
+                - (|delay_before_activate_counter_q[ci]);
+            delay_before_write_counter_d[ci] = delay_before_write_counter_q[ci]
+                - (|delay_before_write_counter_q[ci]);
+            delay_before_read_counter_d[ci] = delay_before_read_counter_q[ci]
+                - (|delay_before_read_counter_q[ci]);
+            bank_status_d[ci] = bank_status_q[ci];
+            bank_active_row_d[ci] = bank_active_row_q[ci];
+        end
+        for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
+            ccd_counter_d[ci] = ccd_counter_q[ci] - (|ccd_counter_q[ci]);
+            wtr_counter_d[ci] = wtr_counter_q[ci] - (|wtr_counter_q[ci]);
+            rrd_counter_d[ci] = rrd_counter_q[ci] - (|rrd_counter_q[ci]);
+        end
+        for (ci = 0; ci < 4; ci = ci + 1)
+            activate_timestamp_d[ci] = activate_timestamp_q[ci]
+                - (|activate_timestamp_q[ci]);
+
+        // ROM PRE ALL closes all banks (refresh loop addr 33)
+        if (rom_precharge_all) begin
+            for (ci = 0; ci < NUM_BANKS; ci = ci + 1)
+                bank_status_d[ci] = 1'b0;
+        end
+
+        // ═══════════════════════════════════════════════════════════════
+        // §11c — Stage 2 Command Scheduling + Counter Loading
+        // PRE→ACT→RD/WR with bank group awareness (PLAN §6.6, SPEC §2–3)
+        // Uses counter_q <= 1 optimization (PLAN §6.6 stall path)
+        // ═══════════════════════════════════════════════════════════════
+        cmd_odt = 1'b0;
+        stage2_update = !stage2_pending;
+        sched_precharge = 1'b0;
+        sched_activate  = 1'b0;
+        sched_write     = 1'b0;
+        sched_read      = 1'b0;
+        sched_anticipate = 1'b0;
+
+        if (stage2_pending && refresh_idle) begin
+
+            // ── Bank active, wrong row → PRECHARGE (single bank) ──
+            if (bank_status_q[stage2_bank]
+                && (bank_active_row_q[stage2_bank] != stage2_row)
+                && (delay_before_precharge_counter_q[stage2_bank] <= 1)) begin
+                sched_precharge = 1'b1;
+                delay_before_activate_counter_d[stage2_bank] =
+                    PRECHARGE_TO_ACTIVATE_DELAY[$clog2(MAX_ACTIVATE_DELAY):0];
+                bank_status_d[stage2_bank] = 1'b0;
+            end
+
+            // ── Bank idle → ACTIVATE ──
+            else if (!bank_status_q[stage2_bank]
+                     && (delay_before_activate_counter_q[stage2_bank] <= 1)
+                     && (rrd_counter_q[stage2_bg] <= 1)
+                     && !tfaw_blocked) begin
+                sched_activate = 1'b1;
+                // tRAS — minimum time bank must stay active (JESD79-4D §4.22)
+                delay_before_precharge_counter_d[stage2_bank] =
+                    ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
+                // tRCD — only raise (protect lingering higher delay)
+                if (delay_before_write_counter_d[stage2_bank]
+                    < ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_WRITE_DELAY):0])
+                    delay_before_write_counter_d[stage2_bank] =
+                        ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
+                if (delay_before_read_counter_d[stage2_bank]
+                    < ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_READ_DELAY):0])
+                    delay_before_read_counter_d[stage2_bank] =
+                        ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_READ_DELAY):0];
+                bank_status_d[stage2_bank] = 1'b1;
+                bank_active_row_d[stage2_bank] = stage2_row;
+                // Per-BG tRRD: same BG = LONG, diff BG = SHORT only-raise (SPEC §2.4)
+                for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
+                    if (ci[BG_BITS-1:0] == stage2_bg)
+                        rrd_counter_d[ci] =
+                            ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG[$clog2(MAX_RRD_DELAY):0];
+                    else if (rrd_counter_d[ci]
+                             < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0])
+                        rrd_counter_d[ci] =
+                            ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0];
+                end
+                // Per-bank activate counter: only-raise for all other banks
+                // (BREAKDOWN counter loading table, belt-and-suspenders with rrd)
+                for (ci = 0; ci < NUM_BANKS; ci = ci + 1) begin
+                    if (ci[BG_BITS+BA_BITS-1:0] != stage2_bank
+                        && delay_before_activate_counter_d[ci]
+                           < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0])
+                        delay_before_activate_counter_d[ci] =
+                            ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0];
+                end
+                // tFAW — record this activate's timestamp (PLAN §6.5.3)
+                activate_timestamp_d[activate_index_q] =
+                    TFAW_CYCLES[$clog2(TFAW_CYCLES):0];
+            end
+
+            // ── Bank active, correct row → WRITE or READ ──
+            else if (bank_status_q[stage2_bank]
+                     && (bank_active_row_q[stage2_bank] == stage2_row)) begin
+
+                // WRITE — ODT on (SPEC §6.1)
+                if (stage2_we
+                    && (delay_before_write_counter_q[stage2_bank] <= 1)
+                    && (ccd_counter_q[stage2_bg] <= 1)) begin
+                    sched_write = 1'b1;
+                    cmd_odt = 1'b1;
+                    stage2_update = 1'b1;
+                    // tWR — precharge: only raise to protect tRAS
+                    if (delay_before_precharge_counter_d[stage2_bank]
+                        < WRITE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0])
+                        delay_before_precharge_counter_d[stage2_bank] =
+                            WRITE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
+                    // Per-BG tCCD + tWTR (SPEC §2.3)
+                    for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
+                        if (ci[BG_BITS-1:0] == stage2_bg) begin
+                            ccd_counter_d[ci] =
+                                CAS_TO_CAS_DELAY_SAME_BG[$clog2(MAX_CCD_DELAY):0];
+                            wtr_counter_d[ci] =
+                                WRITE_TO_READ_DELAY_SAME_BG[$clog2(MAX_WTR_DELAY):0];
+                        end else begin
+                            if (ccd_counter_d[ci]
+                                < CAS_TO_CAS_DELAY_DIFF_BG[$clog2(MAX_CCD_DELAY):0])
+                                ccd_counter_d[ci] =
+                                    CAS_TO_CAS_DELAY_DIFF_BG[$clog2(MAX_CCD_DELAY):0];
+                            if (wtr_counter_d[ci]
+                                < WRITE_TO_READ_DELAY_DIFF_BG[$clog2(MAX_WTR_DELAY):0])
+                                wtr_counter_d[ci] =
+                                    WRITE_TO_READ_DELAY_DIFF_BG[$clog2(MAX_WTR_DELAY):0];
+                        end
+                    end
+                end
+
+                // READ — ODT off (SPEC §6.1)
+                else if (!stage2_we
+                         && (delay_before_read_counter_q[stage2_bank] <= 1)
+                         && (ccd_counter_q[stage2_bg] <= 1)
+                         && (wtr_counter_q[stage2_bg] <= 1)) begin
+                    sched_read = 1'b1;
+                    stage2_update = 1'b1;
+                    // tRTP — precharge: only raise
+                    if (delay_before_precharge_counter_d[stage2_bank]
+                        < READ_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0])
+                        delay_before_precharge_counter_d[stage2_bank] =
+                            READ_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
+                    // RD→WR turnaround: all banks (global bus/ODT settling)
+                    for (ci = 0; ci < NUM_BANKS; ci = ci + 1) begin
+                        if (delay_before_write_counter_d[ci]
+                            < READ_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0])
+                            delay_before_write_counter_d[ci] =
+                                READ_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
+                    end
+                    // Per-BG tCCD (SPEC §2.3)
+                    for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
+                        if (ci[BG_BITS-1:0] == stage2_bg)
+                            ccd_counter_d[ci] =
+                                CAS_TO_CAS_DELAY_SAME_BG[$clog2(MAX_CCD_DELAY):0];
+                        else if (ccd_counter_d[ci]
+                                 < CAS_TO_CAS_DELAY_DIFF_BG[$clog2(MAX_CCD_DELAY):0])
+                            ccd_counter_d[ci] =
+                                CAS_TO_CAS_DELAY_DIFF_BG[$clog2(MAX_CCD_DELAY):0];
+                    end
+                end
+            end
+        end
+
+        // ── Bank anticipation: pre-ACT next bank while Stage 2 issues WR/RD ──
+        // Only fires when stage2_update (WR/RD completing or idle) and Stage 1
+        // has a pending request whose next-bank is idle (PLAN §6.6)
+        if (stage2_update && stage1_pending && refresh_idle
+            && !bank_status_d[stage1_next_bank]
+            && (delay_before_activate_counter_d[stage1_next_bank] == 0)
+            && (rrd_counter_d[stage1_next_bg] == 0)
+            && (activate_timestamp_d[activate_index_q] == 0)) begin
+            sched_anticipate = 1'b1;
+            delay_before_precharge_counter_d[stage1_next_bank] =
+                ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
+            if (delay_before_write_counter_d[stage1_next_bank]
+                < ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_WRITE_DELAY):0])
+                delay_before_write_counter_d[stage1_next_bank] =
+                    ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
+            if (delay_before_read_counter_d[stage1_next_bank]
+                < ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_READ_DELAY):0])
+                delay_before_read_counter_d[stage1_next_bank] =
+                    ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_READ_DELAY):0];
+            bank_status_d[stage1_next_bank] = 1'b1;
+            bank_active_row_d[stage1_next_bank] = stage1_next_row;
+            for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
+                if (ci[BG_BITS-1:0] == stage1_next_bg)
+                    rrd_counter_d[ci] =
+                        ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG[$clog2(MAX_RRD_DELAY):0];
+                else if (rrd_counter_d[ci]
+                         < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0])
+                    rrd_counter_d[ci] =
+                        ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0];
+            end
+            for (ci = 0; ci < NUM_BANKS; ci = ci + 1) begin
+                if (ci[BG_BITS+BA_BITS-1:0] != stage1_next_bank
+                    && delay_before_activate_counter_d[ci]
+                       < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0])
+                    delay_before_activate_counter_d[ci] =
+                        ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0];
+            end
+            activate_timestamp_d[activate_index_q] =
+                TFAW_CYCLES[$clog2(TFAW_CYCLES):0];
+        end
+    end
+
+    // ─── Stall: combinational, reflects current registered state ───
+    always @* begin
+        o_wb_stall = stage1_pending || !reset_done || refresh_active;
+    end
+
     // ── Sequential block ──
     integer bank_i;
     always @(posedge i_controller_clk) begin
@@ -499,7 +834,6 @@ module ddr4_controller #(
             o_dfi_wrlvl_strobe  <= 1'b0;
             o_dfi_lvl_pattern   <= 4'b0000;
             o_dfi_lvl_periodic  <= 1'b0;
-            o_wb_stall <= 1'b1;
             o_wb_data  <= {WB_DATA_BITS{1'b0}};
             reset_done <= 1'b0;
             instruction_address <= 6'd0;
@@ -524,6 +858,29 @@ module ddr4_controller #(
                 wtr_counter_q[bank_i] <= 0;
                 rrd_counter_q[bank_i] <= 0;
             end
+            for (bank_i = 0; bank_i < 4; bank_i = bank_i + 1)
+                activate_timestamp_q[bank_i] <= 0;
+            activate_index_q <= 2'b00;
+            stage1_pending <= 1'b0;
+            stage1_we      <= 1'b0;
+            stage1_data    <= {WB_DATA_BITS{1'b0}};
+            stage1_dm      <= {WB_SEL_BITS{1'b0}};
+            stage1_col     <= {COL_BITS{1'b0}};
+            stage1_ba      <= {BA_BITS{1'b0}};
+            stage1_bg      <= {BG_BITS{1'b0}};
+            stage1_row     <= {ROW_BITS{1'b0}};
+            stage1_bank    <= {(BG_BITS+BA_BITS){1'b0}};
+            stage1_next_bank <= {(BG_BITS+BA_BITS){1'b0}};
+            stage1_next_row  <= {ROW_BITS{1'b0}};
+            stage2_pending <= 1'b0;
+            stage2_we      <= 1'b0;
+            stage2_data    <= {WB_DATA_BITS{1'b0}};
+            stage2_dm      <= {WB_SEL_BITS{1'b0}};
+            stage2_col     <= {COL_BITS{1'b0}};
+            stage2_ba      <= {BA_BITS{1'b0}};
+            stage2_bg      <= {BG_BITS{1'b0}};
+            stage2_row     <= {ROW_BITS{1'b0}};
+            stage2_bank    <= {(BG_BITS+BA_BITS){1'b0}};
         end else begin
             // ═══════════════════════════════════════════════════════════
             // §11 — Command Scheduler Placeholder (NOP defaults)
@@ -534,7 +891,7 @@ module ddr4_controller #(
                 cmd_d[bank_i] <= {
                     1'b1,       //cs_n = 1 (deselected)
                     CMD_NOP,    //{act_n=1, ras_n=1, cas_n=1, we_n=1}
-                    1'b0,       //odt
+                    cmd_odt,    //odt (broadcast to all slots per SPEC §6.3)
                     reset_done ? 1'b1 : init_cke,     //cke (muxed: rom_instruction on fire, hold on countdown)
                     reset_done ? 1'b1 : init_reset_n, //reset_n (muxed: rom_instruction on fire, hold on countdown)
                     2'b00,      //bg
@@ -610,9 +967,140 @@ module ddr4_controller #(
                         instruction_address <= instruction_address + 1'b1;
                 end
             end
-            // Phase 4: Command scheduler + delay counters
-            // Phase 5: Read ACK pipeline + refresh
+            // ═══════════════════════════════════════════════════════════
+            // §11d — Scheduler Command Construction (SPEC §3.3–3.4)
+            // Driven by sched_* flags from combinational §11c.
+            // Scheduler only fires during tREFI idle window.
+            // ═══════════════════════════════════════════════════════════
+            if (sched_precharge) begin
+                cmd_d[PRECHARGE_SLOT] <= {
+                    1'b0,           //cs_n = 0
+                    CMD_PRE,        //{act_n=1, ras_n=0, cas_n=1, we_n=0}
+                    cmd_odt, 1'b1, 1'b1,  //odt, cke=1, reset_n=1
+                    stage2_bg,      //bg
+                    stage2_ba,      //ba
+                    7'b0, 1'b0, 9'b0  //A10=0 (single bank precharge)
+                };
+            end
+            if (sched_activate) begin
+                cmd_d[ACTIVATE_SLOT] <= {
+                    1'b0,           //cs_n = 0
+                    1'b0,           //act_n = 0 (ACTIVATE)
+                    stage2_row_padded[16],  //ras_n → A16
+                    stage2_row_padded[15],  //cas_n → A15
+                    stage2_row_padded[14],  //we_n  → A14
+                    cmd_odt, 1'b1, 1'b1,
+                    stage2_bg,
+                    stage2_ba,
+                    stage2_row_padded  //addr[16:0] = full row address
+                };
+            end
+            if (sched_write) begin
+                cmd_d[WRITE_SLOT] <= {
+                    1'b0,           //cs_n = 0
+                    CMD_WR,         //{act_n=1, ras_n=1, cas_n=0, we_n=0}
+                    cmd_odt, 1'b1, 1'b1,
+                    stage2_bg,
+                    stage2_ba,
+                    3'b000,         //A16:A14
+                    1'b0,           //A13
+                    1'b0,           //A12 (BL8, no BC4)
+                    1'b0,           //A11
+                    1'b0,           //A10 = 0 (no auto-precharge)
+                    stage2_col[9:0] //A9:A0 = column
+                };
+            end
+            if (sched_read) begin
+                cmd_d[READ_SLOT] <= {
+                    1'b0,           //cs_n = 0
+                    CMD_RD,         //{act_n=1, ras_n=1, cas_n=0, we_n=1}
+                    cmd_odt, 1'b1, 1'b1,
+                    stage2_bg,
+                    stage2_ba,
+                    3'b000,         //A16:A14
+                    1'b0,           //A13
+                    1'b0,           //A12
+                    1'b0,           //A11
+                    1'b0,           //A10 = 0 (no auto-precharge)
+                    stage2_col[9:0] //A9:A0 = column
+                };
+            end
+            if (sched_anticipate) begin
+                cmd_d[ACTIVATE_SLOT] <= {
+                    1'b0,           //cs_n = 0
+                    1'b0,           //act_n = 0 (ACTIVATE)
+                    stage1_next_row_padded[16],
+                    stage1_next_row_padded[15],
+                    stage1_next_row_padded[14],
+                    cmd_odt, 1'b1, 1'b1,
+                    stage1_next_bg,
+                    stage1_next_bank[BA_BITS-1:0],
+                    stage1_next_row_padded
+                };
+            end
+
+            // Phase 5: Read ACK pipeline + refresh integration
             // Phase 7: Training command pump
+
+            // ═══════════════════════════════════════════════════════════
+            // §11b — Counter Latch + Pipeline Handoff + Stage 1 WB Accept
+            // ═══════════════════════════════════════════════════════════
+
+            // Latch combinational next-state into registers
+            for (bank_i = 0; bank_i < NUM_BANKS; bank_i = bank_i + 1) begin
+                delay_before_precharge_counter_q[bank_i] <= delay_before_precharge_counter_d[bank_i];
+                delay_before_activate_counter_q[bank_i]  <= delay_before_activate_counter_d[bank_i];
+                delay_before_write_counter_q[bank_i]     <= delay_before_write_counter_d[bank_i];
+                delay_before_read_counter_q[bank_i]      <= delay_before_read_counter_d[bank_i];
+                bank_status_q[bank_i]     <= bank_status_d[bank_i];
+                bank_active_row_q[bank_i] <= bank_active_row_d[bank_i];
+            end
+            for (bank_i = 0; bank_i < NUM_BG; bank_i = bank_i + 1) begin
+                ccd_counter_q[bank_i] <= ccd_counter_d[bank_i];
+                wtr_counter_q[bank_i] <= wtr_counter_d[bank_i];
+                rrd_counter_q[bank_i] <= rrd_counter_d[bank_i];
+            end
+            for (bank_i = 0; bank_i < 4; bank_i = bank_i + 1)
+                activate_timestamp_q[bank_i] <= activate_timestamp_d[bank_i];
+
+            // tFAW index advance on any ACT issue (scheduler or anticipation)
+            if (sched_activate || sched_anticipate)
+                activate_index_q <= activate_index_q + 1'b1;
+
+            // Stage 1→2 handoff: zero-bubble pipeline (PLAN §6.6)
+            // stage2_update=1 when Stage 2 idle OR just issued WR/RD (completing).
+            // Consume Stage 1's request immediately → no wasted cycles.
+            if (stage2_update) begin
+                if (stage1_pending) begin
+                    stage2_pending <= 1'b1;
+                    stage2_we      <= stage1_we;
+                    stage2_data    <= stage1_data;
+                    stage2_dm      <= stage1_dm;
+                    stage2_col     <= stage1_col;
+                    stage2_ba      <= stage1_ba;
+                    stage2_bg      <= stage1_bg;
+                    stage2_row     <= stage1_row;
+                    stage2_bank    <= stage1_bank;
+                    stage1_pending <= 1'b0;
+                end else begin
+                    stage2_pending <= 1'b0;
+                end
+            end
+
+            // Stage 1: latch decoded WB request
+            if (wb_accept) begin
+                stage1_pending   <= 1'b1;
+                stage1_we        <= i_wb_we;
+                stage1_data      <= i_wb_data;
+                stage1_dm        <= i_wb_sel;
+                stage1_col       <= wb_col;
+                stage1_ba        <= wb_ba;
+                stage1_bg        <= wb_bg;
+                stage1_row       <= wb_row;
+                stage1_bank      <= wb_bank;
+                stage1_next_bank <= wb_next_bank;
+                stage1_next_row  <= wb_next_row;
+            end
 
             // ═══════════════════════════════════════════════════════════
             // §12 — DFI Signal Mapping (DFI 3.1 §3.2, 4-phase, 1:4 ratio)
@@ -834,16 +1322,25 @@ module ddr4_controller #(
         nCK_to_cycles = (nck + SERDES_RATIO - 1) / SERDES_RATIO;
     endfunction
 
-    // find_delay: slot-aware delay for DFI 3.1 4-phase packing.
-    // Minimum controller cycles between a command in start_slot
-    // and a command in end_slot, given a required gap of delay_nCK DDR cycles.
-    // The actual DDR gap is: (4 - start_slot) + end_slot + 4*k
+    // find_delay: slot-aware delay counter value for DFI 3.1 4-phase packing.
+    // Returns the value to load into a per-bank delay counter such that
+    // the DDR gap between a command in start_slot and a command in end_slot
+    // meets or exceeds delay_nCK DDR clock cycles.
+    //
+    // UberDDR3 uses registered eligibility (counter_d==0 → register → fire next cycle),
+    // giving gap = 4*(k+1) + end_slot - start_slot for k >= 0.
+    // UberDDR4 fires directly when counter_q <= 1 (no registered pipeline), giving:
+    //   k=0 : fire at M+1, gap = 4 + end_slot - start_slot
+    //   k>=2: fire at M+k, gap = 4*k + end_slot - start_slot
+    //   (k=1 fires at M+1, same as k=0 due to <= 1 check)
+    // So for k >= 1 returned by the DDR3-style formula, we add 1 to compensate.
     function integer find_delay(input integer delay_nCK, input integer start_slot, input integer end_slot);
         integer k;
         begin
             k = 0;
             while (((4 - start_slot) + end_slot + 4*k) < delay_nCK)
                 k = k + 1;
+            if (k > 0) k = k + 1;
             find_delay = k;
         end
     endfunction

@@ -1,0 +1,27 @@
+[tasks]
+prove_map0
+prove_map1
+
+[options]
+prove_map0: mode prove
+prove_map0: depth 8
+prove_map1: mode prove
+prove_map1: depth 8
+
+[engines]
+smtbmc
+
+[script]
+prove_map0: read -formal -DADDR_MAPPING=0 ddr4_controller.v
+prove_map1: read -formal -DADDR_MAPPING=1 ddr4_controller.v
+read -formal fwb_slave.v
+read -formal mini_fifo.v
+read -formal f_addr_decode.v
+prep -top ddr4_controller
+
+[files]
+rtl/ddr4_controller.v
+formal/ddr4_controller_formal.vh
+formal/fwb_slave.v
+formal/mini_fifo.v
+formal/f_addr_decode.v

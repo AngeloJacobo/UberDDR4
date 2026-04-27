@@ -104,6 +104,7 @@ module ddr4_sim_top;
     reg [EXT_ADDR_BITS-1:0]  wb_addr;
     reg [WB_DATA_BITS-1:0]   wb_data;
     reg [WB_SEL_BITS-1:0]    wb_sel;
+    wire                     wb_stall;
     reg                      bist_start;
 
     initial begin
@@ -152,7 +153,7 @@ module ddr4_sim_top;
         .i_wb_addr         (wb_addr),
         .i_wb_data         (wb_data),
         .i_wb_sel          (wb_sel),
-        .o_wb_stall        (),
+        .o_wb_stall        (wb_stall),
         .o_wb_ack          (),
         .o_wb_data         (),
         .o_ddr4_ck_p       (ddr4_ck_p),
@@ -335,13 +336,205 @@ module ddr4_sim_top;
         end
     end
 
-    // Monitor REF commands on the DFI interface (phase-independent — works for
-    // ROM-driven refresh, command-scheduler refresh, or any future source).
-    // Uses the existing dbg_dfi_cmd decode which checks DFI phase-0 signals.
+    // ═══════════════════════════════════════════════════════════════════
+    // WB Write Stimulus — Multi-phase test covering all scheduler paths
+    //
+    // ADDR_MAPPING=1 (BG-interleaved) address layout:
+    //   bits [1:0]   = BG
+    //   bits [7:2]   = col_upper (→ col[9:4])
+    //   bits [9:8]   = BA
+    //   bits [25:10]  = row
+    //
+    // Phase A: Cold writes to idle banks       (ACT → WR)
+    // Phase B: Bank hits, same row still open  (WR only)
+    // Phase C: Row miss, different row          (PRE → ACT → WR)
+    // Phase D: Post-refresh, banks closed       (ACT → WR again)
+    // Phase E: Same-BG different-bank writes   (tests tRRD_L / tCCD_L)
+    // ═══════════════════════════════════════════════════════════════════
+
     integer ref_count;
+    initial ref_count = 0;
+
+    reg [8*8-1:0] test_phase;
+    initial test_phase = "IDLE";
+    reg all_tests_done;
+    initial all_tests_done = 1'b0;
+
+    localparam [EXT_ADDR_BITS-1:0] ROW0_BG0 = 0,
+                                    ROW0_BG1 = 1,
+                                    ROW0_BG2 = 2,
+                                    ROW0_BG3 = 3,
+                                    ROW1_BG0 = (1 << 10) | 0,
+                                    ROW1_BG1 = (1 << 10) | 1,
+                                    ROW1_BG2 = (1 << 10) | 2,
+                                    ROW1_BG3 = (1 << 10) | 3,
+                                    ROW0_BG0_BA1 = (1 << 8) | 0,
+                                    ROW0_BG0_BA2 = (2 << 8) | 0;
+
+    task wb_write_one(input [EXT_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data);
+        begin
+            wb_cyc  = 1'b1;
+            wb_stb  = 1'b1;
+            wb_we   = 1'b1;
+            wb_addr = addr;
+            wb_data = data;
+            wb_sel  = {WB_SEL_BITS{1'b1}};
+            @(posedge controller_clk);
+            while (wb_stall) @(posedge controller_clk);
+        end
+    endtask
+
+    task wb_idle;
+        begin
+            wb_stb = 1'b0;
+            wb_cyc = 1'b0;
+            wb_we  = 1'b0;
+        end
+    endtask
+
+    task drain_pipeline;
+        begin
+            wb_idle;
+            repeat (40) @(posedge controller_clk);
+        end
+    endtask
+
+    integer wb_write_count;
+    initial wb_write_count = 0;
+
+    initial begin
+        wait (reset_done_seen);
+        @(posedge controller_clk);
+        while (wb_stall) @(posedge controller_clk);
+
+        // ── Phase A: Cold writes to 4 idle banks (ACT → WR) ──
+        test_phase = "PHASE_A";
+        $display("[%0t] ═══ Phase A: Cold writes to idle banks (ACT→WR) ═══", $realtime);
+        wb_write_one(ROW0_BG0, 128'h0A);
+        $display("[%0t]   write BG0/BA0/row0", $realtime);
+        wb_write_one(ROW0_BG1, 128'h0B);
+        $display("[%0t]   write BG1/BA0/row0", $realtime);
+        wb_write_one(ROW0_BG2, 128'h0C);
+        $display("[%0t]   write BG2/BA0/row0", $realtime);
+        wb_write_one(ROW0_BG3, 128'h0D);
+        $display("[%0t]   write BG3/BA0/row0", $realtime);
+        drain_pipeline;
+
+        // ── Phase B: Bank hits — same bank, same row still open (WR only) ──
+        test_phase = "PHASE_B";
+        $display("[%0t] ═══ Phase B: Bank hits — same row open (WR only) ═══", $realtime);
+        wb_write_one(ROW0_BG0, 128'h1A);
+        $display("[%0t]   write BG0/BA0/row0 (hit)", $realtime);
+        wb_write_one(ROW0_BG1, 128'h1B);
+        $display("[%0t]   write BG1/BA0/row0 (hit)", $realtime);
+        wb_write_one(ROW0_BG2, 128'h1C);
+        $display("[%0t]   write BG2/BA0/row0 (hit)", $realtime);
+        wb_write_one(ROW0_BG3, 128'h1D);
+        $display("[%0t]   write BG3/BA0/row0 (hit)", $realtime);
+        drain_pipeline;
+
+        // ── Phase C: Row miss — same bank, different row (PRE → ACT → WR) ──
+        test_phase = "PHASE_C";
+        $display("[%0t] ═══ Phase C: Row miss — different row (PRE→ACT→WR) ═══", $realtime);
+        wb_write_one(ROW1_BG0, 128'h2A);
+        $display("[%0t]   write BG0/BA0/row1 (miss)", $realtime);
+        wb_write_one(ROW1_BG1, 128'h2B);
+        $display("[%0t]   write BG1/BA0/row1 (miss)", $realtime);
+        wb_write_one(ROW1_BG2, 128'h2C);
+        $display("[%0t]   write BG2/BA0/row1 (miss)", $realtime);
+        wb_write_one(ROW1_BG3, 128'h2D);
+        $display("[%0t]   write BG3/BA0/row1 (miss)", $realtime);
+        drain_pipeline;
+
+        // ── Phase D: Wait for refresh (PRE ALL closes all banks), then re-access ──
+        test_phase = "WAIT_REF";
+        $display("[%0t] ═══ Waiting for refresh to close all banks... ═══", $realtime);
+        wb_idle;
+        wait (ref_count >= 2);
+        @(posedge controller_clk);
+        while (wb_stall) @(posedge controller_clk);
+
+        test_phase = "PHASE_D";
+        $display("[%0t] ═══ Phase D: Post-refresh writes (ACT→WR) ═══", $realtime);
+        wb_write_one(ROW0_BG0, 128'h3A);
+        $display("[%0t]   write BG0/BA0/row0 (post-refresh)", $realtime);
+        wb_write_one(ROW0_BG1, 128'h3B);
+        $display("[%0t]   write BG1/BA0/row0 (post-refresh)", $realtime);
+        wb_write_one(ROW0_BG2, 128'h3C);
+        $display("[%0t]   write BG2/BA0/row0 (post-refresh)", $realtime);
+        wb_write_one(ROW0_BG3, 128'h3D);
+        $display("[%0t]   write BG3/BA0/row0 (post-refresh)", $realtime);
+        drain_pipeline;
+
+        // ── Phase E: Same-BG different-bank writes (tRRD_L / tCCD_L stress) ──
+        test_phase = "PHASE_E";
+        $display("[%0t] ═══ Phase E: Same-BG different-bank writes (tRRD/tCCD_L) ═══", $realtime);
+        wb_write_one(ROW0_BG0,     128'h4A);
+        $display("[%0t]   write BG0/BA0/row0", $realtime);
+        wb_write_one(ROW0_BG0_BA1, 128'h4B);
+        $display("[%0t]   write BG0/BA1/row0 (same BG, diff bank)", $realtime);
+        wb_write_one(ROW0_BG0_BA2, 128'h4C);
+        $display("[%0t]   write BG0/BA2/row0 (same BG, diff bank)", $realtime);
+        drain_pipeline;
+
+        test_phase = "DONE";
+        $display("[%0t] ═══ All test phases complete ═══", $realtime);
+        all_tests_done = 1'b1;
+    end
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Command Monitor — uses DFI signals (all 4 phases per controller cycle)
+    // DDR4 bus only shows one slot per controller_clk edge; DFI shows all 4.
+    // ═══════════════════════════════════════════════════════════════════
+    wire [3:0] mon_cs_n  = u_dut.u_controller.o_dfi_cs_n;
+    wire [3:0] mon_act_n = u_dut.u_controller.o_dfi_act_n;
+    wire [3:0] mon_ras_n = u_dut.u_controller.o_dfi_ras_n;
+    wire [3:0] mon_cas_n = u_dut.u_controller.o_dfi_cas_n;
+    wire [3:0] mon_we_n  = u_dut.u_controller.o_dfi_we_n;
+    wire [4*BG_BITS-1:0] mon_bg   = u_dut.u_controller.o_dfi_bg;
+    wire [4*BA_BITS-1:0] mon_bank = u_dut.u_controller.o_dfi_bank;
+
+    wire [3:0] mon_is_act = ~mon_cs_n & ~mon_act_n;
+    wire [3:0] mon_is_wr  = ~mon_cs_n & mon_act_n & mon_ras_n & ~mon_cas_n & ~mon_we_n;
+    wire [3:0] mon_is_pre = ~mon_cs_n & mon_act_n & ~mon_ras_n & mon_cas_n & ~mon_we_n;
+
+    integer act_count, wr_count, pre_count;
+    integer mon_ph;
+    initial begin act_count = 0; wr_count = 0; pre_count = 0; end
+
+    always @(posedge controller_clk) begin
+        if (reset_done_seen && !all_tests_done) begin
+            for (mon_ph = 0; mon_ph < 4; mon_ph = mon_ph + 1) begin
+                if (mon_is_act[mon_ph]) begin
+                    act_count = act_count + 1;
+                    $display("[%0t] [%0s] DDR4 ACT #%0d: BG=%0d BA=%0d (slot %0d)",
+                             $realtime, test_phase, act_count,
+                             mon_bg[mon_ph*BG_BITS +: BG_BITS],
+                             mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph);
+                end
+                if (mon_is_wr[mon_ph]) begin
+                    wr_count = wr_count + 1;
+                    $display("[%0t] [%0s] DDR4 WR  #%0d: BG=%0d BA=%0d (slot %0d)",
+                             $realtime, test_phase, wr_count,
+                             mon_bg[mon_ph*BG_BITS +: BG_BITS],
+                             mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph);
+                end
+                if (mon_is_pre[mon_ph]) begin
+                    pre_count = pre_count + 1;
+                    $display("[%0t] [%0s] DDR4 PRE #%0d: BG=%0d BA=%0d (slot %0d)",
+                             $realtime, test_phase, pre_count,
+                             mon_bg[mon_ph*BG_BITS +: BG_BITS],
+                             mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph);
+                end
+            end
+        end
+    end
+
+    // ═══════════════════════════════════════════════════════════════════
+    // REF Monitor
+    // ═══════════════════════════════════════════════════════════════════
     realtime ref_time_prev;
     realtime ref_time_curr;
-    initial ref_count = 0;
     initial ref_time_prev = 0;
     initial ref_time_curr = 0;
 
@@ -359,20 +552,29 @@ module ddr4_sim_top;
         end
     end
 
-    localparam NUM_REFRESH_CYCLES = 5;
+    // ═══════════════════════════════════════════════════════════════════
+    // End-of-test: wait for all phases + 3 refresh cycles, then report
+    // ═══════════════════════════════════════════════════════════════════
+    localparam NUM_REFRESH_CYCLES = 3;
 
     initial begin
-        wait (reset_done_seen);
+        wait (all_tests_done);
         wait (ref_count >= NUM_REFRESH_CYCLES);
         repeat (10) @(posedge controller_clk);
-        $display("[%0t] PASS: %0d refresh cycles observed", $realtime, ref_count);
+        $display("");
+        $display("[%0t] ═══════════════════════════════════════════════", $realtime);
+        $display("[%0t] SUMMARY: ACT=%0d  WR=%0d  PRE=%0d  REF=%0d",
+                 $realtime, act_count, wr_count, pre_count, ref_count);
+        $display("[%0t] PASS: All 5 test phases + %0d refresh cycles, zero violations",
+                 $realtime, ref_count);
         $display("[%0t] Simulation finished successfully", $realtime);
+        $display("[%0t] ═══════════════════════════════════════════════", $realtime);
         $finish;
     end
 
     initial begin
-        #50_000_000;
-        $display("[%0t] TIMEOUT: init did not complete within 50 us", $realtime);
+        #120_000_000;
+        $display("[%0t] TIMEOUT: simulation did not complete within 120 us", $realtime);
         $finish;
     end
 

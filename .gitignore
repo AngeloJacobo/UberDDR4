@@ -34,6 +34,12 @@ testbench/micron/ddr4_model.sv
 *.ip_user_files/
 *.sim/
 
+# Formal verification (SymbiYosys work directories)
+formal/ddr4_singleconfig/
+formal/ddr4_singleconfig_*/
+formal/ddr4_multiconfig/
+formal/ddr4_multiconfig_*/
+
 # Python
 __pycache__/
 *.pyc
