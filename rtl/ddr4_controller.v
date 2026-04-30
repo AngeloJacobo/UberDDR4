@@ -317,6 +317,13 @@ module ddr4_controller #(
     localparam MAX_WTR_DELAY       = WRITE_TO_READ_DELAY_SAME_BG;
     localparam MAX_RRD_DELAY       = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG;
 
+    // ── Read/Write data enable pipeline depths (SPEC §4.3, §5.3) ──
+    // Controller cycles from READ command to dfi_rddata_en assertion
+    localparam READ_DELAY = find_delay(CL_nCK, READ_SLOT, READ_SLOT);
+    localparam RDDATA_EN_PIPE_WIDTH = READ_DELAY + 2;
+    // Controller cycles from WRITE command to dfi_wrdata_en assertion
+    localparam WRITE_DATA_DELAY = find_delay(CWL_nCK, WRITE_SLOT, WRITE_SLOT);
+
     // ROM delay counter width — enough for longest init timer
     localparam DELAY_COUNTER_WIDTH = 20;
 
@@ -468,8 +475,14 @@ module ddr4_controller #(
     wire init_cke     = init_firing ? (rom_cmd_is_mrs ? 1'b1 : rom_instruction[ROM_CKE])     : rom_cke_hold;
     wire init_reset_n = init_firing ? (rom_cmd_is_mrs ? 1'b1 : rom_instruction[ROM_RESET_N]) : rom_reset_n_hold;
 
-    // ── Static outputs (Phase 1 stubs) ──
-    assign o_wb_ack = 1'b0; // driven by read ACK pipeline in Phase 5
+    // ── §13 Read/Write data enable pipelines (SPEC §4.4, §5.3) ──
+    reg[RDDATA_EN_PIPE_WIDTH-1:0] rddata_en_pipe_q;
+    reg[WRITE_DATA_DELAY:0]       wrdata_en_pipe_q;
+    reg                           write_ack_q;
+    reg                           read_ack_q;
+
+    // ── Static outputs ──
+    assign o_wb_ack = i_rst_n && reset_done && (write_ack_q || read_ack_q);
     assign o_dfi_init_start = ~reset_done; // request PHY init until ROM completes
     assign o_calib_complete = 1'b0; // driven by training pump in Phase 7
     assign o_calib_error = 1'b0;
@@ -861,6 +874,10 @@ module ddr4_controller #(
             for (bank_i = 0; bank_i < 4; bank_i = bank_i + 1)
                 activate_timestamp_q[bank_i] <= 0;
             activate_index_q <= 2'b00;
+            rddata_en_pipe_q <= {RDDATA_EN_PIPE_WIDTH{1'b0}};
+            wrdata_en_pipe_q <= {(WRITE_DATA_DELAY+1){1'b0}};
+            write_ack_q <= 1'b0;
+            read_ack_q  <= 1'b0;
             stage1_pending <= 1'b0;
             stage1_we      <= 1'b0;
             stage1_data    <= {WB_DATA_BITS{1'b0}};
@@ -1039,7 +1056,44 @@ module ddr4_controller #(
                 };
             end
 
-            // Phase 5: Read ACK pipeline + refresh integration
+            // ═══════════════════════════════════════════════════════════
+            // §13 — Read/Write Data Enable Pipelines + WB ACK
+            // Shift registers track when dfi_rddata_en / dfi_wrdata_en
+            // should assert after a READ / WRITE command. WB ACK is
+            // generated from write command issue and dfi_rddata_valid.
+            // ═══════════════════════════════════════════════════════════
+
+            // Write data enable shift register (SPEC §5.3)
+            wrdata_en_pipe_q <= {1'b0, wrdata_en_pipe_q[WRITE_DATA_DELAY:1]};
+            if (sched_write)
+                wrdata_en_pipe_q[WRITE_DATA_DELAY] <= 1'b1;
+            o_dfi_wrdata_en <= {4{wrdata_en_pipe_q[0]}};
+
+            // Write data pipeline — drive DFI write data from stage2
+            // Data is captured at stage1→stage2 handoff; by the time
+            // wrdata_en_pipe_q[0] asserts, stage2_data holds the correct word.
+            // Phase packing per SPEC §5.1: each phase = 2 beats (rising+falling)
+            if (wrdata_en_pipe_q[0]) begin
+                o_dfi_wrdata <= stage2_data;
+                o_dfi_wrdata_mask <= ~stage2_dm;
+            end
+
+            // Read data enable shift register (SPEC §4.4)
+            rddata_en_pipe_q <= {1'b0, rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1:1]};
+            if (sched_read)
+                rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
+            o_dfi_rddata_en <= {4{rddata_en_pipe_q[0]}};
+
+            // Read data capture from DFI (SPEC §4.5)
+            if (|i_dfi_rddata_valid)
+                o_wb_data <= i_dfi_rddata;
+
+            // WB ACK generation (SPEC §4.6)
+            // Write ACK: 1 cycle after WR command issues
+            // Read ACK: 1 cycle after dfi_rddata_valid (data latch delay)
+            write_ack_q <= sched_write;
+            read_ack_q  <= |i_dfi_rddata_valid;
+
             // Phase 7: Training command pump
 
             // ═══════════════════════════════════════════════════════════
