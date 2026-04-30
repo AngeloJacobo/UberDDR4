@@ -36,26 +36,26 @@ ddr4_1600_x4_map0:  read -formal -DDDR4_CLK_PERIOD=1250 -DDQ_BITS=4  -DADDR_MAPP
 ddr4_1600_x4_map1:  read -formal -DDDR4_CLK_PERIOD=1250 -DDQ_BITS=4  -DADDR_MAPPING=1 ddr4_controller.v
 ddr4_1600_x8_map0:  read -formal -DDDR4_CLK_PERIOD=1250 -DDQ_BITS=8  -DADDR_MAPPING=0 ddr4_controller.v
 ddr4_1600_x8_map1:  read -formal -DDDR4_CLK_PERIOD=1250 -DDQ_BITS=8  -DADDR_MAPPING=1 ddr4_controller.v
-ddr4_1600_x16_map0: read -formal -DDDR4_CLK_PERIOD=1250 -DDQ_BITS=16 -DADDR_MAPPING=0 ddr4_controller.v
-ddr4_1600_x16_map1: read -formal -DDDR4_CLK_PERIOD=1250 -DDQ_BITS=16 -DADDR_MAPPING=1 ddr4_controller.v
+ddr4_1600_x16_map0: read -formal -DDDR4_CLK_PERIOD=1250 -DDQ_BITS=16 -DBG_BITS=1 -DADDR_MAPPING=0 ddr4_controller.v
+ddr4_1600_x16_map1: read -formal -DDDR4_CLK_PERIOD=1250 -DDQ_BITS=16 -DBG_BITS=1 -DADDR_MAPPING=1 ddr4_controller.v
 ddr4_1866_x4_map0:  read -formal -DDDR4_CLK_PERIOD=1071 -DDQ_BITS=4  -DADDR_MAPPING=0 ddr4_controller.v
 ddr4_1866_x4_map1:  read -formal -DDDR4_CLK_PERIOD=1071 -DDQ_BITS=4  -DADDR_MAPPING=1 ddr4_controller.v
 ddr4_1866_x8_map0:  read -formal -DDDR4_CLK_PERIOD=1071 -DDQ_BITS=8  -DADDR_MAPPING=0 ddr4_controller.v
 ddr4_1866_x8_map1:  read -formal -DDDR4_CLK_PERIOD=1071 -DDQ_BITS=8  -DADDR_MAPPING=1 ddr4_controller.v
-ddr4_1866_x16_map0: read -formal -DDDR4_CLK_PERIOD=1071 -DDQ_BITS=16 -DADDR_MAPPING=0 ddr4_controller.v
-ddr4_1866_x16_map1: read -formal -DDDR4_CLK_PERIOD=1071 -DDQ_BITS=16 -DADDR_MAPPING=1 ddr4_controller.v
+ddr4_1866_x16_map0: read -formal -DDDR4_CLK_PERIOD=1071 -DDQ_BITS=16 -DBG_BITS=1 -DADDR_MAPPING=0 ddr4_controller.v
+ddr4_1866_x16_map1: read -formal -DDDR4_CLK_PERIOD=1071 -DDQ_BITS=16 -DBG_BITS=1 -DADDR_MAPPING=1 ddr4_controller.v
 ddr4_2133_x4_map0:  read -formal -DDDR4_CLK_PERIOD=937  -DDQ_BITS=4  -DADDR_MAPPING=0 ddr4_controller.v
 ddr4_2133_x4_map1:  read -formal -DDDR4_CLK_PERIOD=937  -DDQ_BITS=4  -DADDR_MAPPING=1 ddr4_controller.v
 ddr4_2133_x8_map0:  read -formal -DDDR4_CLK_PERIOD=937  -DDQ_BITS=8  -DADDR_MAPPING=0 ddr4_controller.v
 ddr4_2133_x8_map1:  read -formal -DDDR4_CLK_PERIOD=937  -DDQ_BITS=8  -DADDR_MAPPING=1 ddr4_controller.v
-ddr4_2133_x16_map0: read -formal -DDDR4_CLK_PERIOD=937  -DDQ_BITS=16 -DADDR_MAPPING=0 ddr4_controller.v
-ddr4_2133_x16_map1: read -formal -DDDR4_CLK_PERIOD=937  -DDQ_BITS=16 -DADDR_MAPPING=1 ddr4_controller.v
+ddr4_2133_x16_map0: read -formal -DDDR4_CLK_PERIOD=937  -DDQ_BITS=16 -DBG_BITS=1 -DADDR_MAPPING=0 ddr4_controller.v
+ddr4_2133_x16_map1: read -formal -DDDR4_CLK_PERIOD=937  -DDQ_BITS=16 -DBG_BITS=1 -DADDR_MAPPING=1 ddr4_controller.v
 ddr4_2400_x4_map0:  read -formal -DDDR4_CLK_PERIOD=833  -DDQ_BITS=4  -DADDR_MAPPING=0 ddr4_controller.v
 ddr4_2400_x4_map1:  read -formal -DDDR4_CLK_PERIOD=833  -DDQ_BITS=4  -DADDR_MAPPING=1 ddr4_controller.v
 ddr4_2400_x8_map0:  read -formal -DDDR4_CLK_PERIOD=833  -DDQ_BITS=8  -DADDR_MAPPING=0 ddr4_controller.v
 ddr4_2400_x8_map1:  read -formal -DDDR4_CLK_PERIOD=833  -DDQ_BITS=8  -DADDR_MAPPING=1 ddr4_controller.v
-ddr4_2400_x16_map0: read -formal -DDDR4_CLK_PERIOD=833  -DDQ_BITS=16 -DADDR_MAPPING=0 ddr4_controller.v
-ddr4_2400_x16_map1: read -formal -DDDR4_CLK_PERIOD=833  -DDQ_BITS=16 -DADDR_MAPPING=1 ddr4_controller.v
+ddr4_2400_x16_map0: read -formal -DDDR4_CLK_PERIOD=833  -DDQ_BITS=16 -DBG_BITS=1 -DADDR_MAPPING=0 ddr4_controller.v
+ddr4_2400_x16_map1: read -formal -DDDR4_CLK_PERIOD=833  -DDQ_BITS=16 -DBG_BITS=1 -DADDR_MAPPING=1 ddr4_controller.v
 read -formal fwb_slave.v
 read -formal mini_fifo.v
 read -formal f_addr_decode.v

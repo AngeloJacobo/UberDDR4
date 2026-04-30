@@ -221,6 +221,9 @@ module ddr4_phy #(
                 i_dfi_address[17*slot +: 14]
             };
 
+            // BG padding: always 2 bits in cmd word (PLAN §6.4: bg at [20:19])
+            wire [1:0] slot_bg_padded = i_dfi_bg[BG_BITS*slot +: BG_BITS];
+
             assign dfi_cmd[slot] = {
                 i_dfi_cs_n[slot],
                 i_dfi_act_n[slot],
@@ -230,7 +233,7 @@ module ddr4_phy #(
                 i_dfi_odt[slot],
                 i_dfi_cke[slot],
                 i_dfi_reset_n[slot],
-                i_dfi_bg[BG_BITS*slot +: BG_BITS],
+                slot_bg_padded,
                 i_dfi_bank[BA_BITS*slot +: BA_BITS],
                 muxed_addr
             };
@@ -311,10 +314,10 @@ module ddr4_phy #(
                 .IS_RST_INVERTED(1'b0),
                 .SIM_DEVICE("ULTRASCALE_PLUS")
             ) oserdes_bg (
-                .D({dfi_cmd[3][CMD_BG_START-(BG_BITS-1)+bgbit], dfi_cmd[3][CMD_BG_START-(BG_BITS-1)+bgbit],
-                    dfi_cmd[2][CMD_BG_START-(BG_BITS-1)+bgbit], dfi_cmd[2][CMD_BG_START-(BG_BITS-1)+bgbit],
-                    dfi_cmd[1][CMD_BG_START-(BG_BITS-1)+bgbit], dfi_cmd[1][CMD_BG_START-(BG_BITS-1)+bgbit],
-                    dfi_cmd[0][CMD_BG_START-(BG_BITS-1)+bgbit], dfi_cmd[0][CMD_BG_START-(BG_BITS-1)+bgbit]}),
+                .D({dfi_cmd[3][CMD_BG_START-1+bgbit], dfi_cmd[3][CMD_BG_START-1+bgbit],
+                    dfi_cmd[2][CMD_BG_START-1+bgbit], dfi_cmd[2][CMD_BG_START-1+bgbit],
+                    dfi_cmd[1][CMD_BG_START-1+bgbit], dfi_cmd[1][CMD_BG_START-1+bgbit],
+                    dfi_cmd[0][CMD_BG_START-1+bgbit], dfi_cmd[0][CMD_BG_START-1+bgbit]}),
                 .OQ(bg_oserdes_out),
                 .T_OUT(),
                 .CLK(i_ddr4_clk),

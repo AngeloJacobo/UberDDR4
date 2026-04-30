@@ -599,6 +599,11 @@ module ddr4_controller #(
     // Next-bank BG extraction for anticipation
     wire[BG_BITS-1:0] stage1_next_bg = stage1_next_bank[BG_BITS+BA_BITS-1:BA_BITS];
 
+    // BG padding to 2 bits for cmd_d construction (PLAN §6.4: bg always [20:19])
+    // Verilog zero-extends naturally: BG_BITS=2 → pass-through, BG_BITS=1 → {0, bg[0]}
+    wire [1:0] stage2_bg_padded = stage2_bg;
+    wire [1:0] stage1_next_bg_padded = stage1_next_bg;
+
     // Row padding to 17 bits for ACT command construction (SPEC §3.3)
     wire[16:0] stage2_row_padded     = {{(17-ROW_BITS){1'b0}}, stage2_row};
     wire[16:0] stage1_next_row_padded = {{(17-ROW_BITS){1'b0}}, stage1_next_row};
@@ -994,7 +999,7 @@ module ddr4_controller #(
                     1'b0,           //cs_n = 0
                     CMD_PRE,        //{act_n=1, ras_n=0, cas_n=1, we_n=0}
                     cmd_odt, 1'b1, 1'b1,  //odt, cke=1, reset_n=1
-                    stage2_bg,      //bg
+                    stage2_bg_padded, //bg[1:0] (PLAN §6.4)
                     stage2_ba,      //ba
                     7'b0, 1'b0, 9'b0  //A10=0 (single bank precharge)
                 };
@@ -1007,7 +1012,7 @@ module ddr4_controller #(
                     stage2_row_padded[15],  //cas_n → A15
                     stage2_row_padded[14],  //we_n  → A14
                     cmd_odt, 1'b1, 1'b1,
-                    stage2_bg,
+                    stage2_bg_padded, //bg[1:0] (PLAN §6.4)
                     stage2_ba,
                     stage2_row_padded  //addr[16:0] = full row address
                 };
@@ -1017,7 +1022,7 @@ module ddr4_controller #(
                     1'b0,           //cs_n = 0
                     CMD_WR,         //{act_n=1, ras_n=1, cas_n=0, we_n=0}
                     cmd_odt, 1'b1, 1'b1,
-                    stage2_bg,
+                    stage2_bg_padded, //bg[1:0] (PLAN §6.4)
                     stage2_ba,
                     3'b000,         //A16:A14
                     1'b0,           //A13
@@ -1032,7 +1037,7 @@ module ddr4_controller #(
                     1'b0,           //cs_n = 0
                     CMD_RD,         //{act_n=1, ras_n=1, cas_n=0, we_n=1}
                     cmd_odt, 1'b1, 1'b1,
-                    stage2_bg,
+                    stage2_bg_padded, //bg[1:0] (PLAN §6.4)
                     stage2_ba,
                     3'b000,         //A16:A14
                     1'b0,           //A13
@@ -1050,7 +1055,7 @@ module ddr4_controller #(
                     stage1_next_row_padded[15],
                     stage1_next_row_padded[14],
                     cmd_odt, 1'b1, 1'b1,
-                    stage1_next_bg,
+                    stage1_next_bg_padded, //bg[1:0] (PLAN §6.4)
                     stage1_next_bank[BA_BITS-1:0],
                     stage1_next_row_padded
                 };
@@ -1169,7 +1174,7 @@ module ddr4_controller #(
                 o_dfi_odt[bank_i]     <= cmd_d[bank_i][CMD_ODT];
                 o_dfi_cke[bank_i]     <= cmd_d[bank_i][CMD_CKE];
                 o_dfi_reset_n[bank_i] <= cmd_d[bank_i][CMD_RESET_N];
-                o_dfi_bg[BG_BITS*bank_i +: BG_BITS]   <= cmd_d[bank_i][CMD_BG_START:CMD_BG_START-(BG_BITS-1)];
+                o_dfi_bg[BG_BITS*bank_i +: BG_BITS]   <= cmd_d[bank_i][CMD_BG_START-1 +: BG_BITS];
                 o_dfi_bank[BA_BITS*bank_i +: BA_BITS]  <= cmd_d[bank_i][CMD_BA_START:CMD_BA_START-(BA_BITS-1)];
                 o_dfi_address[17*bank_i +: 17]         <= cmd_d[bank_i][16:0];
             end

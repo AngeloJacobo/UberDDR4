@@ -208,14 +208,14 @@ end
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
         if ($past(sched_write)) begin
-            assert(cmd_d[WRITE_SLOT][CMD_BG_START:CMD_BG_START-(BG_BITS-1)]
+            assert(cmd_d[WRITE_SLOT][CMD_BG_START-1 +: BG_BITS]
                    == $past(stage2_bg));
             assert(cmd_d[WRITE_SLOT][CMD_BA_START:CMD_BA_START-(BA_BITS-1)]
                    == $past(stage2_ba));
             assert(!cmd_d[WRITE_SLOT][CMD_CS_N]);
         end
         if ($past(sched_read)) begin
-            assert(cmd_d[READ_SLOT][CMD_BG_START:CMD_BG_START-(BG_BITS-1)]
+            assert(cmd_d[READ_SLOT][CMD_BG_START-1 +: BG_BITS]
                    == $past(stage2_bg));
             assert(cmd_d[READ_SLOT][CMD_BA_START:CMD_BA_START-(BA_BITS-1)]
                    == $past(stage2_ba));
@@ -469,7 +469,7 @@ end
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done)) begin
         if ($past(sched_anticipate)) begin
-            assert(cmd_d[ACTIVATE_SLOT][CMD_BG_START:CMD_BG_START-(BG_BITS-1)]
+            assert(cmd_d[ACTIVATE_SLOT][CMD_BG_START-1 +: BG_BITS]
                    == $past(stage1_next_bg));
             assert(cmd_d[ACTIVATE_SLOT][CMD_BA_START:CMD_BA_START-(BA_BITS-1)]
                    == $past(stage1_next_bank[BA_BITS-1:0]));
