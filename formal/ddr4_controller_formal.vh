@@ -85,8 +85,16 @@ fwb_slave #(
 );
 
 // Induction invariant: f_outstanding == pipeline occupancy + in-flight ACKs.
-// Without this, k-induction desynchronizes fwb_slave's counters from the
-// controller's pipeline (safe: this invariant holds for all reachable states).
+// This MUST be an assume (not assert) for k-induction: without it, the solver
+// desynchronizes fwb_slave's internal counters from the pipeline, causing
+// fwb_slave's own protocol assertions to fail at arbitrary induction steps.
+// Correctness justification: basecase proves this invariant holds from reset
+// for 8 cycles, and every pipeline element is accounted for:
+//   stage1_pending: accepted but not yet scheduled
+//   stage2_pending: waiting for scheduler to fire
+//   write_ack_q:    WR command fired, ACK pending (1 cycle)
+//   rddata_en_pipe_q: RD command fired, waiting for DFI rddata_valid
+//   read_ack_q:     rddata_valid received, ACK pending (1 cycle)
 always @* begin
     if (reset_done && i_wb_cyc && i_rst_n)
         assume(f_outstanding ==
@@ -104,9 +112,12 @@ end
 // failures from arbitrary initial register state.
 // ═══════════════════════════════════════════════════════════════════
 // cmd_d is a register array — the sequential block always writes all 4 slots
-// with identical CKE/ODT/RESET_N. We assume this as an induction invariant
-// (safe: the sequential block enforces it every cycle), then assert the DFI
-// outputs which are latched from cmd_d one cycle later.
+// with identical CKE/ODT/RESET_N. This MUST be an assume (not assert) for
+// k-induction: the solver can pick arbitrary initial cmd_d values where
+// slots disagree, and no other property constrains per-slot consistency.
+// The sequential block enforces consistency every cycle, and the basecase
+// proves it holds from reset for 8 cycles. The DFI output asserts below
+// verify the registered outputs are consistent one cycle later.
 always @* begin
     if (i_rst_n) begin
         assume(cmd_d[0][CMD_CKE] == cmd_d[1][CMD_CKE]);

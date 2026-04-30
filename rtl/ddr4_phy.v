@@ -134,14 +134,23 @@ module ddr4_phy #(
     assign sync_rst = rst_sync_q[1];
 
     // IDELAYCTRL reset: released after SERDES/delay primitives
+    // sync_rst is in i_ddr4_clk domain — synchronize into i_ref_clk first
+    reg [1:0] refclk_rst_sync_q;
     reg [2:0] idelayctrl_rst_pipe_q;
     wire idelayctrl_rst;
 
     always @(posedge i_ref_clk or negedge i_rst_n) begin
         if (!i_rst_n)
+            refclk_rst_sync_q <= 2'b11;
+        else
+            refclk_rst_sync_q <= {refclk_rst_sync_q[0], sync_rst};
+    end
+
+    always @(posedge i_ref_clk or negedge i_rst_n) begin
+        if (!i_rst_n)
             idelayctrl_rst_pipe_q <= 3'b111;
         else
-            idelayctrl_rst_pipe_q <= {idelayctrl_rst_pipe_q[1:0], sync_rst};
+            idelayctrl_rst_pipe_q <= {idelayctrl_rst_pipe_q[1:0], refclk_rst_sync_q[1]};
     end
     assign idelayctrl_rst = idelayctrl_rst_pipe_q[2];
 

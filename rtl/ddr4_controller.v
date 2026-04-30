@@ -1022,7 +1022,7 @@ module ddr4_controller #(
                     3'b000,         //A16:A14
                     1'b0,           //A13
                     1'b0,           //A12 (BL8, no BC4)
-                    1'b0,           //A11
+                    (COL_BITS > 10) ? stage2_col[10] : 1'b0, //A11: col[10] for x4
                     1'b0,           //A10 = 0 (no auto-precharge)
                     stage2_col[9:0] //A9:A0 = column
                 };
@@ -1036,8 +1036,8 @@ module ddr4_controller #(
                     stage2_ba,
                     3'b000,         //A16:A14
                     1'b0,           //A13
-                    1'b0,           //A12
-                    1'b0,           //A11
+                    1'b0,           //A12 (BL8, no BC4)
+                    (COL_BITS > 10) ? stage2_col[10] : 1'b0, //A11: col[10] for x4
                     1'b0,           //A10 = 0 (no auto-precharge)
                     stage2_col[9:0] //A9:A0 = column
                 };
