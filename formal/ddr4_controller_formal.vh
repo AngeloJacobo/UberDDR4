@@ -1,4 +1,4 @@
-// ddr4_controller_formal.vh — Phase 4C formal properties
+// ddr4_controller_formal.vh — Phase 4C/4D formal properties
 // Included inside ddr4_controller.v under `ifdef FORMAL
 //
 // Properties verified in Phase 4C:
@@ -6,14 +6,22 @@
 //   2. CKE/ODT/RESET_N all-phase consistency
 //   3. Command slot mutual exclusivity
 //   4. Zero-bubble stall (no unnecessary stall)
-//   5. Pipeline occupancy (mini_fifo oracle)
-//   6. Pipeline data integrity (f_addr_decode cross-check)
+//   5. Pipeline occupancy (mini_fifo oracle) — deferred to Phase 5
+//   6. Pipeline data integrity (f_addr_decode cross-check) — deferred to Phase 5
+//   6b. DDR4 command BG/BA integrity (WR/RD)
 //   7. BG counter gating (anyconst)
 //   8. Bank status (WR/RD only to active banks)
 //   9. Command encoding (ACT_n correctness)
 //
-// Phase 5 adds: all timing assertions (tRCD, tRP, tRAS, etc.),
-// bounded stall/ACK, multiconfig sweep.
+// Properties added in Phase 4D:
+//  10. Per-bank counter gating (anyconst bank)
+//  11. Earliest-issue throughput (no dead cycles)
+//  12. Counter loading correctness (JEDEC minimum delays)
+//  13. tFAW window assertion
+//  14. Scheduler mutual exclusion
+//  15. Anticipation command integrity
+//
+// Phase 5 adds: bounded stall/ACK, multiconfig sweep.
 //
 // Engineer: Angelo C. Jacobo
 // Copyright (c) 2025, Angelo C. Jacobo
@@ -242,5 +250,192 @@ always @(posedge i_controller_clk) begin
         // PRECHARGE: act_n must be 1
         if ($past(sched_precharge))
             assert(cmd_d[PRECHARGE_SLOT][CMD_ACT_N]);
+    end
+end
+
+// ═══════════════════════════════════════════════════════════════════
+// 10. Per-Bank Counter Gating (anyconst — proves for ALL banks)
+// The scheduler must never fire a command when the target bank's
+// per-bank counter hasn't expired. Complements property 7 (which
+// covers per-BG counters). Uses a separate anyconst bank register.
+// ═══════════════════════════════════════════════════════════════════
+(* anyconst *) reg [BG_BITS+BA_BITS-1:0] f_bank_const;
+
+always @* begin
+    if (reset_done && i_wb_cyc) begin
+        if (sched_precharge && stage2_bank == f_bank_const)
+            assert(delay_before_precharge_counter_q[f_bank_const] <= 1);
+        if (sched_activate && stage2_bank == f_bank_const)
+            assert(delay_before_activate_counter_q[f_bank_const] <= 1);
+        if (sched_write && stage2_bank == f_bank_const)
+            assert(delay_before_write_counter_q[f_bank_const] <= 1);
+        if (sched_read && stage2_bank == f_bank_const)
+            assert(delay_before_read_counter_q[f_bank_const] <= 1);
+    end
+    if (reset_done && sched_anticipate && stage1_next_bank == f_bank_const)
+        assert(delay_before_activate_counter_d[f_bank_const] == 0);
+end
+
+// ═══════════════════════════════════════════════════════════════════
+// 11. Earliest-Issue Throughput
+// Proves the scheduler fires commands at the earliest possible cycle.
+// If all blocking conditions are clear, the command MUST issue.
+// Catches priority inversion, dead code paths, missing conditions.
+// All purely combinational — k-induction safe.
+// ═══════════════════════════════════════════════════════════════════
+always @* begin
+    if (reset_done && stage2_pending && refresh_idle && i_wb_cyc) begin
+        if (bank_status_q[stage2_bank]
+            && (bank_active_row_q[stage2_bank] != stage2_row)
+            && (delay_before_precharge_counter_q[stage2_bank] <= 1))
+            assert(sched_precharge);
+        if (!bank_status_q[stage2_bank]
+            && (delay_before_activate_counter_q[stage2_bank] <= 1)
+            && (rrd_counter_q[stage2_bg] <= 1)
+            && !tfaw_blocked)
+            assert(sched_activate);
+        if (stage2_we
+            && bank_status_q[stage2_bank]
+            && (bank_active_row_q[stage2_bank] == stage2_row)
+            && (delay_before_write_counter_q[stage2_bank] <= 1)
+            && (ccd_counter_q[stage2_bg] <= 1))
+            assert(sched_write);
+        if (!stage2_we
+            && bank_status_q[stage2_bank]
+            && (bank_active_row_q[stage2_bank] == stage2_row)
+            && (delay_before_read_counter_q[stage2_bank] <= 1)
+            && (ccd_counter_q[stage2_bg] <= 1)
+            && (wtr_counter_q[stage2_bg] <= 1))
+            assert(sched_read);
+    end
+end
+
+// ═══════════════════════════════════════════════════════════════════
+// 12. Counter Loading Correctness
+// After each command, verify the target bank/BG counters are loaded
+// with at least the correct JEDEC minimum. Uses $past on scheduler
+// flags + anyconst bank/BG. Catches wrong delay constant, missing
+// only-raise guard, counter loaded for wrong bank, asymmetric
+// read/write loading bugs.
+// ═══════════════════════════════════════════════════════════════════
+
+// 12a — After ACTIVATE or ANTICIPATE: per-bank counters + bank status
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
+        if ($past(sched_activate) && $past(stage2_bank) == f_bank_const) begin
+            assert(delay_before_precharge_counter_q[f_bank_const]
+                   >= ACTIVATE_TO_PRECHARGE_DELAY);
+            assert(delay_before_write_counter_q[f_bank_const]
+                   >= ACTIVATE_TO_READWRITE_DELAY);
+            assert(delay_before_read_counter_q[f_bank_const]
+                   >= ACTIVATE_TO_READWRITE_DELAY);
+            assert(bank_status_q[f_bank_const]);
+        end
+        if ($past(sched_anticipate) && $past(stage1_next_bank) == f_bank_const) begin
+            assert(delay_before_precharge_counter_q[f_bank_const]
+                   >= ACTIVATE_TO_PRECHARGE_DELAY);
+            assert(delay_before_write_counter_q[f_bank_const]
+                   >= ACTIVATE_TO_READWRITE_DELAY);
+            assert(delay_before_read_counter_q[f_bank_const]
+                   >= ACTIVATE_TO_READWRITE_DELAY);
+            assert(bank_status_q[f_bank_const]);
+        end
+    end
+end
+
+// 12a-bg — After ACTIVATE: per-BG rrd counter (same-BG / diff-BG)
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
+        if ($past(sched_activate) && $past(stage2_bg) == f_bg_const)
+            assert(rrd_counter_q[f_bg_const]
+                   >= ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG);
+        if ($past(sched_activate) && $past(stage2_bg) != f_bg_const)
+            assert(rrd_counter_q[f_bg_const]
+                   >= ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG);
+    end
+end
+
+// 12b — After PRECHARGE: activate counter + bank status cleared
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
+        if ($past(sched_precharge) && $past(stage2_bank) == f_bank_const) begin
+            assert(delay_before_activate_counter_q[f_bank_const]
+                   >= PRECHARGE_TO_ACTIVATE_DELAY);
+            assert(!bank_status_q[f_bank_const]);
+        end
+    end
+end
+
+// 12c — After WRITE: precharge counter + BG ccd/wtr counters
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
+        if ($past(sched_write) && $past(stage2_bank) == f_bank_const)
+            assert(delay_before_precharge_counter_q[f_bank_const]
+                   >= WRITE_TO_PRECHARGE_DELAY);
+        if ($past(sched_write) && $past(stage2_bg) == f_bg_const) begin
+            assert(ccd_counter_q[f_bg_const] >= CAS_TO_CAS_DELAY_SAME_BG);
+            assert(wtr_counter_q[f_bg_const] >= WRITE_TO_READ_DELAY_SAME_BG);
+        end
+        if ($past(sched_write) && $past(stage2_bg) != f_bg_const) begin
+            assert(ccd_counter_q[f_bg_const] >= CAS_TO_CAS_DELAY_DIFF_BG);
+            assert(wtr_counter_q[f_bg_const] >= WRITE_TO_READ_DELAY_DIFF_BG);
+        end
+    end
+end
+
+// 12d — After READ: precharge + RD→WR turnaround (all banks) + BG ccd
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
+        if ($past(sched_read) && $past(stage2_bank) == f_bank_const)
+            assert(delay_before_precharge_counter_q[f_bank_const]
+                   >= READ_TO_PRECHARGE_DELAY);
+        if ($past(sched_read))
+            assert(delay_before_write_counter_q[f_bank_const]
+                   >= READ_TO_WRITE_DELAY);
+        if ($past(sched_read) && $past(stage2_bg) == f_bg_const)
+            assert(ccd_counter_q[f_bg_const] >= CAS_TO_CAS_DELAY_SAME_BG);
+        if ($past(sched_read) && $past(stage2_bg) != f_bg_const)
+            assert(ccd_counter_q[f_bg_const] >= CAS_TO_CAS_DELAY_DIFF_BG);
+    end
+end
+
+// ═══════════════════════════════════════════════════════════════════
+// 13. tFAW Window Assertion
+// ACT requires oldest tFAW timestamp expired (== 0 for _q).
+// Anticipation uses _d (post-decrement), so _q <= 1 is equivalent.
+// ═══════════════════════════════════════════════════════════════════
+always @* begin
+    if (reset_done && i_wb_cyc) begin
+        if (sched_activate)
+            assert(activate_timestamp_q[activate_index_q] == 0);
+        if (sched_anticipate)
+            assert(activate_timestamp_q[activate_index_q] <= 1);
+    end
+end
+
+// ═══════════════════════════════════════════════════════════════════
+// 14. Scheduler Mutual Exclusion
+// At most one of {PRE, ACT, WR, RD} fires per cycle (else-if chain).
+// Anticipation is separate and can co-fire with WR/RD.
+// ═══════════════════════════════════════════════════════════════════
+always @* begin
+    if (reset_done)
+        assert((sched_precharge + sched_activate + sched_write + sched_read) <= 1);
+end
+
+// ═══════════════════════════════════════════════════════════════════
+// 15. Anticipation Command Integrity
+// When anticipation fires, the ACT command on ACTIVATE_SLOT must
+// carry the correct BG/BA from stage1's next-bank fields.
+// ═══════════════════════════════════════════════════════════════════
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && $past(reset_done)) begin
+        if ($past(sched_anticipate)) begin
+            assert(cmd_d[ACTIVATE_SLOT][CMD_BG_START:CMD_BG_START-(BG_BITS-1)]
+                   == $past(stage1_next_bg));
+            assert(cmd_d[ACTIVATE_SLOT][CMD_BA_START:CMD_BA_START-(BA_BITS-1)]
+                   == $past(stage1_next_bank[BA_BITS-1:0]));
+            assert(!cmd_d[ACTIVATE_SLOT][CMD_CS_N]);
+        end
     end
 end

@@ -1438,31 +1438,34 @@ module ddr4_controller #(
     endfunction
 
     // CL_encoding: JESD79-4D Table 13 — MR0 CAS Latency {A12, A6:A4, A2}
+    // CL 9–16: sequential encoding 0–7
+    // CL 17–24: non-sequential (18,20,22,24 = enc 8–11; 23,17,19,21 = enc 12–15)
+    // CL 25+: A12=1, sequential encoding 16+
     function [4:0] CL_encoding(input [5:0] cl_nck);
         case (cl_nck)
-            6'd9:  CL_encoding = 5'b0_000_0;
-            6'd10: CL_encoding = 5'b0_001_0;
-            6'd11: CL_encoding = 5'b0_010_0;
-            6'd12: CL_encoding = 5'b0_011_0;
-            6'd13: CL_encoding = 5'b0_100_0;
-            6'd14: CL_encoding = 5'b0_101_0;
-            6'd15: CL_encoding = 5'b0_110_0;
-            6'd16: CL_encoding = 5'b0_111_0;
-            6'd17: CL_encoding = 5'b1_000_0;
-            6'd18: CL_encoding = 5'b1_001_0;
-            6'd19: CL_encoding = 5'b1_010_0;
-            6'd20: CL_encoding = 5'b1_011_0;
-            6'd21: CL_encoding = 5'b1_100_0;
-            6'd22: CL_encoding = 5'b1_101_0;
-            6'd23: CL_encoding = 5'b1_110_0;
-            6'd24: CL_encoding = 5'b1_111_0;
-            6'd25: CL_encoding = 5'b0_000_1;
-            6'd26: CL_encoding = 5'b0_001_1;
-            6'd27: CL_encoding = 5'b0_010_1;
-            6'd28: CL_encoding = 5'b0_011_1;
-            6'd30: CL_encoding = 5'b0_100_1;
-            6'd32: CL_encoding = 5'b0_101_1;
-            default: CL_encoding = 5'b0_000_0; //CL=9 fallback
+            6'd9:  CL_encoding = 5'b0_000_0; // enc 0
+            6'd10: CL_encoding = 5'b0_000_1; // enc 1
+            6'd11: CL_encoding = 5'b0_001_0; // enc 2
+            6'd12: CL_encoding = 5'b0_001_1; // enc 3
+            6'd13: CL_encoding = 5'b0_010_0; // enc 4
+            6'd14: CL_encoding = 5'b0_010_1; // enc 5
+            6'd15: CL_encoding = 5'b0_011_0; // enc 6
+            6'd16: CL_encoding = 5'b0_011_1; // enc 7
+            6'd17: CL_encoding = 5'b0_110_1; // enc 13
+            6'd18: CL_encoding = 5'b0_100_0; // enc 8
+            6'd19: CL_encoding = 5'b0_111_0; // enc 14
+            6'd20: CL_encoding = 5'b0_100_1; // enc 9
+            6'd21: CL_encoding = 5'b0_111_1; // enc 15
+            6'd22: CL_encoding = 5'b0_101_0; // enc 10
+            6'd23: CL_encoding = 5'b0_110_0; // enc 12
+            6'd24: CL_encoding = 5'b0_101_1; // enc 11
+            6'd25: CL_encoding = 5'b1_000_0; // enc 16
+            6'd26: CL_encoding = 5'b1_000_1; // enc 17
+            6'd27: CL_encoding = 5'b1_001_0; // enc 18
+            6'd28: CL_encoding = 5'b1_001_1; // enc 19
+            6'd30: CL_encoding = 5'b1_010_0; // enc 20
+            6'd32: CL_encoding = 5'b1_010_1; // enc 21
+            default: CL_encoding = 5'b0_000_0; // CL=9 fallback
         endcase
     endfunction
 

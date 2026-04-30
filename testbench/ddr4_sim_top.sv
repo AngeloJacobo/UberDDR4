@@ -384,6 +384,18 @@ module ddr4_sim_top;
         end
     endtask
 
+    task wb_read_one(input [EXT_ADDR_BITS-1:0] addr);
+        begin
+            wb_cyc  = 1'b1;
+            wb_stb  = 1'b1;
+            wb_we   = 1'b0;
+            wb_addr = addr;
+            wb_sel  = {WB_SEL_BITS{1'b1}};
+            @(posedge controller_clk);
+            while (wb_stall) @(posedge controller_clk);
+        end
+    endtask
+
     task wb_idle;
         begin
             wb_stb = 1'b0;
@@ -477,6 +489,52 @@ module ddr4_sim_top;
         $display("[%0t]   write BG0/BA2/row0 (same BG, diff bank)", $realtime);
         drain_pipeline;
 
+        // ── Phase F: Read requests (exercises sched_read path) ──
+        // Reads won't return data (no PHY data path yet), but the scheduler
+        // issues RD commands and the Micron model validates timing.
+        test_phase = "PHASE_F";
+        $display("[%0t] ═══ Phase F: Read requests (ACT→RD, bank hit RD) ═══", $realtime);
+        wb_write_one(ROW0_BG0, 128'h5A);
+        $display("[%0t]   write BG0/BA0/row0 (open bank)", $realtime);
+        wb_write_one(ROW0_BG1, 128'h5B);
+        $display("[%0t]   write BG1/BA0/row0 (open bank)", $realtime);
+        drain_pipeline;
+        wb_read_one(ROW0_BG0);
+        $display("[%0t]   read BG0/BA0/row0 (bank hit RD)", $realtime);
+        wb_read_one(ROW0_BG1);
+        $display("[%0t]   read BG1/BA0/row0 (bank hit RD)", $realtime);
+        wb_read_one(ROW0_BG2);
+        $display("[%0t]   read BG2/BA0/row0 (cold bank ACT→RD)", $realtime);
+        wb_read_one(ROW0_BG3);
+        $display("[%0t]   read BG3/BA0/row0 (cold bank ACT→RD)", $realtime);
+        drain_pipeline;
+
+        // ── Phase G: Same-bank rapid re-access (tRC stress: ACT→ACT same bank) ──
+        test_phase = "PHASE_G";
+        $display("[%0t] ═══ Phase G: Same-bank rapid re-access (tRC stress) ═══", $realtime);
+        wb_write_one(ROW0_BG0, 128'h6A);
+        $display("[%0t]   write BG0/BA0/row0", $realtime);
+        drain_pipeline;
+        wb_write_one(ROW1_BG0, 128'h6B);
+        $display("[%0t]   write BG0/BA0/row1 (miss → PRE+ACT+WR same bank)", $realtime);
+        drain_pipeline;
+        wb_write_one(ROW0_BG0, 128'h6C);
+        $display("[%0t]   write BG0/BA0/row0 (miss → PRE+ACT+WR same bank again)", $realtime);
+        drain_pipeline;
+
+        // ── Phase H: Write-then-read same BG (tWTR stress) ──
+        test_phase = "PHASE_H";
+        $display("[%0t] ═══ Phase H: Write-then-read same BG (tWTR stress) ═══", $realtime);
+        wb_write_one(ROW0_BG0, 128'h7A);
+        $display("[%0t]   write BG0/BA0/row0", $realtime);
+        wb_read_one(ROW0_BG0);
+        $display("[%0t]   read BG0/BA0/row0 (same BG → tWTR_L)", $realtime);
+        wb_write_one(ROW0_BG1, 128'h7B);
+        $display("[%0t]   write BG1/BA0/row0", $realtime);
+        wb_read_one(ROW0_BG0);
+        $display("[%0t]   read BG0/BA0/row0 (diff BG → tWTR_S applies to BG1)", $realtime);
+        drain_pipeline;
+
         test_phase = "DONE";
         $display("[%0t] ═══ All test phases complete ═══", $realtime);
         all_tests_done = 1'b1;
@@ -496,11 +554,12 @@ module ddr4_sim_top;
 
     wire [3:0] mon_is_act = ~mon_cs_n & ~mon_act_n;
     wire [3:0] mon_is_wr  = ~mon_cs_n & mon_act_n & mon_ras_n & ~mon_cas_n & ~mon_we_n;
+    wire [3:0] mon_is_rd  = ~mon_cs_n & mon_act_n & mon_ras_n & ~mon_cas_n & mon_we_n;
     wire [3:0] mon_is_pre = ~mon_cs_n & mon_act_n & ~mon_ras_n & mon_cas_n & ~mon_we_n;
 
-    integer act_count, wr_count, pre_count;
+    integer act_count, wr_count, rd_count, pre_count;
     integer mon_ph;
-    initial begin act_count = 0; wr_count = 0; pre_count = 0; end
+    initial begin act_count = 0; wr_count = 0; rd_count = 0; pre_count = 0; end
 
     always @(posedge controller_clk) begin
         if (reset_done_seen && !all_tests_done) begin
@@ -516,6 +575,13 @@ module ddr4_sim_top;
                     wr_count = wr_count + 1;
                     $display("[%0t] [%0s] DDR4 WR  #%0d: BG=%0d BA=%0d (slot %0d)",
                              $realtime, test_phase, wr_count,
+                             mon_bg[mon_ph*BG_BITS +: BG_BITS],
+                             mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph);
+                end
+                if (mon_is_rd[mon_ph]) begin
+                    rd_count = rd_count + 1;
+                    $display("[%0t] [%0s] DDR4 RD  #%0d: BG=%0d BA=%0d (slot %0d)",
+                             $realtime, test_phase, rd_count,
                              mon_bg[mon_ph*BG_BITS +: BG_BITS],
                              mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph);
                 end
@@ -563,9 +629,9 @@ module ddr4_sim_top;
         repeat (10) @(posedge controller_clk);
         $display("");
         $display("[%0t] ═══════════════════════════════════════════════", $realtime);
-        $display("[%0t] SUMMARY: ACT=%0d  WR=%0d  PRE=%0d  REF=%0d",
-                 $realtime, act_count, wr_count, pre_count, ref_count);
-        $display("[%0t] PASS: All 5 test phases + %0d refresh cycles, zero violations",
+        $display("[%0t] SUMMARY: ACT=%0d  WR=%0d  RD=%0d  PRE=%0d  REF=%0d",
+                 $realtime, act_count, wr_count, rd_count, pre_count, ref_count);
+        $display("[%0t] PASS: All 8 test phases + %0d refresh cycles, zero violations",
                  $realtime, ref_count);
         $display("[%0t] Simulation finished successfully", $realtime);
         $display("[%0t] ═══════════════════════════════════════════════", $realtime);
@@ -573,8 +639,8 @@ module ddr4_sim_top;
     end
 
     initial begin
-        #120_000_000;
-        $display("[%0t] TIMEOUT: simulation did not complete within 120 us", $realtime);
+        #200_000_000;
+        $display("[%0t] TIMEOUT: simulation did not complete within 200 us", $realtime);
         $finish;
     end
 
