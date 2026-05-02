@@ -203,7 +203,8 @@ module ddr4_top #(
         .BA_BITS(BA_BITS),
         .BG_BITS(BG_BITS),
         .DQ_BITS(DQ_BITS),
-        .BYTE_LANES(BYTE_LANES)
+        .BYTE_LANES(BYTE_LANES),
+        .SKIP_CALIB(SKIP_CALIB)
     ) u_phy (
         .i_controller_clk(i_controller_clk),
         .i_ddr4_clk(i_ddr4_clk),

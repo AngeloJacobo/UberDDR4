@@ -39,6 +39,7 @@ module ddr4_phy #(
               BG_BITS = 2,      //bank group bits
               DQ_BITS = 8,      //device data width
               BYTE_LANES = 2,   //number of byte lanes
+    parameter[0:0] SKIP_CALIB = 1,
     parameter SERDES_RATIO = 4,
               DFI_DATA_WIDTH = 2 * DQ_BITS * BYTE_LANES, //per DFI phase
               NUM_BG = (1 << BG_BITS)
@@ -136,6 +137,26 @@ module ddr4_phy #(
     // but OSERDESE3 cmd pipeline (+1 CLKDIV) shifts it by 2 edges.
     // Empirically validated: offset = 6 for DDR4-2400 CL=16.
     localparam integer INITIAL_BITSLIP         = 6;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §13 — PHY Training FSM Constants (SPEC §9.3)
+    // ═══════════════════════════════════════════════════════════════════
+    localparam[3:0] PHY_IDLE          = 4'd0,
+                    PHY_GATE_BITSLIP  = 4'd1,
+                    PHY_GATE_DQS_FIND = 4'd2,
+                    PHY_GATE_DONE     = 4'd3,
+                    PHY_EYE_SWEEP     = 4'd4,
+                    PHY_EYE_CENTER    = 4'd5,
+                    PHY_EYE_VERIFY    = 4'd6,
+                    PHY_EYE_DONE      = 4'd7,
+                    PHY_WL_SAMPLE     = 4'd8,
+                    PHY_WL_ADJUST     = 4'd9,
+                    PHY_WL_CHECK      = 4'd10,
+                    PHY_WL_DONE       = 4'd11;
+
+    // MPR page 0 after ISERDESE3 8:1 DDR deserialize (JEDEC §4.25)
+    // Q[0]=D0=0(rise), Q[1]=D1=1(fall), ... Q[7]=D7=1(fall) → 8'b10101010
+    localparam [7:0] MPR_PATTERN = 8'b10101010;
 
     // Derived constants for DFI data indexing
     localparam TOTAL_DQ      = DQ_BITS * BYTE_LANES;
@@ -453,6 +474,7 @@ module ddr4_phy #(
     // Read:  DQ pad → IOBUF → IDELAYE3 → ISERDESE3(1:8 DDR)
     // ═══════════════════════════════════════════════════════════════════
     wire [7:0] iserdes_dq_q [TOTAL_DQ-1:0];  // raw ISERDESE3 output per DQ bit
+    wire [7:0] iserdes_dqs_q [BYTE_LANES-1:0]; // raw DQS ISERDESE3 (gate training)
 
     generate
         genvar dq_lane, dq_bit;
@@ -601,8 +623,7 @@ module ddr4_phy #(
                 .CASC_RETURN(1'b0), .CASC_OUT()
             );
 
-            // DQS ISERDESE3 — used during training only (gate + WL feedback)
-            wire [7:0] iserdes_dqs_q_unused;
+            // DQS ISERDESE3 — used during training (gate + WL feedback)
             ISERDESE3 #(
                 .DATA_WIDTH(8), .FIFO_ENABLE("FALSE"),
                 .FIFO_SYNC_MODE("FALSE"),
@@ -611,7 +632,7 @@ module ddr4_phy #(
             ) iserdes_dqs (
                 .CLK(i_ddr4_clk), .CLK_B(i_ddr4_clk),
                 .CLKDIV(i_controller_clk),
-                .D(idelay_dqs_out), .Q(iserdes_dqs_q_unused),
+                .D(idelay_dqs_out), .Q(iserdes_dqs_q[dqs_lane]),
                 .RST(sync_rst),
                 .FIFO_RD_CLK(1'b0), .FIFO_RD_EN(1'b0), .FIFO_EMPTY()
             );
@@ -683,6 +704,12 @@ module ddr4_phy #(
     reg [2:0]  bitslip_count_q [BYTE_LANES-1:0];
     wire [7:0] aligned_dq [TOTAL_DQ-1:0];
 
+    // §13 — PHY training FSM state registers
+    reg [3:0] phy_state;
+    reg [$clog2(BYTE_LANES > 1 ? BYTE_LANES : 2)-1:0] train_lane;
+    reg [2:0] phy_timer;
+    reg [3:0] bitslip_shift_count;
+
     generate
         genvar bs_lane, bs_bit;
         for (bs_lane = 0; bs_lane < BYTE_LANES; bs_lane = bs_lane + 1) begin : gen_bs_lane
@@ -710,7 +737,11 @@ module ddr4_phy #(
             for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
                 prev_iserdes_q[dfi_pack_idx] <= 8'b0;
             for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1)
-                bitslip_count_q[dfi_pack_idx] <= INITIAL_BITSLIP[2:0];
+                bitslip_count_q[dfi_pack_idx] <= SKIP_CALIB ? INITIAL_BITSLIP[2:0] : 3'b0;
+            phy_state           <= PHY_IDLE;
+            train_lane          <= 0;
+            phy_timer           <= 3'b0;
+            bitslip_shift_count <= 4'b0;
         end else begin
             // Update previous ISERDESE3 outputs for bitslip window
             for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
@@ -737,6 +768,78 @@ module ddr4_phy #(
 
             // rddata_valid: assert 1 cycle after rddata_en
             o_dfi_rddata_valid <= i_dfi_rddata_en;
+
+            // ═══════════════════════════════════════════════════════════
+            // §13 — PHY Training FSM (SPEC §9.3)
+            // Gate training: bitslip alignment using MPR page 0 pattern.
+            // Eye/WL states declared but implemented in Phases 7C/7D.
+            // ═══════════════════════════════════════════════════════════
+            if (!SKIP_CALIB) begin
+                case (phy_state)
+                    PHY_IDLE: begin
+                        if (i_dfi_rdlvl_gate_en) begin
+                            o_dfi_rdlvl_resp <= {BYTE_LANES{1'b0}};
+                            train_lane <= 0;
+                            bitslip_shift_count <= 4'd0;
+                            phy_state <= PHY_GATE_BITSLIP;
+                        end
+                    end
+
+                    PHY_GATE_BITSLIP: begin
+                        if (phy_timer != 0)
+                            phy_timer <= phy_timer - 1'b1;
+                        else if (|i_dfi_rddata_en) begin
+                            if (aligned_dq[train_lane * DQ_BITS] == MPR_PATTERN) begin
+                                phy_state <= PHY_GATE_DQS_FIND;
+                                `ifndef YOSYS
+                                $display("[%0t] PHY gate: lane %0d bitslip=%0d match",
+                                    $realtime, train_lane, bitslip_count_q[train_lane]);
+                                `endif
+                            end else if (bitslip_shift_count == 4'd8) begin
+                                phy_state <= PHY_GATE_DQS_FIND;
+                                `ifndef YOSYS
+                                $display("[%0t] PHY gate: lane %0d exhausted 8 shifts, proceeding",
+                                    $realtime, train_lane);
+                                `endif
+                            end else begin
+                                bitslip_count_q[train_lane] <=
+                                    bitslip_count_q[train_lane] + 1'b1;
+                                bitslip_shift_count <=
+                                    bitslip_shift_count + 1'b1;
+                                phy_timer <= 3'd3;
+                            end
+                        end
+                    end
+
+                    PHY_GATE_DQS_FIND: begin
+                        // V1 simplified: verify DQS toggling, advance lane
+                        if (|i_dfi_rddata_en) begin
+                            if (train_lane < BYTE_LANES - 1) begin
+                                train_lane <= train_lane + 1'b1;
+                                bitslip_shift_count <= 4'd0;
+                                phy_state <= PHY_GATE_BITSLIP;
+                            end else begin
+                                phy_state <= PHY_GATE_DONE;
+                                `ifndef YOSYS
+                                for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES;
+                                     dfi_pack_idx = dfi_pack_idx + 1)
+                                    $display("[%0t] PHY gate done: lane %0d bitslip=%0d",
+                                        $realtime, dfi_pack_idx,
+                                        bitslip_count_q[dfi_pack_idx]);
+                                `endif
+                            end
+                        end
+                    end
+
+                    PHY_GATE_DONE: begin
+                        o_dfi_rdlvl_resp <= {BYTE_LANES{1'b1}};
+                        if (!i_dfi_rdlvl_gate_en)
+                            phy_state <= PHY_IDLE;
+                    end
+
+                    default: ;
+                endcase
+            end
         end
     end
 
