@@ -111,8 +111,8 @@ module ddr4_controller #(
     input wire                       i_dfi_rdlvl_gate_req,
     input wire                       i_dfi_wrlvl_req,
     // Status
-    output wire                      o_calib_complete,
-    output wire                      o_calib_error
+    output reg                       o_calib_complete,
+    output reg                       o_calib_error
 );
 
     // ═══════════════════════════════════════════════════════════════════
@@ -158,6 +158,32 @@ module ddr4_controller #(
 
     // Calibration window delay — large enough for training FSM
     localparam integer CALIBRATION_DELAY = 1000;
+
+    // DFI 3.1 training pump timing (SPEC §9.3.2)
+    localparam T_RDLVL_EN   = 4;    // min DFI clks: rdlvl_en → first READ
+    localparam T_RDLVL_RR   = 16;   // min DFI clks between training READs
+    localparam T_RDLVL_MAX  = 4096; // timeout for rdlvl_resp
+    localparam T_WRLVL_EN   = 4;    // min DFI clks: wrlvl_en → first strobe
+    localparam T_WRLVL_WW   = 32;   // min DFI clks between strobe pulses
+    localparam T_WRLVL_MAX  = 4096; // timeout for wrlvl_resp
+    localparam CALIB_RETRY_MAX = 3;
+
+    // Training command pump states (SPEC §9.2)
+    localparam[3:0] CALIB_IDLE       = 4'd0,
+                    CALIB_GATE_EN    = 4'd1,
+                    CALIB_GATE_READ  = 4'd2,
+                    CALIB_GATE_WAIT  = 4'd3,
+                    CALIB_GATE_EXIT  = 4'd4,
+                    CALIB_EYE_EN     = 4'd5,
+                    CALIB_EYE_READ   = 4'd6,
+                    CALIB_EYE_WAIT   = 4'd7,
+                    CALIB_EYE_EXIT   = 4'd8,
+                    CALIB_WL_EN      = 4'd9,
+                    CALIB_WL_STROBE  = 4'd10,
+                    CALIB_WL_WAIT    = 4'd11,
+                    CALIB_WL_EXIT    = 4'd12,
+                    CALIB_DONE       = 4'd13,
+                    CALIB_ERROR      = 4'd14;
 
     // Packed command word bit-field positions (29 bits, see PLAN §6.4)
     localparam CMD_CS_N     = 28,
@@ -464,6 +490,14 @@ module ddr4_controller #(
     reg[DELAY_COUNTER_WIDTH-1:0] delay_counter;
     reg delay_counter_is_zero;
     reg pause_counter;
+
+    // ── §14 Training pump state (logic in sequential block) ──
+    reg [3:0] calib_state;
+    reg [$clog2(T_RDLVL_MAX):0] calib_timer;
+    reg [$clog2(T_WRLVL_WW):0]  calib_rr_timer;
+    reg [1:0] calib_retry_count;
+    reg calib_act_done;
+
     reg rom_cke_hold;
     reg rom_reset_n_hold;
     wire[31:0] rom_instruction;
@@ -487,8 +521,6 @@ module ddr4_controller #(
     // ── Static outputs ──
     assign o_wb_ack = i_rst_n && reset_done && (write_ack_q || read_ack_q);
     assign o_dfi_init_start = ~reset_done; // request PHY init until ROM completes
-    assign o_calib_complete = 1'b0; // driven by training pump in Phase 7
-    assign o_calib_error = 1'b0;
 
     // ═══════════════════════════════════════════════════════════════════
     // §7.5 — Address Decode
@@ -832,7 +864,8 @@ module ddr4_controller #(
 
     // ─── Stall: combinational, reflects current registered state ───
     always @* begin
-        o_wb_stall = stage1_pending || !reset_done || refresh_active;
+        o_wb_stall = stage1_pending || !reset_done || refresh_active
+                     || (!SKIP_CALIB && !o_calib_complete);
     end
 
     // ── Sequential block ──
@@ -867,6 +900,13 @@ module ddr4_controller #(
             delay_counter <= {DELAY_COUNTER_WIDTH{1'b0}};
             delay_counter_is_zero <= 1'b1;
             pause_counter <= 1'b0;
+            calib_state <= CALIB_IDLE;
+            calib_timer <= 0;
+            calib_rr_timer <= 0;
+            calib_retry_count <= 2'b00;
+            calib_act_done <= 1'b0;
+            o_calib_complete <= 1'b0;
+            o_calib_error <= 1'b0;
             rom_cke_hold <= 1'b0;
             rom_reset_n_hold <= 1'b0;
             for (bank_i = 0; bank_i < SERDES_RATIO; bank_i = bank_i + 1) begin
@@ -1117,7 +1157,211 @@ module ddr4_controller #(
             write_ack_q <= sched_write;
             read_ack_q  <= |i_dfi_rddata_valid;
 
-            // Phase 7: Training command pump
+            // ═══════════════════════════════════════════════════════════
+            // §14 — Training Command Pump (DFI 3.1 Full Training Mode)
+            // MC-side calibration FSM: drives DFI training enables and
+            // pumps READ commands / wrlvl strobes during calibration
+            // windows opened by the init ROM (addrs 22, 27). The pump
+            // takes over cmd_d directly while pause_counter is held.
+            // See SPEC §9.2 for state descriptions.
+            // ═══════════════════════════════════════════════════════════
+            if (SKIP_CALIB) begin
+                o_calib_complete <= reset_done;
+            end else begin
+                if (calib_timer != 0)
+                    calib_timer <= calib_timer - 1'b1;
+                if (calib_rr_timer != 0)
+                    calib_rr_timer <= calib_rr_timer - 1'b1;
+
+                case (calib_state)
+                    CALIB_IDLE: begin
+                        if (instruction_address == ROM_ADDR_RD_CAL
+                            && delay_counter_is_zero) begin
+                            pause_counter <= 1'b1;
+                            calib_state <= CALIB_GATE_EN;
+                            calib_rr_timer <= T_RDLVL_EN[$clog2(T_WRLVL_WW):0];
+                        end
+                    end
+
+                    CALIB_GATE_EN: begin
+                        o_dfi_rdlvl_gate_en <= 1'b1;
+                        if (calib_rr_timer == 0) begin
+                            calib_state <= CALIB_GATE_READ;
+                            calib_timer <= T_RDLVL_MAX[$clog2(T_RDLVL_MAX):0];
+                        end
+                    end
+
+                    CALIB_GATE_READ: begin
+                        if (!calib_act_done) begin
+                            // ACT BG0/BA0/row0 before first training READ
+                            cmd_d[ACTIVATE_SLOT] <= {
+                                1'b0, 1'b0, 3'b000,
+                                cmd_odt, 1'b1, 1'b1,
+                                {BG_BITS{1'b0}}, {BA_BITS{1'b0}}, 17'b0
+                            };
+                            calib_act_done <= 1'b1;
+                            calib_rr_timer <=
+                                ACTIVATE_TO_READWRITE_DELAY[$clog2(T_WRLVL_WW):0];
+                        end else if (calib_rr_timer == 0) begin
+                            cmd_d[READ_SLOT] <= {
+                                1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
+                                {BG_BITS{1'b0}}, {BA_BITS{1'b0}}, 17'b0
+                            };
+                            rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
+                            calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
+                            calib_state <= CALIB_GATE_WAIT;
+                        end
+                    end
+
+                    CALIB_GATE_WAIT: begin
+                        if (calib_timer == 0) begin
+                            if (calib_retry_count < CALIB_RETRY_MAX) begin
+                                calib_retry_count <= calib_retry_count + 1'b1;
+                                calib_state <= CALIB_GATE_EN;
+                                calib_rr_timer <=
+                                    T_RDLVL_EN[$clog2(T_WRLVL_WW):0];
+                            end else
+                                calib_state <= CALIB_ERROR;
+                        end else if (&i_dfi_rdlvl_resp) begin
+                            calib_state <= CALIB_GATE_EXIT;
+                        end else if (calib_rr_timer == 0) begin
+                            cmd_d[READ_SLOT] <= {
+                                1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
+                                {BG_BITS{1'b0}}, {BA_BITS{1'b0}}, 17'b0
+                            };
+                            rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
+                            calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
+                        end
+                    end
+
+                    CALIB_GATE_EXIT: begin
+                        o_dfi_rdlvl_gate_en <= 1'b0;
+                        calib_state <= CALIB_EYE_EN;
+                        calib_rr_timer <= T_RDLVL_EN[$clog2(T_WRLVL_WW):0];
+                        calib_retry_count <= 2'b00;
+                    end
+
+                    CALIB_EYE_EN: begin
+                        o_dfi_rdlvl_en <= 1'b1;
+                        if (calib_rr_timer == 0) begin
+                            calib_state <= CALIB_EYE_READ;
+                            calib_timer <= T_RDLVL_MAX[$clog2(T_RDLVL_MAX):0];
+                        end
+                    end
+
+                    CALIB_EYE_READ: begin
+                        // bank already activated from gate training
+                        cmd_d[READ_SLOT] <= {
+                            1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
+                            {BG_BITS{1'b0}}, {BA_BITS{1'b0}}, 17'b0
+                        };
+                        rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
+                        calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
+                        calib_state <= CALIB_EYE_WAIT;
+                    end
+
+                    CALIB_EYE_WAIT: begin
+                        if (calib_timer == 0) begin
+                            if (calib_retry_count < CALIB_RETRY_MAX) begin
+                                calib_retry_count <= calib_retry_count + 1'b1;
+                                calib_state <= CALIB_EYE_EN;
+                                calib_rr_timer <=
+                                    T_RDLVL_EN[$clog2(T_WRLVL_WW):0];
+                            end else
+                                calib_state <= CALIB_ERROR;
+                        end else if (&i_dfi_rdlvl_resp) begin
+                            calib_state <= CALIB_EYE_EXIT;
+                        end else if (calib_rr_timer == 0) begin
+                            cmd_d[READ_SLOT] <= {
+                                1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
+                                {BG_BITS{1'b0}}, {BA_BITS{1'b0}}, 17'b0
+                            };
+                            rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
+                            calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
+                        end
+                    end
+
+                    CALIB_EYE_EXIT: begin
+                        o_dfi_rdlvl_en <= 1'b0;
+                        if (calib_act_done) begin
+                            // precharge BG0/BA0 before ROM issues MRS
+                            cmd_d[PRECHARGE_SLOT] <= {
+                                1'b0, CMD_PRE, cmd_odt, 1'b1, 1'b1,
+                                {BG_BITS{1'b0}}, {BA_BITS{1'b0}},
+                                7'b0, 1'b0, 9'b0
+                            };
+                            calib_act_done <= 1'b0;
+                            calib_rr_timer <=
+                                PRECHARGE_TO_ACTIVATE_DELAY[$clog2(T_WRLVL_WW):0];
+                        end else if (calib_rr_timer == 0 && pause_counter) begin
+                            pause_counter <= 1'b0;
+                        end
+                        // wait for ROM to reach write leveling window
+                        if (instruction_address == ROM_ADDR_WL_CAL
+                            && delay_counter_is_zero && !pause_counter) begin
+                            pause_counter <= 1'b1;
+                            calib_state <= CALIB_WL_EN;
+                            calib_rr_timer <= T_WRLVL_EN[$clog2(T_WRLVL_WW):0];
+                            calib_retry_count <= 2'b00;
+                        end
+                    end
+
+                    CALIB_WL_EN: begin
+                        o_dfi_wrlvl_en <= 1'b1;
+                        if (calib_rr_timer == 0) begin
+                            calib_state <= CALIB_WL_STROBE;
+                            calib_timer <= T_WRLVL_MAX[$clog2(T_RDLVL_MAX):0];
+                        end
+                    end
+
+                    CALIB_WL_STROBE: begin
+                        o_dfi_wrlvl_strobe <= 1'b1;
+                        calib_rr_timer <= T_WRLVL_WW[$clog2(T_WRLVL_WW):0];
+                        calib_state <= CALIB_WL_WAIT;
+                    end
+
+                    CALIB_WL_WAIT: begin
+                        o_dfi_wrlvl_strobe <= 1'b0;
+                        if (calib_timer == 0) begin
+                            if (calib_retry_count < CALIB_RETRY_MAX) begin
+                                calib_retry_count <= calib_retry_count + 1'b1;
+                                calib_state <= CALIB_WL_EN;
+                                calib_rr_timer <=
+                                    T_WRLVL_EN[$clog2(T_WRLVL_WW):0];
+                            end else
+                                calib_state <= CALIB_ERROR;
+                        end else if (&i_dfi_wrlvl_resp) begin
+                            calib_state <= CALIB_WL_EXIT;
+                        end else if (calib_rr_timer == 0) begin
+                            o_dfi_wrlvl_strobe <= 1'b1;
+                            calib_rr_timer <=
+                                T_WRLVL_WW[$clog2(T_WRLVL_WW):0];
+                        end
+                    end
+
+                    CALIB_WL_EXIT: begin
+                        o_dfi_wrlvl_en <= 1'b0;
+                        o_dfi_wrlvl_strobe <= 1'b0;
+                        if (!pause_counter) begin
+                            // already released — wait for init to finish
+                            if (reset_done) begin
+                                calib_state <= CALIB_DONE;
+                                o_calib_complete <= 1'b1;
+                            end
+                        end else begin
+                            pause_counter <= 1'b0;
+                        end
+                    end
+
+                    CALIB_DONE: begin
+                        o_calib_complete <= 1'b1;
+                    end
+
+                    CALIB_ERROR: begin
+                        o_calib_error <= 1'b1;
+                    end
+                endcase
+            end
 
             // ═══════════════════════════════════════════════════════════
             // §11b — Counter Latch + Pipeline Handoff + Stage 1 WB Accept

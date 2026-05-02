@@ -115,6 +115,8 @@ module ddr4_sim_top;
     wire                     wb_ack;
     wire [WB_DATA_BITS-1:0]  wb_rdata;
     reg                      bist_start;
+    wire                     calib_complete;
+    wire                     calib_error;
 
     initial begin
         wb_cyc     = 'z;
@@ -185,8 +187,8 @@ module ddr4_sim_top;
         .o_bist_fail       (),
         .o_bist_correct    (),
         .o_bist_error      (),
-        .o_calib_complete  (),
-        .o_calib_error     ()
+        .o_calib_complete  (calib_complete),
+        .o_calib_error     (calib_error)
     );
 
     // ═══════════════════════════════════════════════════════════════════
@@ -427,6 +429,22 @@ module ddr4_sim_top;
         if (rst_n && u_dut.u_controller.reset_done && !reset_done_seen) begin
             $display("[%0t] PASS: DDR4 init sequence complete (reset_done)", $realtime);
             reset_done_seen <= 1'b1;
+        end
+    end
+
+    // Calibration status monitor
+    reg calib_complete_seen;
+    reg calib_error_seen;
+    initial begin calib_complete_seen = 1'b0; calib_error_seen = 1'b0; end
+
+    always @(posedge controller_clk) begin
+        if (rst_n && calib_complete && !calib_complete_seen) begin
+            $display("[%0t] CALIB_COMPLETE asserted", $realtime);
+            calib_complete_seen <= 1'b1;
+        end
+        if (rst_n && calib_error && !calib_error_seen) begin
+            $display("[%0t] CALIB_ERROR asserted — training timed out", $realtime);
+            calib_error_seen <= 1'b1;
         end
     end
 

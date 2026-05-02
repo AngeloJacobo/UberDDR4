@@ -173,13 +173,13 @@ end
 
 // ═══════════════════════════════════════════════════════════════════
 // 4. Zero-Bubble Stall
-// During normal operation (reset_done, not refresh), stall must be
-// LOW whenever stage1 is free. There is no "combinational forwarding"
-// in this pipeline — stage1_pending is the only scheduler-related
-// stall source. This proves no unnecessary stall exists.
+// During normal operation (reset_done, not refresh, calibration done),
+// stall must be LOW whenever stage1 is free. SKIP_CALIB=0 adds a
+// stall term until o_calib_complete — guarded here so the property
+// only fires after training completes.
 // ═══════════════════════════════════════════════════════════════════
 always @* begin
-    if (reset_done && !refresh_active) begin
+    if (reset_done && !refresh_active && (SKIP_CALIB || o_calib_complete)) begin
         if (!stage1_pending)
             assert(!o_wb_stall);
     end
@@ -192,9 +192,25 @@ always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n)
         && $past(stage1_pending) && $past(stage2_update)
         && $past(reset_done) && reset_done
-        && !$past(refresh_active) && !refresh_active) begin
+        && !$past(refresh_active) && !refresh_active
+        && (SKIP_CALIB || ($past(o_calib_complete) && o_calib_complete))) begin
         // stage1 should have moved to stage2 (unless wb_accept refilled it)
         assert(stage2_pending);
+    end
+end
+
+// ═══════════════════════════════════════════════════════════════════
+// 4b. Training FSM Induction Invariant
+// Active training states (GATE/EYE/WL) only exist before reset_done.
+// CALIB_WL_EXIT may overlap with reset_done (it waits for it).
+// Without this, the solver constructs unreachable states where the
+// training pump and post-init scheduler both fire simultaneously.
+// ═══════════════════════════════════════════════════════════════════
+always @* begin
+    if (i_rst_n && !SKIP_CALIB) begin
+        if (calib_state != CALIB_IDLE && calib_state != CALIB_DONE
+            && calib_state != CALIB_ERROR && calib_state != CALIB_WL_EXIT)
+            assume(!reset_done);
     end
 end
 
