@@ -161,6 +161,12 @@ module ddr4_phy #(
     // Eye training: sweep IDELAYE3 in steps of 4 (512/4 = 128 iterations)
     localparam [3:0] TAP_SWEEP_STEP = 4'd4;
 
+    // Write leveling: sweep ODELAYE3 DQS in steps of 4
+    localparam [3:0] WL_TAP_STEP = 4'd4;
+
+    // VTC settle: ~200 controller_clk cycles after EN_VTC assertion (SPEC §7.5)
+    localparam [7:0] VTC_SETTLE_CYCLES = 8'd200;
+
     // Derived constants for DFI data indexing
     localparam TOTAL_DQ      = DQ_BITS * BYTE_LANES;
     localparam BEAT_WIDTH    = DQ_BITS * BYTE_LANES;         // bits per beat
@@ -459,17 +465,31 @@ module ddr4_phy #(
     wire dqs_tristate = ~dqs_output_enable;
     wire dq_tristate  = ~dq_output_enable;
 
-    // DQS pattern: toggle during data, postamble after, idle otherwise
+    // WL state detection — used by DQS pattern and tristate overrides
+    wire wl_active;
+
+    // DQS pattern: toggle during data, single rising edge during WL strobe
     reg [7:0] dqs_pattern;
+    reg       wl_dqs_strobe;
     always @* begin
-        if (wrdata_en_any)
-            dqs_pattern = 8'b01_01_01_01;  // toggle: D[0]=1 first rising edge
+        if (wl_active) begin
+            if (wl_dqs_strobe)
+                dqs_pattern = 8'b00_00_00_01;
+            else
+                dqs_pattern = 8'b00_00_00_00;
+        end else if (wrdata_en_any)
+            dqs_pattern = 8'b01_01_01_01;
         else
-            dqs_pattern = 8'b00_00_00_00;  // idle/postamble: DQS LOW
+            dqs_pattern = 8'b00_00_00_00;
     end
 
-    // EN_VTC: held LOW for Phase 6 (SKIP_CALIB). Phase 7 manages transitions.
-    wire en_vtc = 1'b0;
+    reg  wl_dqs_strobe_d1;
+    wire wl_dqs_drive = wl_dqs_strobe | wl_dqs_strobe_d1;
+    wire dqs_tristate_wl = wl_active ? ~wl_dqs_drive : dqs_tristate;
+
+    // EN_VTC: LOW during training (tap changes), HIGH in normal operation (SPEC §7.5)
+    // TIME mode requires VTC active after calibration for PVT drift compensation.
+    reg en_vtc_q;
 
     // ═══════════════════════════════════════════════════════════════════
     // §8 — DQ Data Path (per bit, per byte lane) — SPEC §12.2, §8.4
@@ -482,6 +502,10 @@ module ddr4_phy #(
     // Eye training: per-lane IDELAYE3 LOAD pulse and shared tap value
     reg  idelay_load_lane [BYTE_LANES-1:0];
     reg  [8:0] idelay_cntvalue;
+
+    // Write leveling: per-lane ODELAYE3 DQS LOAD pulse and shared tap value
+    reg  odelay_dqs_load [BYTE_LANES-1:0];
+    reg  [8:0] odelay_dqs_cntvalue;
 
     generate
         genvar dq_lane, dq_bit;
@@ -516,7 +540,7 @@ module ddr4_phy #(
                 wire odelay_dq_out;
                 (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
                 ODELAYE3 #(
-                    .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
+                    .CASCADE("NONE"), .DELAY_FORMAT("TIME"),
                     .DELAY_TYPE("FIXED"), .DELAY_VALUE(DATA_INITIAL_ODELAY_TAP),
                     .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
                     .REFCLK_FREQUENCY(300.0), .SIM_DEVICE("ULTRASCALE_PLUS"),
@@ -525,7 +549,7 @@ module ddr4_phy #(
                     .ODATAIN(oserdes_dq_out), .DATAOUT(odelay_dq_out),
                     .CLK(i_controller_clk), .RST(sync_rst),
                     .CE(1'b0), .INC(1'b0), .LOAD(1'b0),
-                    .CNTVALUEIN(9'b0), .CNTVALUEOUT(), .EN_VTC(en_vtc),
+                    .CNTVALUEIN(9'b0), .CNTVALUEOUT(), .EN_VTC(en_vtc_q),
                     .CASC_IN(1'b0), .CASC_RETURN(1'b0), .CASC_OUT()
                 );
 
@@ -539,7 +563,7 @@ module ddr4_phy #(
                 // VAR_LOAD: training FSM loads tap via idelay_load_lane
                 (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
                 IDELAYE3 #(
-                    .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
+                    .CASCADE("NONE"), .DELAY_FORMAT("TIME"),
                     .DELAY_SRC("IDATAIN"), .DELAY_TYPE("VAR_LOAD"),
                     .DELAY_VALUE(DATA_INITIAL_IDELAY_TAP),
                     .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
@@ -552,7 +576,7 @@ module ddr4_phy #(
                     .LOAD(idelay_load_lane[dq_lane]),
                     .CNTVALUEIN(idelay_cntvalue),
                     .CNTVALUEOUT(),
-                    .DATAIN(1'b0), .EN_VTC(en_vtc), .CASC_IN(1'b0),
+                    .DATAIN(1'b0), .EN_VTC(en_vtc_q), .CASC_IN(1'b0),
                     .CASC_RETURN(1'b0), .CASC_OUT()
                 );
 
@@ -589,22 +613,24 @@ module ddr4_phy #(
             ) oserdes_dqs (
                 .D(dqs_pattern), .OQ(oserdes_dqs_out), .T_OUT(),
                 .CLK(i_ddr4_clk), .CLKDIV(i_controller_clk),
-                .RST(sync_rst), .T(dqs_tristate)
+                .RST(sync_rst), .T(dqs_tristate_wl)
             );
 
             wire odelay_dqs_out;
             (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
             ODELAYE3 #(
-                .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
-                .DELAY_TYPE("FIXED"), .DELAY_VALUE(DQS_INITIAL_ODELAY_TAP),
+                .CASCADE("NONE"), .DELAY_FORMAT("TIME"),
+                .DELAY_TYPE("VAR_LOAD"), .DELAY_VALUE(DQS_INITIAL_ODELAY_TAP),
                 .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
                 .REFCLK_FREQUENCY(300.0), .SIM_DEVICE("ULTRASCALE_PLUS"),
                 .UPDATE_MODE("ASYNC")
             ) odelay_dqs (
                 .ODATAIN(oserdes_dqs_out), .DATAOUT(odelay_dqs_out),
                 .CLK(i_controller_clk), .RST(sync_rst),
-                .CE(1'b0), .INC(1'b0), .LOAD(1'b0),
-                .CNTVALUEIN(9'b0), .CNTVALUEOUT(), .EN_VTC(en_vtc),
+                .CE(1'b0), .INC(1'b0),
+                .LOAD(odelay_dqs_load[dqs_lane]),
+                .CNTVALUEIN(odelay_dqs_cntvalue),
+                .CNTVALUEOUT(), .EN_VTC(en_vtc_q),
                 .CASC_IN(1'b0), .CASC_RETURN(1'b0), .CASC_OUT()
             );
 
@@ -612,13 +638,13 @@ module ddr4_phy #(
             IOBUFDS dqs_iobufds (
                 .I(odelay_dqs_out), .O(ibuf_dqs_out),
                 .IO(io_ddr4_dqs_p[dqs_lane]), .IOB(io_ddr4_dqs_n[dqs_lane]),
-                .T(dqs_tristate)
+                .T(dqs_tristate_wl)
             );
 
             wire idelay_dqs_out;
             (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
             IDELAYE3 #(
-                .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
+                .CASCADE("NONE"), .DELAY_FORMAT("TIME"),
                 .DELAY_SRC("IDATAIN"), .DELAY_TYPE("FIXED"),
                 .DELAY_VALUE(DQS_INITIAL_IDELAY_TAP),
                 .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
@@ -629,7 +655,7 @@ module ddr4_phy #(
                 .CLK(i_controller_clk), .RST(sync_rst),
                 .CE(1'b0), .INC(1'b0), .LOAD(1'b0),
                 .CNTVALUEIN(9'b0), .CNTVALUEOUT(),
-                .DATAIN(1'b0), .EN_VTC(en_vtc), .CASC_IN(1'b0),
+                .DATAIN(1'b0), .EN_VTC(en_vtc_q), .CASC_IN(1'b0),
                 .CASC_RETURN(1'b0), .CASC_OUT()
             );
 
@@ -684,7 +710,7 @@ module ddr4_phy #(
                 wire odelay_dm_out;
                 (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
                 ODELAYE3 #(
-                    .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
+                    .CASCADE("NONE"), .DELAY_FORMAT("TIME"),
                     .DELAY_TYPE("FIXED"), .DELAY_VALUE(DATA_INITIAL_ODELAY_TAP),
                     .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
                     .REFCLK_FREQUENCY(300.0), .SIM_DEVICE("ULTRASCALE_PLUS"),
@@ -693,7 +719,7 @@ module ddr4_phy #(
                     .ODATAIN(oserdes_dm_out), .DATAOUT(odelay_dm_out),
                     .CLK(i_controller_clk), .RST(sync_rst),
                     .CE(1'b0), .INC(1'b0), .LOAD(1'b0),
-                    .CNTVALUEIN(9'b0), .CNTVALUEOUT(), .EN_VTC(en_vtc),
+                    .CNTVALUEIN(9'b0), .CNTVALUEOUT(), .EN_VTC(en_vtc_q),
                     .CASC_IN(1'b0), .CASC_RETURN(1'b0), .CASC_OUT()
                 );
 
@@ -725,6 +751,14 @@ module ddr4_phy #(
     reg [8:0] first_pass_tap [BYTE_LANES-1:0];
     reg [8:0] last_pass_tap  [BYTE_LANES-1:0];
     reg       eye_found      [BYTE_LANES-1:0];
+
+    // Write leveling registers (Phase 7D)
+    reg [8:0] wl_tap        [BYTE_LANES-1:0];
+    reg       wl_prev_dq0   [BYTE_LANES-1:0];
+    reg [7:0] vtc_settle_counter;
+
+    assign wl_active = (phy_state == PHY_WL_SAMPLE) || (phy_state == PHY_WL_ADJUST)
+                     || (phy_state == PHY_WL_CHECK)  || (phy_state == PHY_WL_DONE);
 
     generate
         genvar bs_lane, bs_bit;
@@ -758,6 +792,9 @@ module ddr4_phy #(
                 first_pass_tap[dfi_pack_idx]   <= 9'b0;
                 last_pass_tap[dfi_pack_idx]    <= 9'b0;
                 eye_found[dfi_pack_idx]        <= 1'b0;
+                odelay_dqs_load[dfi_pack_idx]  <= 1'b0;
+                wl_tap[dfi_pack_idx]           <= 9'b0;
+                wl_prev_dq0[dfi_pack_idx]      <= 1'b0;
             end
             phy_state           <= PHY_IDLE;
             train_lane          <= 0;
@@ -765,10 +802,19 @@ module ddr4_phy #(
             bitslip_shift_count <= 4'b0;
             idelay_cntvalue     <= 9'b0;
             sweep_tap           <= 9'b0;
+            odelay_dqs_cntvalue <= 9'b0;
+            wl_dqs_strobe       <= 1'b0;
+            wl_dqs_strobe_d1    <= 1'b0;
+            en_vtc_q            <= 1'b0;
+            vtc_settle_counter  <= 8'b0;
         end else begin
-            // Default: deassert all IDELAYE3 load pulses (single-cycle pulse)
-            for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1)
+            // Default: deassert all LOAD pulses (single-cycle pulse)
+            for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1) begin
                 idelay_load_lane[dfi_pack_idx] <= 1'b0;
+                odelay_dqs_load[dfi_pack_idx]  <= 1'b0;
+            end
+            wl_dqs_strobe <= 1'b0;
+            wl_dqs_strobe_d1 <= wl_dqs_strobe;
 
             // Update previous ISERDESE3 outputs for bitslip window
             for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
@@ -800,17 +846,21 @@ module ddr4_phy #(
             // §13 — PHY Training FSM (SPEC §9.3)
             // Gate training: bitslip alignment using MPR page 0.
             // Eye training: IDELAYE3 DQ tap sweep, find eye, center.
-            // WL states declared but implemented in Phase 7D.
+            // Write leveling: ODELAYE3 DQS tap sweep, find 0→1 on DQ[0].
             // ═══════════════════════════════════════════════════════════
-            if (!SKIP_CALIB) begin
+            if (SKIP_CALIB) begin
+                en_vtc_q <= 1'b1;
+            end else begin
                 case (phy_state)
                     PHY_IDLE: begin
                         if (i_dfi_rdlvl_gate_en) begin
+                            en_vtc_q <= 1'b0;
                             o_dfi_rdlvl_resp <= {BYTE_LANES{1'b0}};
                             train_lane <= 0;
                             bitslip_shift_count <= 4'd0;
                             phy_state <= PHY_GATE_BITSLIP;
                         end else if (i_dfi_rdlvl_en) begin
+                            en_vtc_q <= 1'b0;
                             o_dfi_rdlvl_resp <= {BYTE_LANES{1'b0}};
                             train_lane <= 0;
                             sweep_tap <= 9'd0;
@@ -823,6 +873,18 @@ module ddr4_phy #(
                             end
                             phy_timer <= 3'd4;
                             phy_state <= PHY_EYE_SWEEP;
+                        end else if (i_dfi_wrlvl_en) begin
+                            en_vtc_q <= 1'b0;
+                            o_dfi_wrlvl_resp <= {BYTE_LANES{1'b0}};
+                            train_lane <= 0;
+                            odelay_dqs_cntvalue <= 9'd0;
+                            for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES;
+                                 dfi_pack_idx = dfi_pack_idx + 1) begin
+                                wl_tap[dfi_pack_idx] <= 9'd0;
+                                wl_prev_dq0[dfi_pack_idx] <= 1'b0;
+                            end
+                            phy_timer <= 3'd4;
+                            phy_state <= PHY_WL_SAMPLE;
                         end
                     end
 
@@ -988,6 +1050,95 @@ module ddr4_phy #(
                         o_dfi_rdlvl_resp <= {BYTE_LANES{1'b1}};
                         if (!i_dfi_rdlvl_en)
                             phy_state <= PHY_IDLE;
+                    end
+
+                    // ── Write leveling (Phase 7D) ────────────────────
+                    PHY_WL_SAMPLE: begin
+                        if (phy_timer != 0) begin
+                            if (phy_timer == 3'd3)
+                                odelay_dqs_load[train_lane] <= 1'b1;
+                            phy_timer <= phy_timer - 1'b1;
+                        end else if (i_dfi_wrlvl_strobe) begin
+                            wl_dqs_strobe <= 1'b1;
+                            phy_timer <= 3'd4;
+                            phy_state <= PHY_WL_ADJUST;
+                        end
+                    end
+
+                    PHY_WL_ADJUST: begin
+                        if (phy_timer != 0)
+                            phy_timer <= phy_timer - 1'b1;
+                        else begin
+                            if (|iserdes_dq_q[train_lane * DQ_BITS]) begin
+                                if (wl_prev_dq0[train_lane]) begin
+                                    phy_state <= PHY_WL_CHECK;
+                                end else begin
+                                    wl_prev_dq0[train_lane] <= 1'b1;
+                                    if (wl_tap[train_lane] >= 9'd508) begin
+                                        phy_state <= PHY_WL_CHECK;
+                                    end else begin
+                                        wl_tap[train_lane] <= wl_tap[train_lane]
+                                            + {5'b0, WL_TAP_STEP};
+                                        odelay_dqs_cntvalue <= wl_tap[train_lane]
+                                            + {5'b0, WL_TAP_STEP};
+                                        phy_timer <= 3'd4;
+                                        phy_state <= PHY_WL_SAMPLE;
+                                    end
+                                end
+                            end else begin
+                                wl_prev_dq0[train_lane] <= 1'b0;
+                                if (wl_tap[train_lane] >= 9'd508) begin
+                                    `ifndef YOSYS
+                                    $display("[%0t] PHY WL: lane %0d exhausted taps",
+                                        $realtime, train_lane);
+                                    `endif
+                                    phy_state <= PHY_WL_CHECK;
+                                end else begin
+                                    wl_tap[train_lane] <= wl_tap[train_lane]
+                                        + {5'b0, WL_TAP_STEP};
+                                    odelay_dqs_cntvalue <= wl_tap[train_lane]
+                                        + {5'b0, WL_TAP_STEP};
+                                    phy_timer <= 3'd4;
+                                    phy_state <= PHY_WL_SAMPLE;
+                                end
+                            end
+                        end
+                    end
+
+                    PHY_WL_CHECK: begin
+                        `ifndef YOSYS
+                        $display("[%0t] PHY WL: lane %0d tap=%0d",
+                            $realtime, train_lane, wl_tap[train_lane]);
+                        `endif
+                        if (train_lane < BYTE_LANES - 1) begin
+                            train_lane <= train_lane + 1'b1;
+                            wl_tap[train_lane + 1'b1] <= 9'd0;
+                            wl_prev_dq0[train_lane + 1'b1] <= 1'b0;
+                            odelay_dqs_cntvalue <= 9'd0;
+                            phy_timer <= 3'd4;
+                            phy_state <= PHY_WL_SAMPLE;
+                        end else begin
+                            en_vtc_q <= 1'b1;
+                            vtc_settle_counter <= VTC_SETTLE_CYCLES;
+                            phy_state <= PHY_WL_DONE;
+                            `ifndef YOSYS
+                            for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES;
+                                 dfi_pack_idx = dfi_pack_idx + 1)
+                                $display("[%0t] PHY WL done: lane %0d tap=%0d",
+                                    $realtime, dfi_pack_idx,
+                                    wl_tap[dfi_pack_idx]);
+                            `endif
+                        end
+                    end
+
+                    PHY_WL_DONE: begin
+                        if (vtc_settle_counter != 0)
+                            vtc_settle_counter <= vtc_settle_counter - 1'b1;
+                        else begin
+                            o_dfi_wrlvl_resp <= {BYTE_LANES{1'b1}};
+                            if (!i_dfi_wrlvl_en)
+                                phy_state <= PHY_IDLE;
+                        end
                     end
 
                     default: ;
