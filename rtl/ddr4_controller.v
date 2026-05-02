@@ -1176,7 +1176,8 @@ module ddr4_controller #(
                 case (calib_state)
                     CALIB_IDLE: begin
                         if (instruction_address == ROM_ADDR_RD_CAL
-                            && delay_counter_is_zero) begin
+                            && delay_counter_is_zero
+                            && i_dfi_init_complete) begin
                             pause_counter <= 1'b1;
                             calib_state <= CALIB_GATE_EN;
                             calib_rr_timer <= T_RDLVL_EN[$clog2(T_WRLVL_WW):0];
@@ -1197,7 +1198,7 @@ module ddr4_controller #(
                             cmd_d[ACTIVATE_SLOT] <= {
                                 1'b0, 1'b0, 3'b000,
                                 cmd_odt, 1'b1, 1'b1,
-                                {BG_BITS{1'b0}}, {BA_BITS{1'b0}}, 17'b0
+                                2'b00, 2'b00, 17'b0
                             };
                             calib_act_done <= 1'b1;
                             calib_rr_timer <=
@@ -1205,7 +1206,7 @@ module ddr4_controller #(
                         end else if (calib_rr_timer == 0) begin
                             cmd_d[READ_SLOT] <= {
                                 1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
-                                {BG_BITS{1'b0}}, {BA_BITS{1'b0}}, 17'b0
+                                2'b00, 2'b00, 17'b0
                             };
                             rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
                             calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
@@ -1227,7 +1228,7 @@ module ddr4_controller #(
                         end else if (calib_rr_timer == 0) begin
                             cmd_d[READ_SLOT] <= {
                                 1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
-                                {BG_BITS{1'b0}}, {BA_BITS{1'b0}}, 17'b0
+                                2'b00, 2'b00, 17'b0
                             };
                             rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
                             calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
@@ -1253,7 +1254,7 @@ module ddr4_controller #(
                         // bank already activated from gate training
                         cmd_d[READ_SLOT] <= {
                             1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
-                            {BG_BITS{1'b0}}, {BA_BITS{1'b0}}, 17'b0
+                            2'b00, 2'b00, 17'b0
                         };
                         rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
                         calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
@@ -1274,7 +1275,7 @@ module ddr4_controller #(
                         end else if (calib_rr_timer == 0) begin
                             cmd_d[READ_SLOT] <= {
                                 1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
-                                {BG_BITS{1'b0}}, {BA_BITS{1'b0}}, 17'b0
+                                2'b00, 2'b00, 17'b0
                             };
                             rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
                             calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
@@ -1287,7 +1288,7 @@ module ddr4_controller #(
                             // precharge BG0/BA0 before ROM issues MRS
                             cmd_d[PRECHARGE_SLOT] <= {
                                 1'b0, CMD_PRE, cmd_odt, 1'b1, 1'b1,
-                                {BG_BITS{1'b0}}, {BA_BITS{1'b0}},
+                                2'b00, 2'b00,
                                 7'b0, 1'b0, 9'b0
                             };
                             calib_act_done <= 1'b0;
