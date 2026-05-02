@@ -821,9 +821,7 @@ module ddr4_phy #(
                                 first_pass_tap[dfi_pack_idx] <= 9'd0;
                                 last_pass_tap[dfi_pack_idx] <= 9'd0;
                             end
-                            // Load tap 0 into current lane's IDELAYE3
-                            idelay_load_lane[0] <= 1'b1;
-                            phy_timer <= 3'd2;
+                            phy_timer <= 3'd4;
                             phy_state <= PHY_EYE_SWEEP;
                         end
                     end
@@ -882,9 +880,11 @@ module ddr4_phy #(
 
                     // ── Eye training (Phase 7C) ──────────────────────
                     PHY_EYE_SWEEP: begin
-                        if (phy_timer != 0)
+                        if (phy_timer != 0) begin
+                            if (phy_timer == 3'd3)
+                                idelay_load_lane[train_lane] <= 1'b1;
                             phy_timer <= phy_timer - 1'b1;
-                        else if (|i_dfi_rddata_en) begin
+                        end else if (|i_dfi_rddata_en) begin
                             if (aligned_dq[train_lane * DQ_BITS] == MPR_PATTERN) begin
                                 // Data matches at this tap
                                 if (!eye_found[train_lane]) begin
@@ -899,8 +899,7 @@ module ddr4_phy #(
                                 end else begin
                                     sweep_tap <= sweep_tap + {5'b0, TAP_SWEEP_STEP};
                                     idelay_cntvalue <= sweep_tap + {5'b0, TAP_SWEEP_STEP};
-                                    idelay_load_lane[train_lane] <= 1'b1;
-                                    phy_timer <= 3'd2;
+                                    phy_timer <= 3'd4;
                                 end
                             end else begin
                                 // Data mismatch
@@ -919,8 +918,7 @@ module ddr4_phy #(
                                     end else begin
                                         sweep_tap <= sweep_tap + {5'b0, TAP_SWEEP_STEP};
                                         idelay_cntvalue <= sweep_tap + {5'b0, TAP_SWEEP_STEP};
-                                        idelay_load_lane[train_lane] <= 1'b1;
-                                        phy_timer <= 3'd2;
+                                        phy_timer <= 3'd4;
                                     end
                                 end
                             end
@@ -928,11 +926,9 @@ module ddr4_phy #(
                     end
 
                     PHY_EYE_CENTER: begin
-                        // Compute midpoint and load into IDELAYE3
                         idelay_cntvalue <=
                             (first_pass_tap[train_lane] + last_pass_tap[train_lane]) >> 1;
-                        idelay_load_lane[train_lane] <= 1'b1;
-                        phy_timer <= 3'd2;
+                        phy_timer <= 3'd4;
                         phy_state <= PHY_EYE_VERIFY;
                         `ifndef YOSYS
                         $display("[%0t] PHY eye: lane %0d first=%0d last=%0d center=%0d",
@@ -943,10 +939,11 @@ module ddr4_phy #(
                     end
 
                     PHY_EYE_VERIFY: begin
-                        // Wait for settle, then verify data at centered tap
-                        if (phy_timer != 0)
+                        if (phy_timer != 0) begin
+                            if (phy_timer == 3'd3)
+                                idelay_load_lane[train_lane] <= 1'b1;
                             phy_timer <= phy_timer - 1'b1;
-                        else if (|i_dfi_rddata_en) begin
+                        end else if (|i_dfi_rddata_en) begin
                             if (aligned_dq[train_lane * DQ_BITS] == MPR_PATTERN) begin
                                 // Verified — advance to next lane or finish
                                 if (train_lane < BYTE_LANES - 1) begin
@@ -954,8 +951,7 @@ module ddr4_phy #(
                                     sweep_tap <= 9'd0;
                                     idelay_cntvalue <= 9'd0;
                                     eye_found[train_lane + 1'b1] <= 1'b0;
-                                    idelay_load_lane[train_lane + 1'b1] <= 1'b1;
-                                    phy_timer <= 3'd2;
+                                    phy_timer <= 3'd4;
                                     phy_state <= PHY_EYE_SWEEP;
                                 end else begin
                                     phy_state <= PHY_EYE_DONE;
@@ -979,8 +975,7 @@ module ddr4_phy #(
                                     sweep_tap <= 9'd0;
                                     idelay_cntvalue <= 9'd0;
                                     eye_found[train_lane + 1'b1] <= 1'b0;
-                                    idelay_load_lane[train_lane + 1'b1] <= 1'b1;
-                                    phy_timer <= 3'd2;
+                                    phy_timer <= 3'd4;
                                     phy_state <= PHY_EYE_SWEEP;
                                 end else begin
                                     phy_state <= PHY_EYE_DONE;
