@@ -158,6 +158,9 @@ module ddr4_phy #(
     // Q[0]=D0=0(rise), Q[1]=D1=1(fall), ... Q[7]=D7=1(fall) → 8'b10101010
     localparam [7:0] MPR_PATTERN = 8'b10101010;
 
+    // Eye training: sweep IDELAYE3 in steps of 4 (512/4 = 128 iterations)
+    localparam [3:0] TAP_SWEEP_STEP = 4'd4;
+
     // Derived constants for DFI data indexing
     localparam TOTAL_DQ      = DQ_BITS * BYTE_LANES;
     localparam BEAT_WIDTH    = DQ_BITS * BYTE_LANES;         // bits per beat
@@ -476,6 +479,10 @@ module ddr4_phy #(
     wire [7:0] iserdes_dq_q [TOTAL_DQ-1:0];  // raw ISERDESE3 output per DQ bit
     wire [7:0] iserdes_dqs_q [BYTE_LANES-1:0]; // raw DQS ISERDESE3 (gate training)
 
+    // Eye training: per-lane IDELAYE3 LOAD pulse and shared tap value
+    reg  idelay_load_lane [BYTE_LANES-1:0];
+    reg  [8:0] idelay_cntvalue;
+
     generate
         genvar dq_lane, dq_bit;
         for (dq_lane = 0; dq_lane < BYTE_LANES; dq_lane = dq_lane + 1) begin : gen_dq_lane
@@ -529,10 +536,11 @@ module ddr4_phy #(
                 );
 
                 wire idelay_dq_out;
+                // VAR_LOAD: training FSM loads tap via idelay_load_lane
                 (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
                 IDELAYE3 #(
                     .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
-                    .DELAY_SRC("IDATAIN"), .DELAY_TYPE("FIXED"),
+                    .DELAY_SRC("IDATAIN"), .DELAY_TYPE("VAR_LOAD"),
                     .DELAY_VALUE(DATA_INITIAL_IDELAY_TAP),
                     .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
                     .REFCLK_FREQUENCY(300.0), .SIM_DEVICE("ULTRASCALE_PLUS"),
@@ -540,8 +548,10 @@ module ddr4_phy #(
                 ) idelay_dq (
                     .IDATAIN(ibuf_dq_out), .DATAOUT(idelay_dq_out),
                     .CLK(i_controller_clk), .RST(sync_rst),
-                    .CE(1'b0), .INC(1'b0), .LOAD(1'b0),
-                    .CNTVALUEIN(9'b0), .CNTVALUEOUT(),
+                    .CE(1'b0), .INC(1'b0),
+                    .LOAD(idelay_load_lane[dq_lane]),
+                    .CNTVALUEIN(idelay_cntvalue),
+                    .CNTVALUEOUT(),
                     .DATAIN(1'b0), .EN_VTC(en_vtc), .CASC_IN(1'b0),
                     .CASC_RETURN(1'b0), .CASC_OUT()
                 );
@@ -710,6 +720,12 @@ module ddr4_phy #(
     reg [2:0] phy_timer;
     reg [3:0] bitslip_shift_count;
 
+    // Eye training registers (Phase 7C)
+    reg [8:0] sweep_tap;
+    reg [8:0] first_pass_tap [BYTE_LANES-1:0];
+    reg [8:0] last_pass_tap  [BYTE_LANES-1:0];
+    reg       eye_found      [BYTE_LANES-1:0];
+
     generate
         genvar bs_lane, bs_bit;
         for (bs_lane = 0; bs_lane < BYTE_LANES; bs_lane = bs_lane + 1) begin : gen_bs_lane
@@ -736,13 +752,24 @@ module ddr4_phy #(
             o_dfi_wrlvl_resp   <= {BYTE_LANES{1'b0}};
             for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
                 prev_iserdes_q[dfi_pack_idx] <= 8'b0;
-            for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1)
+            for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1) begin
                 bitslip_count_q[dfi_pack_idx] <= SKIP_CALIB ? INITIAL_BITSLIP[2:0] : 3'b0;
+                idelay_load_lane[dfi_pack_idx] <= 1'b0;
+                first_pass_tap[dfi_pack_idx]   <= 9'b0;
+                last_pass_tap[dfi_pack_idx]    <= 9'b0;
+                eye_found[dfi_pack_idx]        <= 1'b0;
+            end
             phy_state           <= PHY_IDLE;
             train_lane          <= 0;
             phy_timer           <= 3'b0;
             bitslip_shift_count <= 4'b0;
+            idelay_cntvalue     <= 9'b0;
+            sweep_tap           <= 9'b0;
         end else begin
+            // Default: deassert all IDELAYE3 load pulses (single-cycle pulse)
+            for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1)
+                idelay_load_lane[dfi_pack_idx] <= 1'b0;
+
             // Update previous ISERDESE3 outputs for bitslip window
             for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
                 prev_iserdes_q[dfi_pack_idx] <= iserdes_dq_q[dfi_pack_idx];
@@ -771,8 +798,9 @@ module ddr4_phy #(
 
             // ═══════════════════════════════════════════════════════════
             // §13 — PHY Training FSM (SPEC §9.3)
-            // Gate training: bitslip alignment using MPR page 0 pattern.
-            // Eye/WL states declared but implemented in Phases 7C/7D.
+            // Gate training: bitslip alignment using MPR page 0.
+            // Eye training: IDELAYE3 DQ tap sweep, find eye, center.
+            // WL states declared but implemented in Phase 7D.
             // ═══════════════════════════════════════════════════════════
             if (!SKIP_CALIB) begin
                 case (phy_state)
@@ -782,9 +810,25 @@ module ddr4_phy #(
                             train_lane <= 0;
                             bitslip_shift_count <= 4'd0;
                             phy_state <= PHY_GATE_BITSLIP;
+                        end else if (i_dfi_rdlvl_en) begin
+                            o_dfi_rdlvl_resp <= {BYTE_LANES{1'b0}};
+                            train_lane <= 0;
+                            sweep_tap <= 9'd0;
+                            idelay_cntvalue <= 9'd0;
+                            for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES;
+                                 dfi_pack_idx = dfi_pack_idx + 1) begin
+                                eye_found[dfi_pack_idx] <= 1'b0;
+                                first_pass_tap[dfi_pack_idx] <= 9'd0;
+                                last_pass_tap[dfi_pack_idx] <= 9'd0;
+                            end
+                            // Load tap 0 into current lane's IDELAYE3
+                            idelay_load_lane[0] <= 1'b1;
+                            phy_timer <= 3'd2;
+                            phy_state <= PHY_EYE_SWEEP;
                         end
                     end
 
+                    // ── Gate training (Phase 7B) ──────────────────────
                     PHY_GATE_BITSLIP: begin
                         if (phy_timer != 0)
                             phy_timer <= phy_timer - 1'b1;
@@ -812,7 +856,6 @@ module ddr4_phy #(
                     end
 
                     PHY_GATE_DQS_FIND: begin
-                        // V1 simplified: verify DQS toggling, advance lane
                         if (|i_dfi_rddata_en) begin
                             if (train_lane < BYTE_LANES - 1) begin
                                 train_lane <= train_lane + 1'b1;
@@ -834,6 +877,121 @@ module ddr4_phy #(
                     PHY_GATE_DONE: begin
                         o_dfi_rdlvl_resp <= {BYTE_LANES{1'b1}};
                         if (!i_dfi_rdlvl_gate_en)
+                            phy_state <= PHY_IDLE;
+                    end
+
+                    // ── Eye training (Phase 7C) ──────────────────────
+                    PHY_EYE_SWEEP: begin
+                        if (phy_timer != 0)
+                            phy_timer <= phy_timer - 1'b1;
+                        else if (|i_dfi_rddata_en) begin
+                            if (aligned_dq[train_lane * DQ_BITS] == MPR_PATTERN) begin
+                                // Data matches at this tap
+                                if (!eye_found[train_lane]) begin
+                                    first_pass_tap[train_lane] <= sweep_tap;
+                                    eye_found[train_lane] <= 1'b1;
+                                end
+                                last_pass_tap[train_lane] <= sweep_tap;
+                                // Advance to next tap or finish if at 511
+                                if (sweep_tap >= 9'd508) begin
+                                    // At or past last valid step — eye stays open to end
+                                    phy_state <= PHY_EYE_CENTER;
+                                end else begin
+                                    sweep_tap <= sweep_tap + {5'b0, TAP_SWEEP_STEP};
+                                    idelay_cntvalue <= sweep_tap + {5'b0, TAP_SWEEP_STEP};
+                                    idelay_load_lane[train_lane] <= 1'b1;
+                                    phy_timer <= 3'd2;
+                                end
+                            end else begin
+                                // Data mismatch
+                                if (eye_found[train_lane]) begin
+                                    // Eye has closed — we have both boundaries
+                                    phy_state <= PHY_EYE_CENTER;
+                                end else begin
+                                    // Haven't found eye yet — keep sweeping
+                                    if (sweep_tap >= 9'd508) begin
+                                        // Exhausted all taps without finding eye
+                                        `ifndef YOSYS
+                                        $display("[%0t] PHY eye: lane %0d no eye found",
+                                            $realtime, train_lane);
+                                        `endif
+                                        phy_state <= PHY_EYE_CENTER;
+                                    end else begin
+                                        sweep_tap <= sweep_tap + {5'b0, TAP_SWEEP_STEP};
+                                        idelay_cntvalue <= sweep_tap + {5'b0, TAP_SWEEP_STEP};
+                                        idelay_load_lane[train_lane] <= 1'b1;
+                                        phy_timer <= 3'd2;
+                                    end
+                                end
+                            end
+                        end
+                    end
+
+                    PHY_EYE_CENTER: begin
+                        // Compute midpoint and load into IDELAYE3
+                        idelay_cntvalue <=
+                            (first_pass_tap[train_lane] + last_pass_tap[train_lane]) >> 1;
+                        idelay_load_lane[train_lane] <= 1'b1;
+                        phy_timer <= 3'd2;
+                        phy_state <= PHY_EYE_VERIFY;
+                        `ifndef YOSYS
+                        $display("[%0t] PHY eye: lane %0d first=%0d last=%0d center=%0d",
+                            $realtime, train_lane,
+                            first_pass_tap[train_lane], last_pass_tap[train_lane],
+                            (first_pass_tap[train_lane] + last_pass_tap[train_lane]) >> 1);
+                        `endif
+                    end
+
+                    PHY_EYE_VERIFY: begin
+                        // Wait for settle, then verify data at centered tap
+                        if (phy_timer != 0)
+                            phy_timer <= phy_timer - 1'b1;
+                        else if (|i_dfi_rddata_en) begin
+                            if (aligned_dq[train_lane * DQ_BITS] == MPR_PATTERN) begin
+                                // Verified — advance to next lane or finish
+                                if (train_lane < BYTE_LANES - 1) begin
+                                    train_lane <= train_lane + 1'b1;
+                                    sweep_tap <= 9'd0;
+                                    idelay_cntvalue <= 9'd0;
+                                    eye_found[train_lane + 1'b1] <= 1'b0;
+                                    idelay_load_lane[train_lane + 1'b1] <= 1'b1;
+                                    phy_timer <= 3'd2;
+                                    phy_state <= PHY_EYE_SWEEP;
+                                end else begin
+                                    phy_state <= PHY_EYE_DONE;
+                                    `ifndef YOSYS
+                                    for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES;
+                                         dfi_pack_idx = dfi_pack_idx + 1)
+                                        $display("[%0t] PHY eye done: lane %0d tap=%0d",
+                                            $realtime, dfi_pack_idx,
+                                            (first_pass_tap[dfi_pack_idx]
+                                             + last_pass_tap[dfi_pack_idx]) >> 1);
+                                    `endif
+                                end
+                            end else begin
+                                // Verification failed — flag and proceed
+                                `ifndef YOSYS
+                                $display("[%0t] PHY eye: lane %0d verify FAILED at center tap",
+                                    $realtime, train_lane);
+                                `endif
+                                if (train_lane < BYTE_LANES - 1) begin
+                                    train_lane <= train_lane + 1'b1;
+                                    sweep_tap <= 9'd0;
+                                    idelay_cntvalue <= 9'd0;
+                                    eye_found[train_lane + 1'b1] <= 1'b0;
+                                    idelay_load_lane[train_lane + 1'b1] <= 1'b1;
+                                    phy_timer <= 3'd2;
+                                    phy_state <= PHY_EYE_SWEEP;
+                                end else begin
+                                    phy_state <= PHY_EYE_DONE;
+                                end
+                            end
+                        end
+                    end
+
+                    PHY_EYE_DONE: begin
+                        o_dfi_rdlvl_resp <= {BYTE_LANES{1'b1}};
+                        if (!i_dfi_rdlvl_en)
                             phy_state <= PHY_IDLE;
                     end
 
