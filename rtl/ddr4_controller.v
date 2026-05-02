@@ -318,9 +318,12 @@ module ddr4_controller #(
     localparam MAX_RRD_DELAY       = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG;
 
     // ── Read/Write data enable pipeline depths (SPEC §4.3, §5.3) ──
-    // Controller cycles from READ command to dfi_rddata_en assertion
+    // Controller cycles from READ command to dfi_rddata_en assertion.
+    // +4 accounts for: OSERDESE3 cmd pipeline (absorbed by find_delay),
+    // CL propagation, ISERDESE3 deserialization latency (+1 CLKDIV),
+    // and prev_iserdes_q registration for bitslip window (+1 CLKDIV).
     localparam READ_DELAY = find_delay(CL_nCK, READ_SLOT, READ_SLOT);
-    localparam RDDATA_EN_PIPE_WIDTH = READ_DELAY + 2;
+    localparam RDDATA_EN_PIPE_WIDTH = READ_DELAY + 4;
     // Controller cycles from WRITE command to dfi_wrdata_en assertion
     localparam WRITE_DATA_DELAY = find_delay(CWL_nCK, WRITE_SLOT, WRITE_SLOT);
 
@@ -546,6 +549,11 @@ module ddr4_controller #(
     reg                       stage2_we;
     reg[WB_DATA_BITS-1:0]    stage2_data;
     reg[WB_SEL_BITS-1:0]     stage2_dm;
+    // Write data delay pipeline (SPEC §5.4) — mirrors wrdata_en_pipe_q
+    // structure (same depth, shift direction, load position) so data and
+    // enable stay aligned. Prevents stage2_data overwrite on back-to-back writes.
+    reg[WB_DATA_BITS-1:0]    wr_data_pipe_q [WRITE_DATA_DELAY:0];
+    reg[WB_SEL_BITS-1:0]     wr_dm_pipe_q   [WRITE_DATA_DELAY:0];
     reg[COL_BITS-1:0]        stage2_col;
     reg[BA_BITS-1:0]         stage2_ba;
     reg[BG_BITS-1:0]         stage2_bg;
@@ -881,6 +889,10 @@ module ddr4_controller #(
             activate_index_q <= 2'b00;
             rddata_en_pipe_q <= {RDDATA_EN_PIPE_WIDTH{1'b0}};
             wrdata_en_pipe_q <= {(WRITE_DATA_DELAY+1){1'b0}};
+            for (bank_i = 0; bank_i <= WRITE_DATA_DELAY; bank_i = bank_i + 1) begin
+                wr_data_pipe_q[bank_i] <= {WB_DATA_BITS{1'b0}};
+                wr_dm_pipe_q[bank_i]   <= {WB_SEL_BITS{1'b0}};
+            end
             write_ack_q <= 1'b0;
             read_ack_q  <= 1'b0;
             stage1_pending <= 1'b0;
@@ -1074,14 +1086,20 @@ module ddr4_controller #(
                 wrdata_en_pipe_q[WRITE_DATA_DELAY] <= 1'b1;
             o_dfi_wrdata_en <= {4{wrdata_en_pipe_q[0]}};
 
-            // Write data pipeline — drive DFI write data from stage2
-            // Data is captured at stage1→stage2 handoff; by the time
-            // wrdata_en_pipe_q[0] asserts, stage2_data holds the correct word.
-            // Phase packing per SPEC §5.1: each phase = 2 beats (rising+falling)
-            if (wrdata_en_pipe_q[0]) begin
-                o_dfi_wrdata <= stage2_data;
-                o_dfi_wrdata_mask <= ~stage2_dm;
+            // Write data delay pipeline (SPEC §5.4) — mirrors wrdata_en_pipe_q
+            // shift structure: right-shift, load at [WD], read at [0].
+            for (bank_i = 0; bank_i < WRITE_DATA_DELAY; bank_i = bank_i + 1) begin
+                wr_data_pipe_q[bank_i] <= wr_data_pipe_q[bank_i + 1];
+                wr_dm_pipe_q[bank_i]   <= wr_dm_pipe_q[bank_i + 1];
             end
+            wr_data_pipe_q[WRITE_DATA_DELAY] <= {WB_DATA_BITS{1'b0}};
+            wr_dm_pipe_q[WRITE_DATA_DELAY]   <= {WB_SEL_BITS{1'b0}};
+            if (sched_write) begin
+                wr_data_pipe_q[WRITE_DATA_DELAY] <= stage2_data;
+                wr_dm_pipe_q[WRITE_DATA_DELAY]   <= stage2_dm;
+            end
+            o_dfi_wrdata      <= wr_data_pipe_q[0];
+            o_dfi_wrdata_mask <= ~wr_dm_pipe_q[0];
 
             // Read data enable shift register (SPEC §4.4)
             rddata_en_pipe_q <= {1'b0, rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1:1]};

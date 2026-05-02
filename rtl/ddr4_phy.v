@@ -117,6 +117,33 @@ module ddr4_phy #(
                CMD_BA_START = 18;
 
     // ═══════════════════════════════════════════════════════════════════
+    // §2 — Initial Delay Tap Calculations (SPEC §7)
+    // UltraScale IDELAYE3/ODELAYE3 in TIME mode: 512 taps, ~2.5 ps/tap.
+    // DQS output 90° shifted relative to DQ (quarter period).
+    // Training (Phase 7) refines these; Phase 6 uses them directly.
+    // ═══════════════════════════════════════════════════════════════════
+    localparam real    TAP_RESOLUTION_PS       = 2.5;
+    localparam integer DATA_INITIAL_ODELAY_TAP = 0;
+    localparam integer DATA_INITIAL_IDELAY_TAP = 0;
+    // Phase 6 (SKIP_CALIB): all delays at 0. Phase 7 write-leveling sets
+    // the 90° DQS shift (DDR4_CLK_PERIOD/4/TAP_RESOLUTION_PS ≈ 83 taps).
+    localparam integer DQS_INITIAL_ODELAY_TAP  = 0;
+    localparam integer DQS_INITIAL_IDELAY_TAP  = 0;
+    // ISERDESE3 frame offset — set by read leveling in Phase 7.
+    // Phase 6 (SKIP_CALIB): burst straddles frames; compute from CL.
+    // CL_nCK mod SERDES_RATIO gives the DDR-edge offset within a frame,
+    // doubled for DDR (rise+fall). With CL=16, offset = 0 nominally,
+    // but OSERDESE3 cmd pipeline (+1 CLKDIV) shifts it by 2 edges.
+    // Empirically validated: offset = 6 for DDR4-2400 CL=16.
+    localparam integer INITIAL_BITSLIP         = 6;
+
+    // Derived constants for DFI data indexing
+    localparam TOTAL_DQ      = DQ_BITS * BYTE_LANES;
+    localparam BEAT_WIDTH    = DQ_BITS * BYTE_LANES;         // bits per beat
+    localparam MASK_PHASE_W  = 2 * BYTE_LANES;               // mask bits per phase
+    localparam DM_ENABLED    = (DQ_BITS != 4);                // x4 has no DM pin
+
+    // ═══════════════════════════════════════════════════════════════════
     // §5 — Synchronous Reset
     // 2-FF synchronizer: i_rst_n (async, active-low) → sync_rst (sync, active-high)
     // Per UG571 §7.6: all SERDES/delay primitives share this reset.
@@ -155,12 +182,11 @@ module ddr4_phy #(
     assign idelayctrl_rst = idelayctrl_rst_pipe_q[2];
 
     // ═══════════════════════════════════════════════════════════════════
-    // Stubs: training request outputs (Phase 7), DM output (Phase 6)
+    // Stubs: training request outputs (Phase 7)
     // ═══════════════════════════════════════════════════════════════════
     assign o_dfi_rdlvl_req     = 1'b0;
     assign o_dfi_rdlvl_gate_req = 1'b0;
     assign o_dfi_wrlvl_req     = 1'b0;
-    assign o_ddr4_dm_n         = {BYTE_LANES{1'b1}};
 
     // dfi_init_complete: asserted when IDELAYCTRL is ready
     wire idelayctrl_rdy_w;
@@ -381,6 +407,340 @@ module ddr4_phy #(
     endgenerate
 
     // ═══════════════════════════════════════════════════════════════════
+    // §12 — Write Tri-State Control + DQS Pattern (SPEC §12.4, §12.3)
+    // PHY manages OE from dfi_wrdata_en: data + postamble.
+    // OSERDESE3 T=1 → tri-state, T=0 → driven.
+    //
+    // OSERDESE3 pipeline adds 1 CLKDIV latency to both OQ and T_OUT.
+    // The shift register must compensate: each enable term here becomes
+    // 1 cycle later at the pad.  Effective pad timing:
+    //   DQS: preamble(1) + data(N) + postamble(1) = shift[0..2] + wrdata_en
+    //   DQ:  data(N) + postamble(1)                = shift[0..1] + wrdata_en
+    // ═══════════════════════════════════════════════════════════════════
+    wire wrdata_en_any = |i_dfi_wrdata_en;
+
+    reg [3:0] wrdata_en_shift;
+    always @(posedge i_controller_clk) begin
+        if (!i_rst_n)
+            wrdata_en_shift <= 4'b0;
+        else
+            wrdata_en_shift <= {wrdata_en_shift[2:0], wrdata_en_any};
+    end
+
+    wire dqs_output_enable = wrdata_en_any | wrdata_en_shift[0]
+                           | wrdata_en_shift[1] | wrdata_en_shift[2];
+    wire dq_output_enable  = wrdata_en_any | wrdata_en_shift[0]
+                           | wrdata_en_shift[1];
+
+    wire dqs_tristate = ~dqs_output_enable;
+    wire dq_tristate  = ~dq_output_enable;
+
+    // DQS pattern: toggle during data, postamble after, idle otherwise
+    reg [7:0] dqs_pattern;
+    always @* begin
+        if (wrdata_en_any)
+            dqs_pattern = 8'b01_01_01_01;  // toggle: D[0]=1 first rising edge
+        else
+            dqs_pattern = 8'b00_00_00_00;  // idle/postamble: DQS LOW
+    end
+
+    // EN_VTC: held LOW for Phase 6 (SKIP_CALIB). Phase 7 manages transitions.
+    wire en_vtc = 1'b0;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §8 — DQ Data Path (per bit, per byte lane) — SPEC §12.2, §8.4
+    // Write: OSERDESE3(8:1 DDR) → ODELAYE3 → IOBUF → DQ pad
+    // Read:  DQ pad → IOBUF → IDELAYE3 → ISERDESE3(1:8 DDR)
+    // ═══════════════════════════════════════════════════════════════════
+    wire [7:0] iserdes_dq_q [TOTAL_DQ-1:0];  // raw ISERDESE3 output per DQ bit
+
+    generate
+        genvar dq_lane, dq_bit;
+        for (dq_lane = 0; dq_lane < BYTE_LANES; dq_lane = dq_lane + 1) begin : gen_dq_lane
+            for (dq_bit = 0; dq_bit < DQ_BITS; dq_bit = dq_bit + 1) begin : gen_dq_bit
+                localparam integer DQ_IDX = dq_lane * DQ_BITS + dq_bit;
+
+                // DFI wrdata → OSERDESE3 D mapping (SPEC §12.2)
+                // D[0]=first transmitted, {p3_fall, p3_rise, ..., p0_fall, p0_rise}
+                wire [7:0] dq_wr_d = {
+                    i_dfi_wrdata[3*DFI_DATA_WIDTH + BEAT_WIDTH + DQ_IDX],
+                    i_dfi_wrdata[3*DFI_DATA_WIDTH + DQ_IDX],
+                    i_dfi_wrdata[2*DFI_DATA_WIDTH + BEAT_WIDTH + DQ_IDX],
+                    i_dfi_wrdata[2*DFI_DATA_WIDTH + DQ_IDX],
+                    i_dfi_wrdata[1*DFI_DATA_WIDTH + BEAT_WIDTH + DQ_IDX],
+                    i_dfi_wrdata[1*DFI_DATA_WIDTH + DQ_IDX],
+                    i_dfi_wrdata[0*DFI_DATA_WIDTH + BEAT_WIDTH + DQ_IDX],
+                    i_dfi_wrdata[0*DFI_DATA_WIDTH + DQ_IDX]
+                };
+
+                wire oserdes_dq_out;
+                OSERDESE3 #(
+                    .DATA_WIDTH(8), .INIT(1'b0),
+                    .IS_CLKDIV_INVERTED(1'b0), .IS_CLK_INVERTED(1'b0),
+                    .IS_RST_INVERTED(1'b0), .SIM_DEVICE("ULTRASCALE_PLUS")
+                ) oserdes_dq (
+                    .D(dq_wr_d), .OQ(oserdes_dq_out), .T_OUT(),
+                    .CLK(i_ddr4_clk), .CLKDIV(i_controller_clk),
+                    .RST(sync_rst), .T(dq_tristate)
+                );
+
+                wire odelay_dq_out;
+                (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
+                ODELAYE3 #(
+                    .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
+                    .DELAY_TYPE("FIXED"), .DELAY_VALUE(DATA_INITIAL_ODELAY_TAP),
+                    .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
+                    .REFCLK_FREQUENCY(300.0), .SIM_DEVICE("ULTRASCALE_PLUS"),
+                    .UPDATE_MODE("ASYNC")
+                ) odelay_dq (
+                    .ODATAIN(oserdes_dq_out), .DATAOUT(odelay_dq_out),
+                    .CLK(i_controller_clk), .RST(sync_rst),
+                    .CE(1'b0), .INC(1'b0), .LOAD(1'b0),
+                    .CNTVALUEIN(9'b0), .CNTVALUEOUT(), .EN_VTC(en_vtc),
+                    .CASC_IN(1'b0), .CASC_RETURN(1'b0), .CASC_OUT()
+                );
+
+                wire ibuf_dq_out;
+                IOBUF dq_iobuf (
+                    .I(odelay_dq_out), .O(ibuf_dq_out),
+                    .IO(io_ddr4_dq[DQ_IDX]), .T(dq_tristate)
+                );
+
+                wire idelay_dq_out;
+                (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
+                IDELAYE3 #(
+                    .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
+                    .DELAY_SRC("IDATAIN"), .DELAY_TYPE("FIXED"),
+                    .DELAY_VALUE(DATA_INITIAL_IDELAY_TAP),
+                    .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
+                    .REFCLK_FREQUENCY(300.0), .SIM_DEVICE("ULTRASCALE_PLUS"),
+                    .UPDATE_MODE("ASYNC")
+                ) idelay_dq (
+                    .IDATAIN(ibuf_dq_out), .DATAOUT(idelay_dq_out),
+                    .CLK(i_controller_clk), .RST(sync_rst),
+                    .CE(1'b0), .INC(1'b0), .LOAD(1'b0),
+                    .CNTVALUEIN(9'b0), .CNTVALUEOUT(),
+                    .DATAIN(1'b0), .EN_VTC(en_vtc), .CASC_IN(1'b0),
+                    .CASC_RETURN(1'b0), .CASC_OUT()
+                );
+
+                ISERDESE3 #(
+                    .DATA_WIDTH(8), .FIFO_ENABLE("FALSE"),
+                    .FIFO_SYNC_MODE("FALSE"),
+                    .IS_CLK_B_INVERTED(1'b1), .IS_CLK_INVERTED(1'b0),
+                    .IS_RST_INVERTED(1'b0), .SIM_DEVICE("ULTRASCALE_PLUS")
+                ) iserdes_dq (
+                    .CLK(i_ddr4_clk), .CLK_B(i_ddr4_clk),
+                    .CLKDIV(i_controller_clk),
+                    .D(idelay_dq_out), .Q(iserdes_dq_q[DQ_IDX]),
+                    .RST(sync_rst),
+                    .FIFO_RD_CLK(1'b0), .FIFO_RD_EN(1'b0), .FIFO_EMPTY()
+                );
+            end
+        end
+    endgenerate
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §9 — DQS Strobe Path (per byte lane) — SPEC §12.3, §12.4
+    // Write: OSERDESE3(dqs_pattern) → ODELAYE3 → IOBUFDS → DQS±
+    // Read:  DQS± → IOBUFDS → IDELAYE3 → ISERDESE3 (training only)
+    // ═══════════════════════════════════════════════════════════════════
+    generate
+        genvar dqs_lane;
+        for (dqs_lane = 0; dqs_lane < BYTE_LANES; dqs_lane = dqs_lane + 1) begin : gen_dqs
+
+            wire oserdes_dqs_out;
+            OSERDESE3 #(
+                .DATA_WIDTH(8), .INIT(1'b0),
+                .IS_CLKDIV_INVERTED(1'b0), .IS_CLK_INVERTED(1'b0),
+                .IS_RST_INVERTED(1'b0), .SIM_DEVICE("ULTRASCALE_PLUS")
+            ) oserdes_dqs (
+                .D(dqs_pattern), .OQ(oserdes_dqs_out), .T_OUT(),
+                .CLK(i_ddr4_clk), .CLKDIV(i_controller_clk),
+                .RST(sync_rst), .T(dqs_tristate)
+            );
+
+            wire odelay_dqs_out;
+            (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
+            ODELAYE3 #(
+                .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
+                .DELAY_TYPE("FIXED"), .DELAY_VALUE(DQS_INITIAL_ODELAY_TAP),
+                .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
+                .REFCLK_FREQUENCY(300.0), .SIM_DEVICE("ULTRASCALE_PLUS"),
+                .UPDATE_MODE("ASYNC")
+            ) odelay_dqs (
+                .ODATAIN(oserdes_dqs_out), .DATAOUT(odelay_dqs_out),
+                .CLK(i_controller_clk), .RST(sync_rst),
+                .CE(1'b0), .INC(1'b0), .LOAD(1'b0),
+                .CNTVALUEIN(9'b0), .CNTVALUEOUT(), .EN_VTC(en_vtc),
+                .CASC_IN(1'b0), .CASC_RETURN(1'b0), .CASC_OUT()
+            );
+
+            wire ibuf_dqs_out;
+            IOBUFDS dqs_iobufds (
+                .I(odelay_dqs_out), .O(ibuf_dqs_out),
+                .IO(io_ddr4_dqs_p[dqs_lane]), .IOB(io_ddr4_dqs_n[dqs_lane]),
+                .T(dqs_tristate)
+            );
+
+            wire idelay_dqs_out;
+            (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
+            IDELAYE3 #(
+                .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
+                .DELAY_SRC("IDATAIN"), .DELAY_TYPE("FIXED"),
+                .DELAY_VALUE(DQS_INITIAL_IDELAY_TAP),
+                .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
+                .REFCLK_FREQUENCY(300.0), .SIM_DEVICE("ULTRASCALE_PLUS"),
+                .UPDATE_MODE("ASYNC")
+            ) idelay_dqs (
+                .IDATAIN(ibuf_dqs_out), .DATAOUT(idelay_dqs_out),
+                .CLK(i_controller_clk), .RST(sync_rst),
+                .CE(1'b0), .INC(1'b0), .LOAD(1'b0),
+                .CNTVALUEIN(9'b0), .CNTVALUEOUT(),
+                .DATAIN(1'b0), .EN_VTC(en_vtc), .CASC_IN(1'b0),
+                .CASC_RETURN(1'b0), .CASC_OUT()
+            );
+
+            // DQS ISERDESE3 — used during training only (gate + WL feedback)
+            wire [7:0] iserdes_dqs_q_unused;
+            ISERDESE3 #(
+                .DATA_WIDTH(8), .FIFO_ENABLE("FALSE"),
+                .FIFO_SYNC_MODE("FALSE"),
+                .IS_CLK_B_INVERTED(1'b1), .IS_CLK_INVERTED(1'b0),
+                .IS_RST_INVERTED(1'b0), .SIM_DEVICE("ULTRASCALE_PLUS")
+            ) iserdes_dqs (
+                .CLK(i_ddr4_clk), .CLK_B(i_ddr4_clk),
+                .CLKDIV(i_controller_clk),
+                .D(idelay_dqs_out), .Q(iserdes_dqs_q_unused),
+                .RST(sync_rst),
+                .FIFO_RD_CLK(1'b0), .FIFO_RD_EN(1'b0), .FIFO_EMPTY()
+            );
+        end
+    endgenerate
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §10 — DM_n Mask Path (per byte lane, x8/x16 only) — SPEC §5.2
+    // dfi_wrdata_mask (active-HIGH) inverted → DM_n (active-LOW)
+    // x4 devices: DM_ENABLED=0, stub DM_n=1
+    // ═══════════════════════════════════════════════════════════════════
+    generate
+        if (DM_ENABLED) begin : gen_dm
+            genvar dm_lane;
+            for (dm_lane = 0; dm_lane < BYTE_LANES; dm_lane = dm_lane + 1) begin : gen_dm_lane
+                // DFI mask → DM_n OSERDESE3 D mapping (inverted, SPEC §5.2)
+                wire [7:0] dm_d = {
+                    ~i_dfi_wrdata_mask[3*MASK_PHASE_W + BYTE_LANES + dm_lane],
+                    ~i_dfi_wrdata_mask[3*MASK_PHASE_W + dm_lane],
+                    ~i_dfi_wrdata_mask[2*MASK_PHASE_W + BYTE_LANES + dm_lane],
+                    ~i_dfi_wrdata_mask[2*MASK_PHASE_W + dm_lane],
+                    ~i_dfi_wrdata_mask[1*MASK_PHASE_W + BYTE_LANES + dm_lane],
+                    ~i_dfi_wrdata_mask[1*MASK_PHASE_W + dm_lane],
+                    ~i_dfi_wrdata_mask[0*MASK_PHASE_W + BYTE_LANES + dm_lane],
+                    ~i_dfi_wrdata_mask[0*MASK_PHASE_W + dm_lane]
+                };
+
+                wire oserdes_dm_out;
+                OSERDESE3 #(
+                    .DATA_WIDTH(8), .INIT(1'b1),
+                    .IS_CLKDIV_INVERTED(1'b0), .IS_CLK_INVERTED(1'b0),
+                    .IS_RST_INVERTED(1'b0), .SIM_DEVICE("ULTRASCALE_PLUS")
+                ) oserdes_dm (
+                    .D(dm_d), .OQ(oserdes_dm_out), .T_OUT(),
+                    .CLK(i_ddr4_clk), .CLKDIV(i_controller_clk),
+                    .RST(sync_rst), .T(dq_tristate)
+                );
+
+                wire odelay_dm_out;
+                (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
+                ODELAYE3 #(
+                    .CASCADE("NONE"), .DELAY_FORMAT("COUNT"),
+                    .DELAY_TYPE("FIXED"), .DELAY_VALUE(DATA_INITIAL_ODELAY_TAP),
+                    .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
+                    .REFCLK_FREQUENCY(300.0), .SIM_DEVICE("ULTRASCALE_PLUS"),
+                    .UPDATE_MODE("ASYNC")
+                ) odelay_dm (
+                    .ODATAIN(oserdes_dm_out), .DATAOUT(odelay_dm_out),
+                    .CLK(i_controller_clk), .RST(sync_rst),
+                    .CE(1'b0), .INC(1'b0), .LOAD(1'b0),
+                    .CNTVALUEIN(9'b0), .CNTVALUEOUT(), .EN_VTC(en_vtc),
+                    .CASC_IN(1'b0), .CASC_RETURN(1'b0), .CASC_OUT()
+                );
+
+                OBUF dm_obuf (.I(odelay_dm_out), .O(o_ddr4_dm_n[dm_lane]));
+            end
+        end else begin : gen_dm_stub
+            assign o_ddr4_dm_n = {BYTE_LANES{1'b1}};
+        end
+    endgenerate
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §11 — Fabric Bitslip Barrel Shifter (SPEC §8.7)
+    // ISERDESE3 has no BITSLIP pin; alignment done in fabric using a
+    // {prev, cur} 16-bit window per DQ bit, indexed by per-lane count.
+    // Phase 6: bitslip_count=0 (no calibration). Phase 7 sets it.
+    // ═══════════════════════════════════════════════════════════════════
+    reg [7:0]  prev_iserdes_q [TOTAL_DQ-1:0];
+    reg [2:0]  bitslip_count_q [BYTE_LANES-1:0];
+    wire [7:0] aligned_dq [TOTAL_DQ-1:0];
+
+    generate
+        genvar bs_lane, bs_bit;
+        for (bs_lane = 0; bs_lane < BYTE_LANES; bs_lane = bs_lane + 1) begin : gen_bs_lane
+            for (bs_bit = 0; bs_bit < DQ_BITS; bs_bit = bs_bit + 1) begin : gen_bs_bit
+                localparam integer BS_IDX = bs_lane * DQ_BITS + bs_bit;
+                wire [15:0] iserdes_window = {iserdes_dq_q[BS_IDX], prev_iserdes_q[BS_IDX]};
+                assign aligned_dq[BS_IDX] = iserdes_window[bitslip_count_q[bs_lane] +: 8];
+            end
+        end
+    endgenerate
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §11b — DFI Read Data Packing + rddata_valid (SPEC §8.5)
+    // Pack aligned ISERDESE3 outputs into flat o_dfi_rddata vector.
+    // rddata_valid follows rddata_en with 1-cycle capture latency.
+    // ═══════════════════════════════════════════════════════════════════
+    integer dfi_pack_lane, dfi_pack_bit, dfi_pack_phase, dfi_pack_idx;
+
+    always @(posedge i_controller_clk) begin
+        if (!i_rst_n) begin
+            o_dfi_rddata       <= {(4*DFI_DATA_WIDTH){1'b0}};
+            o_dfi_rddata_valid <= 4'b0;
+            o_dfi_rdlvl_resp   <= {BYTE_LANES{1'b0}};
+            o_dfi_wrlvl_resp   <= {BYTE_LANES{1'b0}};
+            for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
+                prev_iserdes_q[dfi_pack_idx] <= 8'b0;
+            for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1)
+                bitslip_count_q[dfi_pack_idx] <= INITIAL_BITSLIP[2:0];
+        end else begin
+            // Update previous ISERDESE3 outputs for bitslip window
+            for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
+                prev_iserdes_q[dfi_pack_idx] <= iserdes_dq_q[dfi_pack_idx];
+
+            // Pack aligned read data into DFI format (SPEC §8.5)
+            // Gated by rddata_en: capture once, hold until next read.
+            // Without gating, the next cycle overwrites valid data with X
+            // (ISERDESE3 Q reverts to X once the DRAM stops driving DQ).
+            // Q[0]=beat0(p0 rise), Q[1]=beat1(p0 fall), ..., Q[7]=beat7(p3 fall)
+            if (|i_dfi_rddata_en) begin
+                for (dfi_pack_lane = 0; dfi_pack_lane < BYTE_LANES; dfi_pack_lane = dfi_pack_lane + 1) begin
+                    for (dfi_pack_bit = 0; dfi_pack_bit < DQ_BITS; dfi_pack_bit = dfi_pack_bit + 1) begin
+                        dfi_pack_idx = dfi_pack_lane * DQ_BITS + dfi_pack_bit;
+                        for (dfi_pack_phase = 0; dfi_pack_phase < 4; dfi_pack_phase = dfi_pack_phase + 1) begin
+                            o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
+                                <= aligned_dq[dfi_pack_idx][2*dfi_pack_phase];
+                            o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + BEAT_WIDTH + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
+                                <= aligned_dq[dfi_pack_idx][2*dfi_pack_phase + 1];
+                        end
+                    end
+                end
+            end
+
+            // rddata_valid: assert 1 cycle after rddata_en
+            o_dfi_rddata_valid <= i_dfi_rddata_en;
+        end
+    end
+
+    // ═══════════════════════════════════════════════════════════════════
     // §14 — IDELAYCTRL
     // Required for IDELAYE3/ODELAYE3 in TIME mode (UG571).
     // Reset released after SERDES primitives per UG571 §7.6.
@@ -391,20 +751,5 @@ module ddr4_phy #(
         .RST(idelayctrl_rst),
         .RDY(idelayctrl_rdy_w)
     );
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Stub: reg output defaults (Phase 6+ fills in data path)
-    // ═══════════════════════════════════════════════════════════════════
-    always @(posedge i_controller_clk) begin
-        if (!i_rst_n) begin
-            o_dfi_rddata       <= {(4*DFI_DATA_WIDTH){1'b0}};
-            o_dfi_rddata_valid <= 4'b0;
-            o_dfi_rdlvl_resp   <= {BYTE_LANES{1'b0}};
-            o_dfi_wrlvl_resp   <= {BYTE_LANES{1'b0}};
-        end else begin
-            // Phase 6: DQ/DQS data path
-            // Phase 7: Training FSM
-        end
-    end
 
 endmodule

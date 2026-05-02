@@ -28,8 +28,15 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-`default_nettype none
 `timescale 1ps / 1ps
+
+`ifdef XILINX_SIMULATOR
+module short(in1, in1);
+inout wire in1;
+endmodule
+`endif
+
+`default_nettype none
 
 module ddr4_sim_top;
 
@@ -56,7 +63,7 @@ module ddr4_sim_top;
     // Clock Generation
     // ddr4_clk   : 834 ps period (toggle every 417 ps)
     // controller : ddr4_clk / 4 = 3336 ps period (phase-aligned)
-    // ref_clk    : 200 MHz = 5000 ps period
+    // ref_clk    : 300 MHz = 3334 ps period (UltraScale+ IDELAYE3/ODELAYE3 min)
     // ═══════════════════════════════════════════════════════════════════
     reg ddr4_clk;
     initial ddr4_clk = 1'b0;
@@ -69,7 +76,7 @@ module ddr4_sim_top;
 
     reg ref_clk;
     initial ref_clk = 1'b0;
-    always #2500 ref_clk = ~ref_clk;
+    always #1667 ref_clk = ~ref_clk;
 
     // ═══════════════════════════════════════════════════════════════════
     // Reset — held low for 100 ns, released on controller_clk posedge
@@ -105,6 +112,8 @@ module ddr4_sim_top;
     reg [WB_DATA_BITS-1:0]   wb_data;
     reg [WB_SEL_BITS-1:0]    wb_sel;
     wire                     wb_stall;
+    wire                     wb_ack;
+    wire [WB_DATA_BITS-1:0]  wb_rdata;
     reg                      bist_start;
 
     initial begin
@@ -154,8 +163,8 @@ module ddr4_sim_top;
         .i_wb_data         (wb_data),
         .i_wb_sel          (wb_sel),
         .o_wb_stall        (wb_stall),
-        .o_wb_ack          (),
-        .o_wb_data         (),
+        .o_wb_ack          (wb_ack),
+        .o_wb_data         (wb_rdata),
         .o_ddr4_ck_p       (ddr4_ck_p),
         .o_ddr4_ck_n       (ddr4_ck_n),
         .o_ddr4_reset_n    (ddr4_reset_n),
@@ -181,26 +190,111 @@ module ddr4_sim_top;
     );
 
     // ═══════════════════════════════════════════════════════════════════
-    // Micron DDR4 Model Wrapper (2× x8 devices, one per byte lane)
+    // Micron DDR4 x8 Models — direct instantiation (no wrapper module)
+    //
+    // Bidirectional DQ/DQS/DM wiring uses the `short` module for xsim
+    // (Xilinx's own workaround — see MIG sim_tb_top.sv) and `tran`
+    // gate primitives for all other simulators.
     // ═══════════════════════════════════════════════════════════════════
-    ddr4_model_wrapper #(
-        .DQ_BITS    (DQ_BITS),
-        .BYTE_LANES (BYTE_LANES)
-    ) u_ddr4_mem (
-        .i_ddr4_ck_p    (ddr4_ck_p),
-        .i_ddr4_ck_n    (ddr4_ck_n),
-        .i_ddr4_reset_n (ddr4_reset_n),
-        .i_ddr4_cke     (ddr4_cke),
-        .i_ddr4_cs_n    (ddr4_cs_n),
-        .i_ddr4_act_n   (ddr4_act_n),
-        .i_ddr4_addr    (ddr4_addr),
-        .i_ddr4_ba      (ddr4_ba),
-        .i_ddr4_bg      (ddr4_bg),
-        .i_ddr4_odt     (ddr4_odt),
-        .io_ddr4_dq     (ddr4_dq),
-        .io_ddr4_dqs_p  (ddr4_dqs_p),
-        .io_ddr4_dqs_n  (ddr4_dqs_n),
-        .io_ddr4_dm_n   (ddr4_dm_n)
+    import arch_package::*;
+
+    DDR4_if #(.CONFIGURED_DQ_BITS(DQ_BITS)) iDDR4_0();
+    DDR4_if #(.CONFIGURED_DQ_BITS(DQ_BITS)) iDDR4_1();
+
+    // Command/address fan-out (shared across both devices)
+    assign iDDR4_0.CK        = {ddr4_ck_p, ddr4_ck_n};
+    assign iDDR4_0.RESET_n   = ddr4_reset_n;
+    assign iDDR4_0.CKE       = ddr4_cke;
+    assign iDDR4_0.CS_n      = ddr4_cs_n;
+    assign iDDR4_0.ACT_n     = ddr4_act_n;
+    assign iDDR4_0.RAS_n_A16 = ddr4_addr[16];
+    assign iDDR4_0.CAS_n_A15 = ddr4_addr[15];
+    assign iDDR4_0.WE_n_A14  = ddr4_addr[14];
+    assign iDDR4_0.ADDR      = ddr4_addr[13:0];
+    assign iDDR4_0.BA        = ddr4_ba;
+    assign iDDR4_0.BG        = ddr4_bg;
+    assign iDDR4_0.ODT       = ddr4_odt;
+    assign iDDR4_0.ADDR_17   = 1'b0;
+    assign iDDR4_0.C         = '0;
+    assign iDDR4_0.TEN       = 1'b0;
+    assign iDDR4_0.PARITY    = 1'b0;
+    assign iDDR4_0.ZQ        = 1'b1;
+    assign iDDR4_0.PWR       = 1'b1;
+    assign iDDR4_0.VREF_CA   = 1'b1;
+    assign iDDR4_0.VREF_DQ   = 1'b1;
+
+    assign iDDR4_1.CK        = {ddr4_ck_p, ddr4_ck_n};
+    assign iDDR4_1.RESET_n   = ddr4_reset_n;
+    assign iDDR4_1.CKE       = ddr4_cke;
+    assign iDDR4_1.CS_n      = ddr4_cs_n;
+    assign iDDR4_1.ACT_n     = ddr4_act_n;
+    assign iDDR4_1.RAS_n_A16 = ddr4_addr[16];
+    assign iDDR4_1.CAS_n_A15 = ddr4_addr[15];
+    assign iDDR4_1.WE_n_A14  = ddr4_addr[14];
+    assign iDDR4_1.ADDR      = ddr4_addr[13:0];
+    assign iDDR4_1.BA        = ddr4_ba;
+    assign iDDR4_1.BG        = ddr4_bg;
+    assign iDDR4_1.ODT       = ddr4_odt;
+    assign iDDR4_1.ADDR_17   = 1'b0;
+    assign iDDR4_1.C         = '0;
+    assign iDDR4_1.TEN       = 1'b0;
+    assign iDDR4_1.PARITY    = 1'b0;
+    assign iDDR4_1.ZQ        = 1'b1;
+    assign iDDR4_1.PWR       = 1'b1;
+    assign iDDR4_1.VREF_CA   = 1'b1;
+    assign iDDR4_1.VREF_DQ   = 1'b1;
+
+    // Bidirectional DQ wiring — short (xsim) / tran (others)
+    genvar gi;
+    generate
+        for (gi = 0; gi < DQ_BITS; gi = gi + 1) begin : bidi_dq
+            `ifdef XILINX_SIMULATOR
+            short bidiDQ0(iDDR4_0.DQ[gi], ddr4_dq[gi]);
+            short bidiDQ1(iDDR4_1.DQ[gi], ddr4_dq[DQ_BITS + gi]);
+            `else
+            tran  bidiDQ0(iDDR4_0.DQ[gi], ddr4_dq[gi]);
+            tran  bidiDQ1(iDDR4_1.DQ[gi], ddr4_dq[DQ_BITS + gi]);
+            `endif
+        end
+    endgenerate
+
+    // Bidirectional DQS/DM wiring
+    `ifdef XILINX_SIMULATOR
+    short bidiDQS_t0(iDDR4_0.DQS_t, ddr4_dqs_p[0]);
+    short bidiDQS_c0(iDDR4_0.DQS_c, ddr4_dqs_n[0]);
+    short bidiDM0   (iDDR4_0.DM_n,   ddr4_dm_n[0]);
+    short bidiDQS_t1(iDDR4_1.DQS_t, ddr4_dqs_p[1]);
+    short bidiDQS_c1(iDDR4_1.DQS_c, ddr4_dqs_n[1]);
+    short bidiDM1   (iDDR4_1.DM_n,   ddr4_dm_n[1]);
+    `else
+    tran  bidiDQS_t0(iDDR4_0.DQS_t, ddr4_dqs_p[0]);
+    tran  bidiDQS_c0(iDDR4_0.DQS_c, ddr4_dqs_n[0]);
+    tran  bidiDM0   (iDDR4_0.DM_n,   ddr4_dm_n[0]);
+    tran  bidiDQS_t1(iDDR4_1.DQS_t, ddr4_dqs_p[1]);
+    tran  bidiDQS_c1(iDDR4_1.DQS_c, ddr4_dqs_n[1]);
+    tran  bidiDM1   (iDDR4_1.DM_n,   ddr4_dm_n[1]);
+    `endif
+
+    // Micron DDR4 x8 model instances
+    wire model_en;
+    assign model_en = 1'b1;
+
+    ddr4_model #(
+        .CONFIGURED_DQ_BITS (DQ_BITS),
+        .CONFIGURED_DENSITY (_8G),
+        .CONFIGURED_RANKS   (1)
+    ) u_ddr4_0 (
+        .model_enable (model_en),
+        .iDDR4        (iDDR4_0)
+    );
+
+    ddr4_model #(
+        .CONFIGURED_DQ_BITS (DQ_BITS),
+        .CONFIGURED_DENSITY (_8G),
+        .CONFIGURED_RANKS   (1)
+    ) u_ddr4_1 (
+        .model_enable (model_en),
+        .iDDR4        (iDDR4_1)
     );
 
     // ═══════════════════════════════════════════════════════════════════
@@ -296,11 +390,11 @@ module ddr4_sim_top;
     // Micron-side command decode — reads the DDR4_if interface signals that
     // feed directly into the encrypted Micron model. Proves what the model
     // actually receives after the PHY's OSERDESE3 → OBUF chain.
-    wire micron_cs_n  = u_ddr4_mem.iDDR4_0.CS_n;
-    wire micron_act_n = u_ddr4_mem.iDDR4_0.ACT_n;
-    wire micron_ras   = u_ddr4_mem.iDDR4_0.RAS_n_A16;
-    wire micron_cas   = u_ddr4_mem.iDDR4_0.CAS_n_A15;
-    wire micron_we    = u_ddr4_mem.iDDR4_0.WE_n_A14;
+    wire micron_cs_n  = iDDR4_0.CS_n;
+    wire micron_act_n = iDDR4_0.ACT_n;
+    wire micron_ras   = iDDR4_0.RAS_n_A16;
+    wire micron_cas   = iDDR4_0.CAS_n_A15;
+    wire micron_we    = iDDR4_0.WE_n_A14;
 
     always @* begin
         if (micron_cs_n)
@@ -369,10 +463,19 @@ module ddr4_sim_top;
                                     ROW1_BG2 = (1 << 10) | 2,
                                     ROW1_BG3 = (1 << 10) | 3,
                                     ROW0_BG0_BA1 = (1 << 8) | 0,
-                                    ROW0_BG0_BA2 = (2 << 8) | 0;
+                                    ROW0_BG0_BA2 = (2 << 8) | 0,
+                                    ROW2_BG0 = (2 << 10) | 0,
+                                    ROW2_BG1 = (2 << 10) | 1,
+                                    ROW2_BG2 = (2 << 10) | 2,
+                                    ROW2_BG3 = (2 << 10) | 3,
+                                    ROW2_BG0_C1 = (2 << 10) | (1 << 2) | 0,
+                                    ROW2_BG1_C1 = (2 << 10) | (1 << 2) | 1;
 
     task wb_write_one(input [EXT_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data);
         begin
+            wb_stb = 1'b0;
+            @(posedge controller_clk);
+            while (wb_stall) @(posedge controller_clk);
             wb_cyc  = 1'b1;
             wb_stb  = 1'b1;
             wb_we   = 1'b1;
@@ -380,19 +483,20 @@ module ddr4_sim_top;
             wb_data = data;
             wb_sel  = {WB_SEL_BITS{1'b1}};
             @(posedge controller_clk);
-            while (wb_stall) @(posedge controller_clk);
         end
     endtask
 
     task wb_read_one(input [EXT_ADDR_BITS-1:0] addr);
         begin
+            wb_stb = 1'b0;
+            @(posedge controller_clk);
+            while (wb_stall) @(posedge controller_clk);
             wb_cyc  = 1'b1;
             wb_stb  = 1'b1;
             wb_we   = 1'b0;
             wb_addr = addr;
             wb_sel  = {WB_SEL_BITS{1'b1}};
             @(posedge controller_clk);
-            while (wb_stall) @(posedge controller_clk);
         end
     endtask
 
@@ -406,8 +510,36 @@ module ddr4_sim_top;
 
     task drain_pipeline;
         begin
+            @(posedge controller_clk);
             wb_idle;
-            repeat (40) @(posedge controller_clk);
+            repeat (39) @(posedge controller_clk);
+        end
+    endtask
+
+    integer rd_err_count;
+    initial rd_err_count = 0;
+
+    task wb_write_read_check(
+        input [EXT_ADDR_BITS-1:0] addr,
+        input [WB_DATA_BITS-1:0]  wdata
+    );
+        reg [WB_DATA_BITS-1:0] captured;
+        begin
+            wb_write_one(addr, wdata);
+            drain_pipeline;
+            wb_read_one(addr);
+            wb_stb = 1'b0;
+            while (!wb_ack) @(posedge controller_clk);
+            captured = wb_rdata;
+            wb_idle;
+            repeat (5) @(posedge controller_clk);
+            if (captured === wdata) begin
+                $display("[%0t]   PASS: addr=0x%0h data=0x%0h", $realtime, addr, captured);
+            end else begin
+                $display("[%0t]   FAIL: addr=0x%0h expected=0x%0h got=0x%0h",
+                         $realtime, addr, wdata, captured);
+                rd_err_count = rd_err_count + 1;
+            end
         end
     endtask
 
@@ -535,6 +667,25 @@ module ddr4_sim_top;
         $display("[%0t]   read BG0/BA0/row0 (diff BG → tWTR_S applies to BG1)", $realtime);
         drain_pipeline;
 
+        // ── Phase I: Write→Read data round-trip verification ──
+        test_phase = "PHASE_I";
+        $display("[%0t] ═══ Phase I: Write→Read round-trip verification ═══", $realtime);
+        wb_write_read_check(ROW2_BG0,    128'hDEAD_BEEF_CAFE_BABE_0123_4567_89AB_CDEF);
+        wb_write_read_check(ROW2_BG1,    128'hFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF);
+        wb_write_read_check(ROW2_BG2,    128'h0000_0000_0000_0000_0000_0000_0000_0000);
+        wb_write_read_check(ROW2_BG3,    128'hA5A5_A5A5_5A5A_5A5A_A5A5_A5A5_5A5A_5A5A);
+        wb_write_read_check(ROW2_BG0_C1, 128'h0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF);
+        wb_write_read_check(ROW2_BG1_C1, 128'hFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000);
+        wb_write_read_check(ROW2_BG0,    128'h1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210);
+        wb_write_read_check(ROW2_BG1,    128'h0F0F_0F0F_F0F0_F0F0_0F0F_0F0F_F0F0_F0F0);
+        wb_write_read_check(ROW2_BG2,    128'h0000_0000_0000_0001_8000_0000_0000_0000);
+        wb_write_read_check(ROW2_BG3,    128'hAAAA_AAAA_5555_5555_AAAA_AAAA_5555_5555);
+
+        if (rd_err_count == 0)
+            $display("[%0t] PASS: All 10 write→read checks passed", $realtime);
+        else
+            $display("[%0t] FAIL: %0d of 10 write→read checks failed", $realtime, rd_err_count);
+
         test_phase = "DONE";
         $display("[%0t] ═══ All test phases complete ═══", $realtime);
         all_tests_done = 1'b1;
@@ -580,10 +731,11 @@ module ddr4_sim_top;
                 end
                 if (mon_is_rd[mon_ph]) begin
                     rd_count = rd_count + 1;
-                    $display("[%0t] [%0s] DDR4 RD  #%0d: BG=%0d BA=%0d (slot %0d)",
+                    $display("[%0t] [%0s] DDR4 RD  #%0d: BG=%0d BA=%0d (slot %0d) stage2_we=%0b",
                              $realtime, test_phase, rd_count,
                              mon_bg[mon_ph*BG_BITS +: BG_BITS],
-                             mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph);
+                             mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph,
+                             u_dut.u_controller.stage2_we);
                 end
                 if (mon_is_pre[mon_ph]) begin
                     pre_count = pre_count + 1;
@@ -629,10 +781,14 @@ module ddr4_sim_top;
         repeat (10) @(posedge controller_clk);
         $display("");
         $display("[%0t] ═══════════════════════════════════════════════", $realtime);
-        $display("[%0t] SUMMARY: ACT=%0d  WR=%0d  RD=%0d  PRE=%0d  REF=%0d",
-                 $realtime, act_count, wr_count, rd_count, pre_count, ref_count);
-        $display("[%0t] PASS: All 8 test phases + %0d refresh cycles, zero violations",
-                 $realtime, ref_count);
+        $display("[%0t] SUMMARY: ACT=%0d  WR=%0d  RD=%0d  PRE=%0d  REF=%0d  RD_ERR=%0d",
+                 $realtime, act_count, wr_count, rd_count, pre_count, ref_count, rd_err_count);
+        if (rd_err_count == 0)
+            $display("[%0t] PASS: All 9 test phases + %0d refresh cycles, zero violations",
+                     $realtime, ref_count);
+        else
+            $display("[%0t] FAIL: %0d read data mismatches detected",
+                     $realtime, rd_err_count);
         $display("[%0t] Simulation finished successfully", $realtime);
         $display("[%0t] ═══════════════════════════════════════════════", $realtime);
         $finish;

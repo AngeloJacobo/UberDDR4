@@ -27,6 +27,12 @@
 //  18. f_outstanding induction invariant (links fwb_slave to pipeline)
 //  19. Bounded stall / ACK latency (deferred — exceeds depth 8)
 //
+// Properties added in Phase 6 audit:
+//  20. Command encoding — RAS_n / CAS_n / WE_n correctness (WR/RD/PRE)
+//  21. Column address integrity in cmd_d (WR/RD)
+//  22. Cover properties — reachability (write/read ACK, all scheduler
+//      actions, anticipation co-fire, dual-slot, multi-read pipeline)
+//
 // Timing properties coverage:
 //  All JEDEC timing (tRCD, tRP, tRAS, tRC, tCCD_L/S, tRRD_L/S,
 //  tWTR_L/S, tWR, tRTP, tFAW) proven by decomposition:
@@ -544,3 +550,88 @@ end
 //   - Prop 10: counter gating (commands blocked only by valid delays)
 // F_MAX_ACK_DELAY requires TPHY_RDLAT (Phase 6). Deferred.
 // ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+// 20. Command Encoding — RAS_n / CAS_n / WE_n correctness
+// Complements property 9 (ACT_n only). Verifies the full 3-bit
+// command opcode in cmd_d matches JEDEC JESD79-4D Table 35 for
+// each scheduler action.
+// ═══════════════════════════════════════════════════════════════════
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
+        if ($past(sched_write)) begin
+            assert(cmd_d[WRITE_SLOT][CMD_RAS_N] == 1'b1);
+            assert(cmd_d[WRITE_SLOT][CMD_CAS_N] == 1'b0);
+            assert(cmd_d[WRITE_SLOT][CMD_WE_N]  == 1'b0);
+        end
+        if ($past(sched_read)) begin
+            assert(cmd_d[READ_SLOT][CMD_RAS_N] == 1'b1);
+            assert(cmd_d[READ_SLOT][CMD_CAS_N] == 1'b0);
+            assert(cmd_d[READ_SLOT][CMD_WE_N]  == 1'b1);
+        end
+        if ($past(sched_precharge)) begin
+            assert(cmd_d[PRECHARGE_SLOT][CMD_RAS_N] == 1'b0);
+            assert(cmd_d[PRECHARGE_SLOT][CMD_CAS_N] == 1'b1);
+            assert(cmd_d[PRECHARGE_SLOT][CMD_WE_N]  == 1'b0);
+        end
+    end
+end
+
+// ═══════════════════════════════════════════════════════════════════
+// 21. Column Address in cmd_d — WR/RD column field integrity
+// Verifies the address bits in cmd_d match stage2_col at the time
+// the scheduler fires. A10=0 (no auto-precharge). A11 carries
+// col[10] only when COL_BITS > 10 (x4 devices).
+// ═══════════════════════════════════════════════════════════════════
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
+        if ($past(sched_write)) begin
+            assert(cmd_d[WRITE_SLOT][9:0] == $past(stage2_col[9:0]));
+            assert(cmd_d[WRITE_SLOT][10]  == 1'b0);
+        end
+        if ($past(sched_read)) begin
+            assert(cmd_d[READ_SLOT][9:0] == $past(stage2_col[9:0]));
+            assert(cmd_d[READ_SLOT][10]  == 1'b0);
+        end
+    end
+end
+
+// ═══════════════════════════════════════════════════════════════════
+// 22. Cover Properties — reachability confirmation
+// Proves the design can reach interesting operating states. Without
+// these, an over-constrained model could vacuously pass all asserts.
+// ═══════════════════════════════════════════════════════════════════
+
+// Basic reachability: pipeline produces ACKs
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && reset_done) begin
+        cover(write_ack_q);
+        cover(read_ack_q);
+    end
+end
+
+// Scheduler actions reachable
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && reset_done) begin
+        cover(sched_write);
+        cover(sched_read);
+        cover(sched_precharge);
+        cover(sched_activate);
+        cover(sched_anticipate);
+    end
+end
+
+// Dual-slot: bank management co-fires with data command
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && reset_done) begin
+        cover(sched_anticipate && sched_write);
+        cover(sched_anticipate && sched_read);
+        cover($countones(f_active_slots) == 2);
+    end
+end
+
+// Pipeline depth: multiple in-flight reads
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && reset_done)
+        cover($countones(rddata_en_pipe_q) >= 2);
+end

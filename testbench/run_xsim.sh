@@ -74,7 +74,6 @@ step "Compiling simulation sources"
   UberDDR4/testbench/micron/StateTableCore.sv \
   UberDDR4/testbench/micron/MemoryArray.sv \
   UberDDR4/testbench/micron/ddr4_model.sv \
-  UberDDR4/testbench/ddr4_model_wrapper.sv \
   UberDDR4/testbench/ddr4_sim_top.sv
 
 step "Compiling Xilinx glbl"
@@ -89,12 +88,15 @@ step "Running simulation"
 SIM_OUTPUT=$(cat sim_result.log)
 
 echo ""
-if echo "$SIM_OUTPUT" | grep -q "PASS:"; then
-    pass "Simulation PASSED"
-elif echo "$SIM_OUTPUT" | grep -q "TIMEOUT:"; then
+if echo "$SIM_OUTPUT" | grep -q "TIMEOUT:"; then
     fail "Simulation TIMED OUT"
     exit 1
+elif echo "$SIM_OUTPUT" | grep -q "FAIL:"; then
+    fail "Simulation FAILED (data mismatch)"
+    exit 1
+elif echo "$SIM_OUTPUT" | grep -q "PASS:"; then
+    pass "Simulation PASSED"
 else
-    fail "Simulation FAILED"
+    fail "Simulation FAILED (no PASS marker found)"
     exit 1
 fi
