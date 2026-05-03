@@ -138,7 +138,7 @@ module ddr4_sim_top;
 
     // ═══════════════════════════════════════════════════════════════════
     // DUT — ddr4_top with MICRON_SIM=1 (shortened init delays)
-    // and SKIP_CALIB=1 (no PHY training in Phase 3)
+    // SKIP_CALIB=0: full PHY calibration (gate → eye → write leveling)
     // ═══════════════════════════════════════════════════════════════════
     ddr4_top #(
         .CONTROLLER_CLK_PERIOD (CTRL_CLK_PERIOD),
@@ -151,7 +151,7 @@ module ddr4_sim_top;
         .BYTE_LANES            (BYTE_LANES),
         .DENSITY               (8),
         .MICRON_SIM            (1),
-        .SKIP_CALIB            (1),
+        .SKIP_CALIB            (0),
         .ADDR_MAPPING          (1)
     ) u_dut (
         .i_controller_clk (controller_clk),
@@ -448,6 +448,45 @@ module ddr4_sim_top;
         end
     end
 
+    // PHY training progress monitor — tracks gate, eye, and WL phases
+    reg [3:0] prev_phy_state;
+    initial prev_phy_state = 4'd0;
+
+    always @(posedge controller_clk) begin
+        if (rst_n) begin
+            prev_phy_state <= u_dut.u_phy.phy_state;
+
+            // Gate training
+            if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd1)
+                $display("[%0t] PHY gate training started", $realtime);
+            if (u_dut.u_phy.phy_state == 4'd3 && prev_phy_state != 4'd3)
+                $display("[%0t] PHY gate training done (lane0 bs=%0d, lane1 bs=%0d)",
+                    $realtime,
+                    u_dut.u_phy.bitslip_count_q[0],
+                    u_dut.u_phy.bitslip_count_q[1]);
+
+            // Eye training
+            if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd4)
+                $display("[%0t] PHY eye training started", $realtime);
+            if (u_dut.u_phy.phy_state == 4'd7 && prev_phy_state != 4'd7)
+                $display("[%0t] PHY eye training done (lane0 tap=%0d [%0d-%0d], lane1 tap=%0d [%0d-%0d])",
+                    $realtime,
+                    (u_dut.u_phy.first_pass_tap[0] + u_dut.u_phy.last_pass_tap[0]) >> 1,
+                    u_dut.u_phy.first_pass_tap[0], u_dut.u_phy.last_pass_tap[0],
+                    (u_dut.u_phy.first_pass_tap[1] + u_dut.u_phy.last_pass_tap[1]) >> 1,
+                    u_dut.u_phy.first_pass_tap[1], u_dut.u_phy.last_pass_tap[1]);
+
+            // Write leveling
+            if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd8)
+                $display("[%0t] PHY write leveling started", $realtime);
+            if (u_dut.u_phy.phy_state == 4'd11 && prev_phy_state != 4'd11)
+                $display("[%0t] PHY write leveling done (lane0 dqs_tap=%0d, lane1 dqs_tap=%0d)",
+                    $realtime,
+                    u_dut.u_phy.wl_tap[0],
+                    u_dut.u_phy.wl_tap[1]);
+        end
+    end
+
     // ═══════════════════════════════════════════════════════════════════
     // WB Write Stimulus — Multi-phase test covering all scheduler paths
     //
@@ -565,7 +604,7 @@ module ddr4_sim_top;
     initial wb_write_count = 0;
 
     initial begin
-        wait (reset_done_seen);
+        wait (calib_complete_seen);
         @(posedge controller_clk);
         while (wb_stall) @(posedge controller_clk);
 

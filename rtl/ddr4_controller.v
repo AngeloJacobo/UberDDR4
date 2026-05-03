@@ -1361,6 +1361,10 @@ module ddr4_controller #(
                     CALIB_ERROR: begin
                         o_calib_error <= 1'b1;
                     end
+
+                    default: begin
+                        calib_state <= CALIB_ERROR;
+                    end
                 endcase
             end
 

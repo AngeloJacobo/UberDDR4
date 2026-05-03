@@ -635,7 +635,9 @@ module ddr4_phy #(
             );
 
             wire ibuf_dqs_out;
-            IOBUFDS dqs_iobufds (
+            IOBUFDS #(
+                .DQS_BIAS("TRUE")
+            ) dqs_iobufds (
                 .I(odelay_dqs_out), .O(ibuf_dqs_out),
                 .IO(io_ddr4_dqs_p[dqs_lane]), .IOB(io_ddr4_dqs_n[dqs_lane]),
                 .T(dqs_tristate_wl)
@@ -805,7 +807,7 @@ module ddr4_phy #(
             odelay_dqs_cntvalue <= 9'b0;
             wl_dqs_strobe       <= 1'b0;
             wl_dqs_strobe_d1    <= 1'b0;
-            en_vtc_q            <= 1'b0;
+            en_vtc_q            <= 1'b1;
             vtc_settle_counter  <= 8'b0;
         end else begin
             // Default: deassert all LOAD pulses (single-cycle pulse)
