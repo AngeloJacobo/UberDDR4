@@ -44,6 +44,8 @@ XVLOG="$XILINX_VIVADO/bin/xvlog"
 XELAB="$XILINX_VIVADO/bin/xelab"
 XSIM="$XILINX_VIVADO/bin/xsim"
 
+EXTRA_DEFS="${EXTRA_DEFINES:-}"
+
 if [[ ! -L "$REPO_ROOT/UberDDR4/testbench/micron/ddr4_model.sv" ]]; then
     fail "Micron DDR4 model symlinks not found in UberDDR4/testbench/micron/"
     fail "Run first:  ./UberDDR4/testbench/setup_micron_model.sh"
@@ -66,6 +68,7 @@ step "Compiling RTL"
 
 step "Compiling simulation sources"
 "$XVLOG" -sv -d DDR4_8G_X8 -d FIXED_2400 -d ALLOW_JITTER -d VCD_DUMP \
+  $EXTRA_DEFS \
   -i UberDDR4/testbench/micron \
   UberDDR4/testbench/micron/arch_package.sv \
   UberDDR4/testbench/micron/proj_package.sv \
@@ -85,16 +88,15 @@ step "Elaborating"
 
 step "Running simulation"
 "$XSIM" sim_snapshot -runall 2>&1 | tee sim_result.log || true
-SIM_OUTPUT=$(cat sim_result.log)
 
 echo ""
-if echo "$SIM_OUTPUT" | grep -q "TIMEOUT:"; then
+if grep -q "TIMEOUT:" sim_result.log; then
     fail "Simulation TIMED OUT"
     exit 1
-elif echo "$SIM_OUTPUT" | grep -q "FAIL:"; then
+elif grep -q "FAIL:" sim_result.log; then
     fail "Simulation FAILED (data mismatch)"
     exit 1
-elif echo "$SIM_OUTPUT" | grep -q "PASS:"; then
+elif grep -q "PASS:" sim_result.log; then
     pass "Simulation PASSED"
 else
     fail "Simulation FAILED (no PASS marker found)"

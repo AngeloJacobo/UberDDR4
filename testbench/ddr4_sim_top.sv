@@ -60,6 +60,34 @@ module ddr4_sim_top;
     localparam EXT_ADDR_BITS  = WB_ADDR_BITS + 1;
 
     // ═══════════════════════════════════════════════════════════════════
+    // Regression-overridable parameters via +define+ (source stays untouched)
+    //
+    // FLY_BY: CK fly-by delay in ps applied to iDDR4_1 (lane 1).
+    //   Models real PCB daisy-chain routing: FPGA → chip0 → chip1.
+    //   Realistic range: 50–400ps for a 2-chip DDR4-2400 board.
+    //
+    // TB_SKIP_CALIB: 0 = full PHY training, 1 = bypass (Phase 6 mode)
+    // TB_ADDR_MAPPING: 0 = sequential, 1 = BG-interleaved (default)
+    // ═══════════════════════════════════════════════════════════════════
+`ifdef SIM_FLY_BY_DELAY
+    localparam FLY_BY = `SIM_FLY_BY_DELAY;
+`else
+    localparam FLY_BY = 0;
+`endif
+
+`ifdef SIM_SKIP_CALIB
+    localparam TB_SKIP_CALIB = `SIM_SKIP_CALIB;
+`else
+    localparam TB_SKIP_CALIB = 0;
+`endif
+
+`ifdef SIM_ADDR_MAPPING
+    localparam TB_ADDR_MAPPING = `SIM_ADDR_MAPPING;
+`else
+    localparam TB_ADDR_MAPPING = 1;
+`endif
+
+    // ═══════════════════════════════════════════════════════════════════
     // Clock Generation
     // ddr4_clk   : 834 ps period (toggle every 417 ps)
     // controller : ddr4_clk / 4 = 3336 ps period (phase-aligned)
@@ -138,7 +166,7 @@ module ddr4_sim_top;
 
     // ═══════════════════════════════════════════════════════════════════
     // DUT — ddr4_top with MICRON_SIM=1 (shortened init delays)
-    // SKIP_CALIB=0: full PHY calibration (gate → eye → write leveling)
+    // SKIP_CALIB and ADDR_MAPPING driven by regression-overridable params
     // ═══════════════════════════════════════════════════════════════════
     ddr4_top #(
         .CONTROLLER_CLK_PERIOD (CTRL_CLK_PERIOD),
@@ -151,8 +179,8 @@ module ddr4_sim_top;
         .BYTE_LANES            (BYTE_LANES),
         .DENSITY               (8),
         .MICRON_SIM            (1),
-        .SKIP_CALIB            (0),
-        .ADDR_MAPPING          (1)
+        .SKIP_CALIB            (TB_SKIP_CALIB),
+        .ADDR_MAPPING          (TB_ADDR_MAPPING)
     ) u_dut (
         .i_controller_clk (controller_clk),
         .i_ddr4_clk       (ddr4_clk),
@@ -225,18 +253,21 @@ module ddr4_sim_top;
     assign iDDR4_0.VREF_CA   = 1'b1;
     assign iDDR4_0.VREF_DQ   = 1'b1;
 
-    assign iDDR4_1.CK        = {ddr4_ck_p, ddr4_ck_n};
-    assign iDDR4_1.RESET_n   = ddr4_reset_n;
-    assign iDDR4_1.CKE       = ddr4_cke;
-    assign iDDR4_1.CS_n      = ddr4_cs_n;
-    assign iDDR4_1.ACT_n     = ddr4_act_n;
-    assign iDDR4_1.RAS_n_A16 = ddr4_addr[16];
-    assign iDDR4_1.CAS_n_A15 = ddr4_addr[15];
-    assign iDDR4_1.WE_n_A14  = ddr4_addr[14];
-    assign iDDR4_1.ADDR      = ddr4_addr[13:0];
-    assign iDDR4_1.BA        = ddr4_ba;
-    assign iDDR4_1.BG        = ddr4_bg;
-    assign iDDR4_1.ODT       = ddr4_odt;
+    // Lane 1 (far end of fly-by) — CK/CMD/ADDR delayed by FLY_BY ps.
+    // Models real PCB daisy-chain: FPGA → chip0 (near) → chip1 (far).
+    // DQ/DQS stay zero-delay (point-to-point, no fly-by).
+    assign #(FLY_BY) iDDR4_1.CK        = {ddr4_ck_p, ddr4_ck_n};
+    assign #(FLY_BY) iDDR4_1.RESET_n   = ddr4_reset_n;
+    assign #(FLY_BY) iDDR4_1.CKE       = ddr4_cke;
+    assign #(FLY_BY) iDDR4_1.CS_n      = ddr4_cs_n;
+    assign #(FLY_BY) iDDR4_1.ACT_n     = ddr4_act_n;
+    assign #(FLY_BY) iDDR4_1.RAS_n_A16 = ddr4_addr[16];
+    assign #(FLY_BY) iDDR4_1.CAS_n_A15 = ddr4_addr[15];
+    assign #(FLY_BY) iDDR4_1.WE_n_A14  = ddr4_addr[14];
+    assign #(FLY_BY) iDDR4_1.ADDR      = ddr4_addr[13:0];
+    assign #(FLY_BY) iDDR4_1.BA        = ddr4_ba;
+    assign #(FLY_BY) iDDR4_1.BG        = ddr4_bg;
+    assign #(FLY_BY) iDDR4_1.ODT       = ddr4_odt;
     assign iDDR4_1.ADDR_17   = 1'b0;
     assign iDDR4_1.C         = '0;
     assign iDDR4_1.TEN       = 1'b0;
@@ -425,6 +456,11 @@ module ddr4_sim_top;
 
     initial $timeformat(-9, 3, "ns", 0);
 
+    initial begin
+        $display("[0ns] CONFIG: FLY_BY=%0dps SKIP_CALIB=%0d ADDR_MAPPING=%0d",
+            FLY_BY, TB_SKIP_CALIB, TB_ADDR_MAPPING);
+    end
+
     always @(posedge controller_clk) begin
         if (rst_n && u_dut.u_controller.reset_done && !reset_done_seen) begin
             $display("[%0t] PASS: DDR4 init sequence complete (reset_done)", $realtime);
@@ -484,6 +520,40 @@ module ddr4_sim_top;
                     $realtime,
                     u_dut.u_phy.wl_tap[0],
                     u_dut.u_phy.wl_tap[1]);
+        end
+    end
+
+    // Calibration result validation — fires once when training completes
+    reg calib_results_checked;
+    initial calib_results_checked = 1'b0;
+
+    always @(posedge controller_clk) begin
+        if (calib_complete && !calib_results_checked && !TB_SKIP_CALIB) begin
+            calib_results_checked <= 1'b1;
+            $display("[%0t] ═══ CALIBRATION RESULTS ═══", $realtime);
+            $display("[%0t]   FLY_BY_DELAY = %0d ps", $realtime, FLY_BY);
+            $display("[%0t]   Gate: lane0 bs=%0d, lane1 bs=%0d",
+                $realtime,
+                u_dut.u_phy.bitslip_count_q[0],
+                u_dut.u_phy.bitslip_count_q[1]);
+            $display("[%0t]   Eye:  lane0 center=%0d [%0d-%0d], lane1 center=%0d [%0d-%0d]",
+                $realtime,
+                (u_dut.u_phy.first_pass_tap[0] + u_dut.u_phy.last_pass_tap[0]) >> 1,
+                u_dut.u_phy.first_pass_tap[0], u_dut.u_phy.last_pass_tap[0],
+                (u_dut.u_phy.first_pass_tap[1] + u_dut.u_phy.last_pass_tap[1]) >> 1,
+                u_dut.u_phy.first_pass_tap[1], u_dut.u_phy.last_pass_tap[1]);
+            $display("[%0t]   WL:   lane0 dqs_tap=%0d, lane1 dqs_tap=%0d",
+                $realtime,
+                u_dut.u_phy.wl_tap[0],
+                u_dut.u_phy.wl_tap[1]);
+            if (FLY_BY >= 100) begin
+                if (u_dut.u_phy.wl_tap[0] == u_dut.u_phy.wl_tap[1])
+                    $display("[%0t]   WARNING: WL taps identical despite FLY_BY=%0dps — expected asymmetry",
+                        $realtime, FLY_BY);
+                else
+                    $display("[%0t]   OK: WL taps differ (lane0=%0d, lane1=%0d) — fly-by compensation working",
+                        $realtime, u_dut.u_phy.wl_tap[0], u_dut.u_phy.wl_tap[1]);
+            end
         end
     end
 

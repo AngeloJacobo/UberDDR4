@@ -16,6 +16,7 @@ xsim.dir/
 waves.shm/
 trace.vcd
 sim_result.log
+testbench/regression_logs/
 
 # Micron DDR4 model symlinks (created by setup_micron_model.sh)
 testbench/micron/arch_package.sv
