@@ -64,6 +64,7 @@ step "Compiling RTL"
 "$XVLOG" -sv \
   UberDDR4/rtl/ddr4_controller.v \
   UberDDR4/rtl/ddr4_phy.v \
+  UberDDR4/rtl/ddr4_prober.v \
   UberDDR4/rtl/ddr4_top.v
 
 step "Compiling simulation sources"

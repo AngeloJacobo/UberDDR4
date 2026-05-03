@@ -112,7 +112,14 @@ module ddr4_controller #(
     input wire                       i_dfi_wrlvl_req,
     // Status
     output reg                       o_calib_complete,
-    output reg                       o_calib_error
+    output reg                       o_calib_error,
+    // Debug status (lightweight assigns for CSR, Phase 8)
+    output wire [3:0]                o_calib_state,
+    output wire                      o_stage1_pending,
+    output wire                      o_stage2_pending,
+    output wire                      o_stage2_we,
+    output wire                      o_refresh_idle,
+    output wire [NUM_BANKS-1:0]      o_bank_status
 );
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1837,8 +1844,18 @@ module ddr4_controller #(
         endcase
     endfunction
 
+    // ═══════════════════════════════════
+    // §19 — Debug Status Assigns (Phase 8)
+    // ═══════════════════════════════════
+    assign o_calib_state    = calib_state;
+    assign o_stage1_pending = stage1_pending;
+    assign o_stage2_pending = stage2_pending;
+    assign o_stage2_we      = stage2_we;
+    assign o_refresh_idle   = refresh_idle;
+    assign o_bank_status    = bank_status_q;
+
     // ═══════════════════════
-    // §18 — Formal Properties
+    // §20 — Formal Properties
     // ═══════════════════════
 `ifdef FORMAL
     `include "ddr4_controller_formal.vh"

@@ -52,6 +52,7 @@ module ddr4_top #(
     // Prober config (Phase 8)
     parameter[1:0] BIST_MODE = 0,
     parameter DEBUG_CSR_ENABLE = 1,
+    parameter BIST_TEST_ADDR_BITS = 8,
     // Derived (for port widths)
     parameter SERDES_RATIO = 4,
               NUM_BG = (1 << BG_BITS),
@@ -90,7 +91,9 @@ module ddr4_top #(
     output wire o_calib_complete, o_calib_error
 );
 
-    // DFI 3.1 Internal Bus
+    // ═══════════════════════════════════════════════════════════════════
+    // §1 — DFI 3.1 Internal Bus
+    // ═══════════════════════════════════════════════════════════════════
     wire [4*17-1:0]             dfi_address;
     wire [4*BA_BITS-1:0]        dfi_bank;
     wire [4*BG_BITS-1:0]        dfi_bg;
@@ -103,7 +106,6 @@ module ddr4_top #(
     wire [3:0]                  dfi_rddata_valid;
     wire [3:0]                  dfi_rddata_en;
     wire                        dfi_init_start, dfi_init_complete;
-    // DFI Training
     wire                        dfi_rdlvl_en, dfi_rdlvl_gate_en;
     wire                        dfi_wrlvl_en, dfi_wrlvl_strobe;
     wire [3:0]                  dfi_lvl_pattern;
@@ -111,18 +113,129 @@ module ddr4_top #(
     wire [BYTE_LANES-1:0]       dfi_rdlvl_resp, dfi_wrlvl_resp;
     wire                        dfi_rdlvl_req, dfi_rdlvl_gate_req, dfi_wrlvl_req;
 
-    // Phase 8 adds address MSB decode for debug CSR + BIST priority mux
-    // For now: direct passthrough
-    wire [WB_ADDR_BITS-1:0] ctrl_wb_addr = i_wb_addr[WB_ADDR_BITS-1:0];
+    // ═══════════════════════════════════════════════════════════════════
+    // §2 — Debug Status Wires (controller → prober, PHY → prober)
+    // ═══════════════════════════════════════════════════════════════════
+    wire [3:0]              ctrl_calib_state;
+    wire                    ctrl_stage1_pending;
+    wire                    ctrl_stage2_pending;
+    wire                    ctrl_stage2_we;
+    wire                    ctrl_refresh_idle;
+    wire [NUM_BANKS-1:0]    ctrl_bank_status;
+    wire                    calib_complete;
+    wire                    calib_error;
+    wire [3:0]              phy_train_state;
+    wire [9*BYTE_LANES-1:0] phy_idelay_center;
+    wire [9*BYTE_LANES-1:0] phy_wl_tap;
+    wire [3*BYTE_LANES-1:0] phy_bitslip;
 
-    // Stub BIST/prober outputs (Phase 8)
-    assign o_bist_busy = 1'b0;
-    assign o_bist_pass = 1'b0;
-    assign o_bist_fail = 1'b0;
-    assign o_bist_correct = 32'b0;
-    assign o_bist_error = 32'b0;
+    // ═══════════════════════════════════════════════════════════════════
+    // §3 — Prober (BIST + CSR) Wires
+    // ═══════════════════════════════════════════════════════════════════
+    wire                     prober_bist_busy;
+    wire                     prober_bist_pass;
+    wire                     prober_bist_fail;
+    wire [31:0]              prober_correct;
+    wire [31:0]              prober_error;
+    wire                     prober_reset_req;
+    wire                     prober_wb_cyc;
+    wire                     prober_wb_stb;
+    wire                     prober_wb_we;
+    wire [WB_ADDR_BITS-1:0]  prober_wb_addr;
+    wire [WB_DATA_BITS-1:0]  prober_wb_data;
+    wire [WB_SEL_BITS-1:0]   prober_wb_sel;
+    wire [31:0]              prober_csr_data;
 
-    // Controller instantiation
+    // ═══════════════════════════════════════════════════════════════════
+    // §4 — WB Address Decode + BIST Priority Mux
+    // ═══════════════════════════════════════════════════════════════════
+    wire bist_active = prober_bist_busy;
+
+    // Address MSB decode: MSB=1 → Debug CSR, MSB=0 → DRAM access
+    // Qualified by STB per WB B4 RULE 3.60
+    wire debug_access;
+    generate if (DEBUG_CSR_ENABLE) begin : gen_dbg_decode
+        assign debug_access = i_wb_cyc && i_wb_stb && i_wb_addr[WB_ADDR_BITS];
+    end else begin : gen_no_dbg_decode
+        assign debug_access = 1'b0;
+    end endgenerate
+
+    wire [WB_ADDR_BITS-1:0] dram_addr = i_wb_addr[WB_ADDR_BITS-1:0];
+    wire dram_stb = i_wb_stb && !debug_access;
+
+    // Mux WB to controller: BIST has priority when active
+    wire                     ctrl_wb_cyc;
+    wire                     ctrl_wb_stb;
+    wire                     ctrl_wb_we;
+    wire [WB_ADDR_BITS-1:0]  ctrl_wb_addr;
+    wire [WB_DATA_BITS-1:0]  ctrl_wb_data;
+    wire [WB_SEL_BITS-1:0]   ctrl_wb_sel;
+    wire                     ctrl_wb_stall;
+    wire                     ctrl_wb_ack;
+    wire [WB_DATA_BITS-1:0]  ctrl_wb_rdata;
+
+    assign ctrl_wb_cyc  = bist_active ? prober_wb_cyc  : i_wb_cyc;
+    assign ctrl_wb_stb  = bist_active ? prober_wb_stb  : dram_stb;
+    assign ctrl_wb_we   = bist_active ? prober_wb_we   : i_wb_we;
+    assign ctrl_wb_addr = bist_active ? prober_wb_addr : dram_addr;
+    assign ctrl_wb_data = bist_active ? prober_wb_data : i_wb_data;
+    assign ctrl_wb_sel  = bist_active ? prober_wb_sel  : i_wb_sel;
+
+    // Route stall/ack to active master, block inactive master
+    wire user_wb_stall = bist_active ? 1'b1          : ctrl_wb_stall;
+    wire user_wb_ack   = bist_active ? 1'b0          : ctrl_wb_ack;
+    wire bist_wb_stall = bist_active ? ctrl_wb_stall : 1'b1;
+    wire bist_wb_ack   = bist_active ? ctrl_wb_ack   : 1'b0;
+
+    // Outstanding DRAM request counter — prevents CSR ACK from masking DRAM ACKs
+    reg [3:0] dram_outstanding_q;
+    wire dram_request_accepted = i_wb_cyc && dram_stb && !user_wb_stall;
+    wire dram_ack_returned     = user_wb_ack;
+
+    always @(posedge i_controller_clk) begin
+        if (!i_rst_n)
+            dram_outstanding_q <= 4'd0;
+        else
+            dram_outstanding_q <= dram_outstanding_q
+                                + {3'd0, dram_request_accepted}
+                                - {3'd0, dram_ack_returned};
+    end
+
+    wire csr_blocked = (dram_outstanding_q != 0);
+    wire csr_ready   = debug_access && !csr_blocked;
+
+    // Final output mux
+    assign o_wb_stall = debug_access ? csr_blocked   : user_wb_stall;
+    assign o_wb_ack   = csr_ready    ? 1'b1          : user_wb_ack;
+    assign o_wb_data  = csr_ready    ? {{(WB_DATA_BITS-32){1'b0}}, prober_csr_data}
+                                     : ctrl_wb_rdata;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §5 — BIST Auto-Start + Manual Trigger
+    // ═══════════════════════════════════════════════════════════════════
+    reg calib_complete_q;
+    always @(posedge i_controller_clk) begin
+        if (!i_rst_n)
+            calib_complete_q <= 1'b0;
+        else
+            calib_complete_q <= calib_complete;
+    end
+
+    wire bist_auto_start = calib_complete && !calib_complete_q && (BIST_MODE != 0);
+    wire bist_start      = bist_auto_start || i_bist_start;
+
+    // Status outputs
+    assign o_calib_complete = calib_complete;
+    assign o_calib_error    = calib_error;
+    assign o_bist_busy      = prober_bist_busy;
+    assign o_bist_pass      = prober_bist_pass;
+    assign o_bist_fail      = prober_bist_fail;
+    assign o_bist_correct   = prober_correct;
+    assign o_bist_error     = prober_error;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §6 — Controller Instantiation
+    // ═══════════════════════════════════════════════════════════════════
     ddr4_controller #(
         .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),
         .DDR4_CLK_PERIOD(DDR4_CLK_PERIOD),
@@ -145,16 +258,16 @@ module ddr4_top #(
     ) u_controller (
         .i_controller_clk(i_controller_clk),
         .i_rst_n(i_rst_n),
-        // Wishbone
-        .i_wb_cyc(i_wb_cyc),
-        .i_wb_stb(i_wb_stb),
-        .i_wb_we(i_wb_we),
+        // Wishbone (muxed)
+        .i_wb_cyc(ctrl_wb_cyc),
+        .i_wb_stb(ctrl_wb_stb),
+        .i_wb_we(ctrl_wb_we),
         .i_wb_addr(ctrl_wb_addr),
-        .i_wb_data(i_wb_data),
-        .i_wb_sel(i_wb_sel),
-        .o_wb_stall(o_wb_stall),
-        .o_wb_ack(o_wb_ack),
-        .o_wb_data(o_wb_data),
+        .i_wb_data(ctrl_wb_data),
+        .i_wb_sel(ctrl_wb_sel),
+        .o_wb_stall(ctrl_wb_stall),
+        .o_wb_ack(ctrl_wb_ack),
+        .o_wb_data(ctrl_wb_rdata),
         // DFI Control
         .o_dfi_address(dfi_address),
         .o_dfi_bank(dfi_bank),
@@ -191,11 +304,19 @@ module ddr4_top #(
         .i_dfi_rdlvl_gate_req(dfi_rdlvl_gate_req),
         .i_dfi_wrlvl_req(dfi_wrlvl_req),
         // Status
-        .o_calib_complete(o_calib_complete),
-        .o_calib_error(o_calib_error)
+        .o_calib_complete(calib_complete),
+        .o_calib_error(calib_error),
+        .o_calib_state(ctrl_calib_state),
+        .o_stage1_pending(ctrl_stage1_pending),
+        .o_stage2_pending(ctrl_stage2_pending),
+        .o_stage2_we(ctrl_stage2_we),
+        .o_refresh_idle(ctrl_refresh_idle),
+        .o_bank_status(ctrl_bank_status)
     );
 
-    // PHY instantiation
+    // ═══════════════════════════════════════════════════════════════════
+    // §7 — PHY Instantiation
+    // ═══════════════════════════════════════════════════════════════════
     ddr4_phy #(
         .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),
         .DDR4_CLK_PERIOD(DDR4_CLK_PERIOD),
@@ -260,7 +381,58 @@ module ddr4_top #(
         .io_ddr4_dq(io_ddr4_dq),
         .io_ddr4_dqs_p(io_ddr4_dqs_p),
         .io_ddr4_dqs_n(io_ddr4_dqs_n),
-        .o_idelayctrl_rdy()  // unused for now
+        .o_idelayctrl_rdy(),
+        .o_phy_state(phy_train_state),
+        .o_phy_idelay_center(phy_idelay_center),
+        .o_phy_wl_tap(phy_wl_tap),
+        .o_phy_bitslip(phy_bitslip)
+    );
+
+    // ═══════════════════════════════════════════════════════════════════
+    // §8 — Prober Instantiation (BIST + Debug CSR)
+    // ═══════════════════════════════════════════════════════════════════
+    ddr4_prober #(
+        .WB_ADDR_BITS(WB_ADDR_BITS),
+        .WB_DATA_BITS(WB_DATA_BITS),
+        .WB_SEL_BITS(WB_SEL_BITS),
+        .BYTE_LANES(BYTE_LANES),
+        .NUM_BANKS(NUM_BANKS),
+        .ROW_BITS(ROW_BITS),
+        .BIST_MODE(BIST_MODE),
+        .DEBUG_CSR_ENABLE(DEBUG_CSR_ENABLE),
+        .BIST_TEST_ADDR_BITS(BIST_TEST_ADDR_BITS)
+    ) u_prober (
+        .i_clk(i_controller_clk),
+        .i_rst_n(i_rst_n),
+        .i_start(bist_start),
+        .i_calib_complete(calib_complete),
+        .o_bist_busy(prober_bist_busy),
+        .o_bist_pass(prober_bist_pass),
+        .o_bist_fail(prober_bist_fail),
+        .o_correct_count(prober_correct),
+        .o_error_count(prober_error),
+        .o_bist_reset_req(prober_reset_req),
+        .o_wb_cyc(prober_wb_cyc),
+        .o_wb_stb(prober_wb_stb),
+        .o_wb_we(prober_wb_we),
+        .o_wb_addr(prober_wb_addr),
+        .o_wb_data(prober_wb_data),
+        .o_wb_sel(prober_wb_sel),
+        .i_wb_stall(bist_wb_stall),
+        .i_wb_ack(bist_wb_ack),
+        .i_wb_data(ctrl_wb_rdata),
+        .i_csr_sel(i_wb_addr[3:0]),
+        .o_csr_data(prober_csr_data),
+        .i_calib_state(ctrl_calib_state),
+        .i_stage1_pending(ctrl_stage1_pending),
+        .i_stage2_pending(ctrl_stage2_pending),
+        .i_stage2_we(ctrl_stage2_we),
+        .i_refresh_idle(ctrl_refresh_idle),
+        .i_bank_status(ctrl_bank_status),
+        .i_phy_state(phy_train_state),
+        .i_phy_idelay_center(phy_idelay_center),
+        .i_phy_wl_tap(phy_wl_tap),
+        .i_phy_bitslip(phy_bitslip)
     );
 
 endmodule

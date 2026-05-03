@@ -145,6 +145,11 @@ module ddr4_sim_top;
     reg                      bist_start;
     wire                     calib_complete;
     wire                     calib_error;
+    wire                     bist_busy;
+    wire                     bist_pass;
+    wire                     bist_fail;
+    wire [31:0]              bist_correct;
+    wire [31:0]              bist_error;
 
     initial begin
         wb_cyc     = 'z;
@@ -180,7 +185,9 @@ module ddr4_sim_top;
         .DENSITY               (8),
         .MICRON_SIM            (1),
         .SKIP_CALIB            (TB_SKIP_CALIB),
-        .ADDR_MAPPING          (TB_ADDR_MAPPING)
+        .ADDR_MAPPING          (TB_ADDR_MAPPING),
+        .BIST_MODE             (0),
+        .DEBUG_CSR_ENABLE      (1)
     ) u_dut (
         .i_controller_clk (controller_clk),
         .i_ddr4_clk       (ddr4_clk),
@@ -210,11 +217,11 @@ module ddr4_sim_top;
         .io_ddr4_dqs_p     (ddr4_dqs_p),
         .io_ddr4_dqs_n     (ddr4_dqs_n),
         .i_bist_start      (bist_start),
-        .o_bist_busy       (),
-        .o_bist_pass       (),
-        .o_bist_fail       (),
-        .o_bist_correct    (),
-        .o_bist_error      (),
+        .o_bist_busy       (bist_busy),
+        .o_bist_pass       (bist_pass),
+        .o_bist_fail       (bist_fail),
+        .o_bist_correct    (bist_correct),
+        .o_bist_error      (bist_error),
         .o_calib_complete  (calib_complete),
         .o_calib_error     (calib_error)
     );

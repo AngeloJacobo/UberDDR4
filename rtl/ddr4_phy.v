@@ -101,7 +101,12 @@ module ddr4_phy #(
     inout  wire [BYTE_LANES-1:0]            io_ddr4_dqs_p,
     inout  wire [BYTE_LANES-1:0]            io_ddr4_dqs_n,
     // Status
-    output wire                             o_idelayctrl_rdy
+    output wire                             o_idelayctrl_rdy,
+    // Debug status (flat packed for synthesis, Phase 8)
+    output wire [3:0]                       o_phy_state,
+    output wire [9*BYTE_LANES-1:0]          o_phy_idelay_center,
+    output wire [9*BYTE_LANES-1:0]          o_phy_wl_tap,
+    output wire [3*BYTE_LANES-1:0]          o_phy_bitslip
 );
 
     // Command word bit-field positions (must match controller)
@@ -1160,5 +1165,19 @@ module ddr4_phy #(
         .RST(idelayctrl_rst),
         .RDY(idelayctrl_rdy_w)
     );
+
+    // ═══════════════════════════════════════
+    // §15 — Debug Status Assigns (Phase 8)
+    // ═══════════════════════════════════════
+    assign o_phy_state = phy_state;
+    generate
+        genvar dbg_lane;
+        for (dbg_lane = 0; dbg_lane < BYTE_LANES; dbg_lane = dbg_lane + 1) begin : gen_dbg
+            assign o_phy_idelay_center[dbg_lane*9 +: 9] =
+                (first_pass_tap[dbg_lane] + last_pass_tap[dbg_lane]) >> 1;
+            assign o_phy_wl_tap[dbg_lane*9 +: 9] = wl_tap[dbg_lane];
+            assign o_phy_bitslip[dbg_lane*3 +: 3] = bitslip_count_q[dbg_lane];
+        end
+    endgenerate
 
 endmodule
