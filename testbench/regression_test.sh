@@ -3,8 +3,7 @@
 # regression_test.sh — UberDDR4 calibration regression suite
 #
 # Runs multiple simulation configurations to stress-test the PHY training
-# FSM with realistic fly-by delays, address mapping variants, and
-# SKIP_CALIB bypass mode.
+# FSM with realistic fly-by delays and address mapping variants.
 #
 # Usage:
 #   export XILINX_VIVADO=/path/to/Vivado/2023.1
@@ -38,8 +37,6 @@ ALL_TESTS=(
     "calib_flyby_400|-d SIM_FLY_BY_DELAY=400"
     "calib_map0|-d SIM_ADDR_MAPPING=0"
     "calib_map0_flyby_200|-d SIM_ADDR_MAPPING=0 -d SIM_FLY_BY_DELAY=200"
-    "skip_calib_map1|-d SIM_SKIP_CALIB=1"
-    "skip_calib_map0|-d SIM_SKIP_CALIB=1 -d SIM_ADDR_MAPPING=0"
 )
 
 if [[ -z "${XILINX_VIVADO:-}" ]]; then

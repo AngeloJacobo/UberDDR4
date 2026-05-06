@@ -66,19 +66,12 @@ module ddr4_sim_top;
     //   Models real PCB daisy-chain routing: FPGA → chip0 → chip1.
     //   Realistic range: 50–400ps for a 2-chip DDR4-2400 board.
     //
-    // TB_SKIP_CALIB: 0 = full PHY training, 1 = bypass (Phase 6 mode)
     // TB_ADDR_MAPPING: 0 = sequential, 1 = BG-interleaved (default)
     // ═══════════════════════════════════════════════════════════════════
 `ifdef SIM_FLY_BY_DELAY
     localparam FLY_BY = `SIM_FLY_BY_DELAY;
 `else
     localparam FLY_BY = 0;
-`endif
-
-`ifdef SIM_SKIP_CALIB
-    localparam TB_SKIP_CALIB = `SIM_SKIP_CALIB;
-`else
-    localparam TB_SKIP_CALIB = 0;
 `endif
 
 `ifdef SIM_ADDR_MAPPING
@@ -171,7 +164,7 @@ module ddr4_sim_top;
 
     // ═══════════════════════════════════════════════════════════════════
     // DUT — ddr4_top with MICRON_SIM=1 (shortened init delays)
-    // SKIP_CALIB and ADDR_MAPPING driven by regression-overridable params
+    // ADDR_MAPPING driven by regression-overridable param
     // ═══════════════════════════════════════════════════════════════════
     ddr4_top #(
         .CONTROLLER_CLK_PERIOD (CTRL_CLK_PERIOD),
@@ -184,9 +177,8 @@ module ddr4_sim_top;
         .BYTE_LANES            (BYTE_LANES),
         .DENSITY               (8),
         .MICRON_SIM            (1),
-        .SKIP_CALIB            (TB_SKIP_CALIB),
         .ADDR_MAPPING          (TB_ADDR_MAPPING),
-        .BIST_MODE             (0),
+        .BIST_MODE             (1),
         .DEBUG_CSR_ENABLE      (1)
     ) u_dut (
         .i_controller_clk (controller_clk),
@@ -464,8 +456,8 @@ module ddr4_sim_top;
     initial $timeformat(-9, 3, "ns", 0);
 
     initial begin
-        $display("[0ns] CONFIG: FLY_BY=%0dps SKIP_CALIB=%0d ADDR_MAPPING=%0d",
-            FLY_BY, TB_SKIP_CALIB, TB_ADDR_MAPPING);
+        $display("[0ns] CONFIG: FLY_BY=%0dps ADDR_MAPPING=%0d",
+            FLY_BY, TB_ADDR_MAPPING);
     end
 
     always @(posedge controller_clk) begin
@@ -535,7 +527,7 @@ module ddr4_sim_top;
     initial calib_results_checked = 1'b0;
 
     always @(posedge controller_clk) begin
-        if (calib_complete && !calib_results_checked && !TB_SKIP_CALIB) begin
+        if (calib_complete && !calib_results_checked) begin
             calib_results_checked <= 1'b1;
             $display("[%0t] ═══ CALIBRATION RESULTS ═══", $realtime);
             $display("[%0t]   FLY_BY_DELAY = %0d ps", $realtime, FLY_BY);
@@ -549,10 +541,10 @@ module ddr4_sim_top;
                 u_dut.u_phy.first_pass_tap[0], u_dut.u_phy.last_pass_tap[0],
                 (u_dut.u_phy.first_pass_tap[1] + u_dut.u_phy.last_pass_tap[1]) >> 1,
                 u_dut.u_phy.first_pass_tap[1], u_dut.u_phy.last_pass_tap[1]);
-            $display("[%0t]   WL:   lane0 dqs_tap=%0d, lane1 dqs_tap=%0d",
+            $display("[%0t]   WL:   lane0 dqs_tap=%0d dq_tap=%0d, lane1 dqs_tap=%0d dq_tap=%0d",
                 $realtime,
-                u_dut.u_phy.wl_tap[0],
-                u_dut.u_phy.wl_tap[1]);
+                u_dut.u_phy.wl_tap[0], u_dut.u_phy.wl_dq_tap[0],
+                u_dut.u_phy.wl_tap[1], u_dut.u_phy.wl_dq_tap[1]);
             if (FLY_BY >= 100) begin
                 if (u_dut.u_phy.wl_tap[0] == u_dut.u_phy.wl_tap[1])
                     $display("[%0t]   WARNING: WL taps identical despite FLY_BY=%0dps — expected asymmetry",
@@ -560,6 +552,52 @@ module ddr4_sim_top;
                 else
                     $display("[%0t]   OK: WL taps differ (lane0=%0d, lane1=%0d) — fly-by compensation working",
                         $realtime, u_dut.u_phy.wl_tap[0], u_dut.u_phy.wl_tap[1]);
+            end
+        end
+    end
+
+    // ═══════════════════════════════════════════════════════════════════
+    // BIST Completion Monitor
+    // ═══════════════════════════════════════════════════════════════════
+    reg bist_was_busy;
+    reg bist_done_seen;
+    initial begin bist_was_busy = 1'b0; bist_done_seen = 1'b0; end
+
+    always @(posedge controller_clk) begin
+        if (bist_busy)
+            bist_was_busy <= 1'b1;
+        if (bist_was_busy && !bist_busy && !bist_done_seen) begin
+            bist_done_seen <= 1'b1;
+            if (!bist_fail)
+                $display("[%0t] BIST RESULT: PASS — correct=%0d errors=%0d",
+                    $realtime, bist_correct, bist_error);
+            else
+                $display("[%0t] BIST RESULT: FAIL — correct=%0d errors=%0d",
+                    $realtime, bist_correct, bist_error);
+        end
+    end
+
+    // ═══════════════════════════════════════════════════════════════════
+    // DFI Write/Read Boundary Monitor — Phase 2 rise corruption tracker
+    // ═══════════════════════════════════════════════════════════════════
+    integer dfi_wr_seq, dfi_rd_seq;
+    initial begin dfi_wr_seq = 0; dfi_rd_seq = 0; end
+
+    always @(posedge controller_clk) begin
+        if (bist_busy) begin
+            if (|u_dut.u_controller.o_dfi_wrdata_en) begin
+                $display("[DBG-WR] #%0d p2rise=%04h full=%0h",
+                    dfi_wr_seq,
+                    u_dut.u_controller.o_dfi_wrdata[79:64],
+                    u_dut.u_controller.o_dfi_wrdata);
+                dfi_wr_seq = dfi_wr_seq + 1;
+            end
+            if (|u_dut.u_phy.o_dfi_rddata_valid) begin
+                $display("[DBG-RD] #%0d p2rise=%04h full=%0h",
+                    dfi_rd_seq,
+                    u_dut.u_phy.o_dfi_rddata[79:64],
+                    u_dut.u_phy.o_dfi_rddata);
+                dfi_rd_seq = dfi_rd_seq + 1;
             end
         end
     end
@@ -603,7 +641,8 @@ module ddr4_sim_top;
                                     ROW2_BG2 = (2 << 10) | 2,
                                     ROW2_BG3 = (2 << 10) | 3,
                                     ROW2_BG0_C1 = (2 << 10) | (1 << 2) | 0,
-                                    ROW2_BG1_C1 = (2 << 10) | (1 << 2) | 1;
+                                    ROW2_BG1_C1 = (2 << 10) | (1 << 2) | 1,
+                                    CSR_BASE = 1 << WB_ADDR_BITS;
 
     task wb_write_one(input [EXT_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data);
         begin
@@ -650,6 +689,15 @@ module ddr4_sim_top;
         end
     endtask
 
+    function automatic [WB_DATA_BITS-1:0] gen_pattern_tb;
+        input [7:0] addr;
+        reg [31:0] seed;
+        begin
+            seed = {addr ^ 8'hA5, addr ^ 8'h5A, addr ^ 8'h3C, addr ^ 8'h7E};
+            gen_pattern_tb = {4{seed}};
+        end
+    endfunction
+
     integer rd_err_count;
     initial rd_err_count = 0;
 
@@ -682,6 +730,11 @@ module ddr4_sim_top;
 
     initial begin
         wait (calib_complete_seen);
+        repeat (10) @(posedge controller_clk);
+        if (bist_busy || bist_was_busy) begin
+            $display("[%0t] Waiting for BIST to complete...", $realtime);
+            wait (bist_done_seen);
+        end
         @(posedge controller_clk);
         while (wb_stall) @(posedge controller_clk);
 
@@ -820,6 +873,109 @@ module ddr4_sim_top;
         else
             $display("[%0t] FAIL: %0d of 10 write→read checks failed", $realtime, rd_err_count);
 
+        // ── Phase J: True pipelined writes — STB stays high, no gaps ──
+        test_phase = "PHASE_J";
+        $display("[%0t] ═══ Phase J: Pipelined write→drain→read (16 addr) ═══", $realtime);
+        begin : phase_j_blk
+            integer pj_idx;
+            integer pj_err;
+            reg [WB_DATA_BITS-1:0] pj_exp;
+            reg [WB_DATA_BITS-1:0] pj_captured;
+            pj_err = 0;
+
+            wb_cyc = 1'b1;
+            wb_stb = 1'b1;
+            wb_we  = 1'b1;
+            wb_sel = {WB_SEL_BITS{1'b1}};
+            wb_addr = 27'h1000;
+            wb_data = gen_pattern_tb(8'd0);
+
+            for (pj_idx = 0; pj_idx < 16; pj_idx = pj_idx + 1) begin
+                @(posedge controller_clk);
+                while (wb_stall) @(posedge controller_clk);
+                if (pj_idx < 15) begin
+                    wb_addr = 27'h1000 + pj_idx + 1;
+                    wb_data = gen_pattern_tb(pj_idx[7:0] + 8'd1);
+                end else begin
+                    wb_stb = 1'b0;
+                end
+            end
+            wb_we = 1'b0;
+
+            drain_pipeline;
+
+            for (pj_idx = 0; pj_idx < 16; pj_idx = pj_idx + 1) begin
+                wb_read_one(27'h1000 + pj_idx);
+                wb_stb = 1'b0;
+                while (!wb_ack) @(posedge controller_clk);
+                pj_captured = wb_rdata;
+                wb_idle;
+                repeat (5) @(posedge controller_clk);
+                pj_exp = gen_pattern_tb(pj_idx[7:0]);
+                if (pj_captured !== pj_exp) begin
+                    $display("[%0t]   PHASE_J FAIL: addr=%0d exp=%0h got=%0h",
+                        $realtime, pj_idx, pj_exp, pj_captured);
+                    pj_err = pj_err + 1;
+                end else begin
+                    $display("[%0t]   PHASE_J PASS: addr=%0d", $realtime, pj_idx);
+                end
+            end
+            wb_idle;
+
+            if (pj_err == 0)
+                $display("[%0t] PASS: Phase J — all 16 pipelined write→read checks passed", $realtime);
+            else begin
+                $display("[%0t] FAIL: Phase J — %0d of 16 checks failed", $realtime, pj_err);
+                rd_err_count = rd_err_count + pj_err;
+            end
+        end
+
+        // ── CSR Read Test: read debug registers 0x0–0xB ──
+        test_phase = "CSR";
+        $display("[%0t] ═══ CSR Read Test: registers 0x0–0xB ═══", $realtime);
+        begin : csr_read_block
+            integer csr_idx;
+            reg [WB_DATA_BITS-1:0] csr_val;
+            for (csr_idx = 0; csr_idx < 12; csr_idx = csr_idx + 1) begin
+                wb_read_one(CSR_BASE | csr_idx);
+                wb_stb = 1'b0;
+                while (!wb_ack) @(posedge controller_clk);
+                csr_val = wb_rdata;
+                wb_idle;
+                $display("[%0t]   CSR[0x%0h] = 0x%08h", $realtime, csr_idx, csr_val[31:0]);
+                repeat (2) @(posedge controller_clk);
+            end
+        end
+        $display("[%0t] CSR read test complete", $realtime);
+
+        // ── BIST Re-trigger Test ──
+        test_phase = "RETRIG";
+        $display("[%0t] ═══ BIST Re-trigger Test ═══", $realtime);
+        bist_start = 1'b1;
+        repeat (5) @(posedge controller_clk);
+        bist_start = 1'b0;
+        begin : retrig_block
+            integer retrig_timeout;
+            retrig_timeout = 0;
+            wait (bist_busy);
+            $display("[%0t]   BIST re-triggered (busy asserted)", $realtime);
+            while (bist_busy && retrig_timeout < 200000) begin
+                @(posedge controller_clk);
+                retrig_timeout = retrig_timeout + 1;
+            end
+            if (retrig_timeout >= 200000) begin
+                $display("[%0t] FAIL: BIST re-trigger timed out", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end else if (!bist_fail) begin
+                $display("[%0t]   BIST re-trigger PASS — correct=%0d errors=%0d",
+                    $realtime, bist_correct, bist_error);
+            end else begin
+                $display("[%0t]   BIST re-trigger FAIL — correct=%0d errors=%0d",
+                    $realtime, bist_correct, bist_error);
+                rd_err_count = rd_err_count + 1;
+            end
+        end
+
         test_phase = "DONE";
         $display("[%0t] ═══ All test phases complete ═══", $realtime);
         all_tests_done = 1'b1;
@@ -847,7 +1003,7 @@ module ddr4_sim_top;
     initial begin act_count = 0; wr_count = 0; rd_count = 0; pre_count = 0; end
 
     always @(posedge controller_clk) begin
-        if (reset_done_seen && !all_tests_done) begin
+        if (reset_done_seen && !all_tests_done && !bist_busy) begin
             for (mon_ph = 0; mon_ph < 4; mon_ph = mon_ph + 1) begin
                 if (mon_is_act[mon_ph]) begin
                     act_count = act_count + 1;
@@ -915,22 +1071,22 @@ module ddr4_sim_top;
         repeat (10) @(posedge controller_clk);
         $display("");
         $display("[%0t] ═══════════════════════════════════════════════", $realtime);
-        $display("[%0t] SUMMARY: ACT=%0d  WR=%0d  RD=%0d  PRE=%0d  REF=%0d  RD_ERR=%0d",
-                 $realtime, act_count, wr_count, rd_count, pre_count, ref_count, rd_err_count);
-        if (rd_err_count == 0)
-            $display("[%0t] PASS: All 9 test phases + %0d refresh cycles, zero violations",
+        $display("[%0t] SUMMARY: ACT=%0d  WR=%0d  RD=%0d  PRE=%0d  REF=%0d  RD_ERR=%0d  BIST_ERR=%0d",
+                 $realtime, act_count, wr_count, rd_count, pre_count, ref_count, rd_err_count, bist_error);
+        if (rd_err_count == 0 && bist_error == 0)
+            $display("[%0t] PASS: All test phases + BIST + %0d refresh cycles, zero violations",
                      $realtime, ref_count);
         else
-            $display("[%0t] FAIL: %0d read data mismatches detected",
-                     $realtime, rd_err_count);
+            $display("[%0t] FAIL: rd_err=%0d bist_err=%0d",
+                     $realtime, rd_err_count, bist_error);
         $display("[%0t] Simulation finished successfully", $realtime);
         $display("[%0t] ═══════════════════════════════════════════════", $realtime);
         $finish;
     end
 
     initial begin
-        #200_000_000;
-        $display("[%0t] TIMEOUT: simulation did not complete within 200 us", $realtime);
+        #300_000_000;
+        $display("[%0t] TIMEOUT: simulation did not complete within 300 us", $realtime);
         $finish;
     end
 

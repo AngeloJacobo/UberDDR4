@@ -39,9 +39,9 @@ module ddr4_prober #(
               BYTE_LANES         = 2,
               NUM_BANKS          = 16,
               ROW_BITS           = 16,
+    parameter[0:0] MICRON_SIM    = 0,
     parameter[1:0] BIST_MODE     = 2,
-    parameter      DEBUG_CSR_ENABLE = 1,
-    parameter      BIST_TEST_ADDR_BITS = 8
+    parameter      DEBUG_CSR_ENABLE = 1
 ) (
     input  wire                     i_clk,
     input  wire                     i_rst_n,
@@ -93,7 +93,10 @@ module ddr4_prober #(
                      BIST_FINISH         = 3'd6,
                      BIST_DONE           = 3'd7;
 
-    localparam TEST_COUNT = (1 << BIST_TEST_ADDR_BITS);
+    localparam BIST_ADDR_BITS = MICRON_SIM ? 10 : WB_ADDR_BITS;
+    localparam [BIST_ADDR_BITS-1:0] BURST_END  = {{2{BIST_MODE[1]}}, {(BIST_ADDR_BITS-2){1'b1}}};
+    localparam [BIST_ADDR_BITS-1:0] RANDOM_END = {1'b1, BIST_MODE[1], {(BIST_ADDR_BITS-2){1'b1}}};
+    localparam [BIST_ADDR_BITS-1:0] ALT_END    = {BIST_ADDR_BITS{1'b1}};
 
     wire [2:0] bist_state_w;
 
@@ -103,9 +106,9 @@ module ddr4_prober #(
     generate if (BIST_MODE != 0) begin : gen_bist
 
         reg [2:0] bist_state;
-        reg [BIST_TEST_ADDR_BITS-1:0] write_addr;
-        reg [BIST_TEST_ADDR_BITS-1:0] read_addr;
-        reg [BIST_TEST_ADDR_BITS-1:0] check_addr;
+        reg [BIST_ADDR_BITS-1:0] write_addr;
+        reg [BIST_ADDR_BITS-1:0] read_addr;
+        reg [BIST_ADDR_BITS-1:0] check_addr;
         reg [31:0] correct_count;
         reg [31:0] error_count;
         reg bist_fail_sticky;
@@ -121,55 +124,44 @@ module ddr4_prober #(
         reg [3:0] outstanding;
         reg [8:0] wr_acks_pending;
 
-        // Pattern generation — deterministic from address
+        // Pattern generation — deterministic from address (XOR-fold full width)
         function [WB_DATA_BITS-1:0] gen_pattern;
-            input [BIST_TEST_ADDR_BITS-1:0] addr;
+            input [BIST_ADDR_BITS-1:0] addr;
             reg [31:0] seed;
+            reg [31:0] a;
             begin
-                seed = {addr[7:0] ^ 8'hA5, addr[7:0] ^ 8'h5A,
-                        addr[7:0] ^ 8'h3C, addr[7:0] ^ 8'h7E};
+                a = {{(32-BIST_ADDR_BITS){1'b0}}, addr};
+                seed = a ^ {a[15:0], a[31:16]} ^ 32'hA55A3CC3;
                 gen_pattern = {(WB_DATA_BITS/32){seed}};
             end
         endfunction
 
-        // Random-order address: swap upper and lower halves for bank thrashing
-        function [BIST_TEST_ADDR_BITS-1:0] scramble_addr;
-            input [BIST_TEST_ADDR_BITS-1:0] addr;
-            reg [BIST_TEST_ADDR_BITS-1:0] result;
-            integer half;
+        // Bit-reversal address scramble — forces row changes on sequential
+        // counter values, maximizing precharge/activate stress
+        function [BIST_ADDR_BITS-1:0] scramble_addr;
+            input [BIST_ADDR_BITS-1:0] addr;
+            integer i;
             begin
-                half = BIST_TEST_ADDR_BITS / 2;
-                result = {addr[half-1:0], addr[BIST_TEST_ADDR_BITS-1:half]};
-                scramble_addr = result;
+                for (i = 0; i < BIST_ADDR_BITS; i = i + 1)
+                    scramble_addr[i] = addr[BIST_ADDR_BITS-1-i];
             end
         endfunction
 
-        wire all_written = (write_addr == {BIST_TEST_ADDR_BITS{1'b0}}) && wb_stb_r;
-        wire all_read    = (read_addr  == {BIST_TEST_ADDR_BITS{1'b0}}) && wb_stb_r;
-        wire all_checked = (outstanding == 0) && !wb_stb_r;
-
-        wire [WB_ADDR_BITS-1:0] burst_write_addr = {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}}, write_addr};
-        wire [WB_ADDR_BITS-1:0] burst_read_addr  = {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}}, read_addr};
-        wire [WB_ADDR_BITS-1:0] rand_write_addr  = {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}}, scramble_addr(write_addr)};
-        wire [WB_ADDR_BITS-1:0] rand_read_addr   = {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}}, scramble_addr(read_addr)};
-
-        // Expected data for read verification (includes FINISH drain phase)
+        // Expected data for read verification (covers trailing ACKs across phases)
         wire uses_scramble = (bist_state == BIST_RANDOM_READ) ||
-                             (bist_state == BIST_FINISH && last_read_scrambled);
+                             ((bist_state == BIST_RANDOM_WRITE ||
+                               bist_state == BIST_ALT_WRITE_READ ||
+                               bist_state == BIST_FINISH) && last_read_scrambled);
         wire [WB_DATA_BITS-1:0] expected_data;
-        assign expected_data = uses_scramble ? gen_pattern(scramble_addr(check_addr)) :
-                               (bist_state == BIST_BURST_READ ||
-                                bist_state == BIST_FINISH ||
-                                (bist_state == BIST_ALT_WRITE_READ && alt_phase))
-                                   ? gen_pattern(check_addr) :
-                               {WB_DATA_BITS{1'b0}};
+        assign expected_data = uses_scramble ? gen_pattern(scramble_addr(check_addr))
+                                             : gen_pattern(check_addr);
 
         always @(posedge i_clk) begin
             if (!i_rst_n) begin
                 bist_state      <= BIST_IDLE;
-                write_addr      <= {BIST_TEST_ADDR_BITS{1'b0}};
-                read_addr       <= {BIST_TEST_ADDR_BITS{1'b0}};
-                check_addr      <= {BIST_TEST_ADDR_BITS{1'b0}};
+                write_addr      <= {BIST_ADDR_BITS{1'b0}};
+                read_addr       <= {BIST_ADDR_BITS{1'b0}};
+                check_addr      <= {BIST_ADDR_BITS{1'b0}};
                 correct_count   <= 32'd0;
                 error_count     <= 32'd0;
                 bist_fail_sticky <= 1'b0;
@@ -201,14 +193,13 @@ module ddr4_prober #(
                 else if (i_wb_ack && wr_acks_pending > 0)
                     wr_acks_pending <= wr_acks_pending - 1'b1;
 
-                // Data check on ACK during read phases (only after all write ACKs drained)
+                // Data check on ACK (wr_acks_pending==0 guarantees it is a read ACK)
                 if (i_wb_ack && wr_acks_pending == 0 &&
-                    (bist_state == BIST_BURST_READ ||
-                     bist_state == BIST_RANDOM_READ ||
-                     (bist_state == BIST_ALT_WRITE_READ && alt_phase) ||
-                     bist_state == BIST_FINISH)) begin
+                    bist_state != BIST_IDLE &&
+                    bist_state != BIST_DONE &&
+                    bist_state != BIST_BURST_WRITE) begin
                     `ifndef YOSYS
-                    if (check_addr < 4)
+                    if (check_addr < 20)
                         $display("[%0t] BIST CHK: addr=%0d exp=%0h got=%0h state=%0d",
                             $realtime, check_addr, expected_data, i_wb_data, bist_state);
                     `endif
@@ -231,12 +222,12 @@ module ddr4_prober #(
                         if (i_start && i_calib_complete) begin
                             `ifndef YOSYS
                             $display("[%0t] BIST START: first wr data=%0h",
-                                $realtime, gen_pattern({BIST_TEST_ADDR_BITS{1'b0}}));
+                                $realtime, gen_pattern({BIST_ADDR_BITS{1'b0}}));
                             `endif
                             bist_state    <= BIST_BURST_WRITE;
-                            write_addr    <= {BIST_TEST_ADDR_BITS{1'b0}};
-                            read_addr     <= {BIST_TEST_ADDR_BITS{1'b0}};
-                            check_addr    <= {BIST_TEST_ADDR_BITS{1'b0}};
+                            write_addr    <= {BIST_ADDR_BITS{1'b0}};
+                            read_addr     <= {BIST_ADDR_BITS{1'b0}};
+                            check_addr    <= {BIST_ADDR_BITS{1'b0}};
                             correct_count <= 32'd0;
                             error_count   <= 32'd0;
                             bist_fail_sticky <= 1'b0;
@@ -244,7 +235,7 @@ module ddr4_prober #(
                             wb_stb_r      <= 1'b1;
                             wb_we_r       <= 1'b1;
                             wb_addr_r     <= {WB_ADDR_BITS{1'b0}};
-                            wb_data_r     <= gen_pattern({BIST_TEST_ADDR_BITS{1'b0}});
+                            wb_data_r     <= gen_pattern({BIST_ADDR_BITS{1'b0}});
                             outstanding   <= 4'd0;
                         end
                     end
@@ -253,10 +244,9 @@ module ddr4_prober #(
                     BIST_BURST_WRITE: begin
                         if (!i_wb_stall) begin
                             write_addr <= write_addr + 1'b1;
-                            wb_addr_r  <= {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}},
-                                           write_addr + 1'b1};
+                            wb_addr_r  <= write_addr + 1'b1;
                             wb_data_r  <= gen_pattern(write_addr + 1'b1);
-                            if (write_addr == TEST_COUNT[BIST_TEST_ADDR_BITS-1:0] - 1'b1) begin
+                            if (write_addr == BURST_END) begin
                                 `ifndef YOSYS
                                 $display("[%0t] BIST W→R: wr_pend=%0d outstanding=%0d",
                                     $realtime, wr_acks_pending, outstanding);
@@ -264,8 +254,8 @@ module ddr4_prober #(
                                 bist_state <= BIST_BURST_READ;
                                 last_read_scrambled <= 1'b0;
                                 wb_we_r    <= 1'b0;
-                                read_addr  <= {BIST_TEST_ADDR_BITS{1'b0}};
-                                check_addr <= {BIST_TEST_ADDR_BITS{1'b0}};
+                                read_addr  <= {BIST_ADDR_BITS{1'b0}};
+                                check_addr <= {BIST_ADDR_BITS{1'b0}};
                                 wb_addr_r  <= {WB_ADDR_BITS{1'b0}};
                             end
                         end
@@ -275,15 +265,10 @@ module ddr4_prober #(
                     BIST_BURST_READ: begin
                         if (!i_wb_stall) begin
                             read_addr <= read_addr + 1'b1;
-                            wb_addr_r <= {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}},
-                                          read_addr + 1'b1};
-                            if (read_addr == TEST_COUNT[BIST_TEST_ADDR_BITS-1:0] - 1'b1) begin
-                                wb_stb_r <= 1'b0;
-                                if (BIST_MODE >= 2) begin
-                                    bist_state <= BIST_RANDOM_WRITE;
-                                end else begin
-                                    bist_state <= BIST_FINISH;
-                                end
+                            wb_addr_r <= read_addr + 1'b1;
+                            if (read_addr == BURST_END) begin
+                                wb_stb_r   <= 1'b0;
+                                bist_state <= BIST_RANDOM_WRITE;
                             end
                         end
                     end
@@ -291,25 +276,33 @@ module ddr4_prober #(
                     // ── Phase 2: Random-Order Write ──
                     BIST_RANDOM_WRITE: begin
                         if (outstanding == 0 && !wb_stb_r) begin
-                            wb_stb_r   <= 1'b1;
-                            wb_we_r    <= 1'b1;
-                            write_addr <= {BIST_TEST_ADDR_BITS{1'b0}};
-                            wb_addr_r  <= {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}},
-                                           scramble_addr({BIST_TEST_ADDR_BITS{1'b0}})};
-                            wb_data_r  <= gen_pattern(scramble_addr({BIST_TEST_ADDR_BITS{1'b0}}));
+                            wb_stb_r <= 1'b1;
+                            wb_we_r  <= 1'b1;
+                            if (BIST_MODE == 2) begin
+                                write_addr <= {BIST_ADDR_BITS{1'b0}};
+                                wb_addr_r  <= scramble_addr({BIST_ADDR_BITS{1'b0}});
+                                wb_data_r  <= gen_pattern(scramble_addr({BIST_ADDR_BITS{1'b0}}));
+                            end else begin
+                                wb_addr_r  <= scramble_addr(write_addr);
+                                wb_data_r  <= gen_pattern(scramble_addr(write_addr));
+                            end
                         end else if (wb_stb_r && !i_wb_stall) begin
                             write_addr <= write_addr + 1'b1;
-                            wb_addr_r  <= {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}},
-                                           scramble_addr(write_addr + 1'b1)};
+                            wb_addr_r  <= scramble_addr(write_addr + 1'b1);
                             wb_data_r  <= gen_pattern(scramble_addr(write_addr + 1'b1));
-                            if (write_addr == TEST_COUNT[BIST_TEST_ADDR_BITS-1:0] - 1'b1) begin
+                            if (write_addr == RANDOM_END) begin
                                 bist_state <= BIST_RANDOM_READ;
                                 last_read_scrambled <= 1'b1;
-                                wb_we_r    <= 1'b0;
-                                read_addr  <= {BIST_TEST_ADDR_BITS{1'b0}};
-                                check_addr <= {BIST_TEST_ADDR_BITS{1'b0}};
-                                wb_addr_r  <= {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}},
-                                               scramble_addr({BIST_TEST_ADDR_BITS{1'b0}})};
+                                wb_we_r <= 1'b0;
+                                if (BIST_MODE == 2) begin
+                                    read_addr  <= {BIST_ADDR_BITS{1'b0}};
+                                    check_addr <= {BIST_ADDR_BITS{1'b0}};
+                                    wb_addr_r  <= scramble_addr({BIST_ADDR_BITS{1'b0}});
+                                end else begin
+                                    read_addr  <= BURST_END + 1'b1;
+                                    check_addr <= BURST_END + 1'b1;
+                                    wb_addr_r  <= scramble_addr(BURST_END + 1'b1);
+                                end
                             end
                         end
                     end
@@ -318,45 +311,38 @@ module ddr4_prober #(
                     BIST_RANDOM_READ: begin
                         if (!i_wb_stall && wb_stb_r) begin
                             read_addr <= read_addr + 1'b1;
-                            wb_addr_r <= {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}},
-                                          scramble_addr(read_addr + 1'b1)};
-                            if (read_addr == TEST_COUNT[BIST_TEST_ADDR_BITS-1:0] - 1'b1) begin
-                                wb_stb_r <= 1'b0;
+                            wb_addr_r <= scramble_addr(read_addr + 1'b1);
+                            if (read_addr == RANDOM_END) begin
+                                wb_stb_r   <= 1'b0;
                                 bist_state <= BIST_ALT_WRITE_READ;
                             end
                         end
                     end
 
-                    // ── Phase 3: Alternating Write/Read ──
+                    // ── Phase 3: Alternating Write/Read (serialized per pair) ──
                     BIST_ALT_WRITE_READ: begin
-                        if (outstanding == 0 && !wb_stb_r && !alt_phase) begin
-                            last_read_scrambled <= 1'b0;
-                            wb_stb_r   <= 1'b1;
-                            wb_we_r    <= 1'b1;
-                            write_addr <= {BIST_TEST_ADDR_BITS{1'b0}};
-                            wb_addr_r  <= {WB_ADDR_BITS{1'b0}};
-                            wb_data_r  <= gen_pattern({BIST_TEST_ADDR_BITS{1'b0}});
-                            alt_phase  <= 1'b0;
-                        end else if (wb_stb_r && !i_wb_stall) begin
+                        if (outstanding == 0 && !wb_stb_r) begin
                             if (!alt_phase) begin
-                                // Just wrote — now read same address
-                                alt_phase <= 1'b1;
-                                wb_we_r   <= 1'b0;
-                                wb_addr_r <= {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}},
-                                              write_addr};
-                                check_addr <= write_addr;
+                                last_read_scrambled <= 1'b0;
+                                wb_stb_r  <= 1'b1;
+                                wb_we_r   <= 1'b1;
+                                wb_addr_r <= write_addr;
+                                wb_data_r <= gen_pattern(write_addr);
                             end else begin
-                                // Just read — advance to next address and write
+                                wb_stb_r   <= 1'b1;
+                                wb_we_r    <= 1'b0;
+                                wb_addr_r  <= write_addr;
+                                check_addr <= write_addr;
+                            end
+                        end else if (wb_stb_r && !i_wb_stall) begin
+                            wb_stb_r <= 1'b0;
+                            if (!alt_phase) begin
+                                alt_phase <= 1'b1;
+                            end else begin
                                 alt_phase  <= 1'b0;
                                 write_addr <= write_addr + 1'b1;
-                                wb_we_r    <= 1'b1;
-                                wb_addr_r  <= {{(WB_ADDR_BITS-BIST_TEST_ADDR_BITS){1'b0}},
-                                               write_addr + 1'b1};
-                                wb_data_r  <= gen_pattern(write_addr + 1'b1);
-                                if (write_addr == TEST_COUNT[BIST_TEST_ADDR_BITS-1:0] - 1'b1) begin
-                                    wb_stb_r   <= 1'b0;
+                                if (write_addr == ALT_END)
                                     bist_state <= BIST_FINISH;
-                                end
                             end
                         end
                     end

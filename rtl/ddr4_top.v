@@ -41,7 +41,6 @@ module ddr4_top #(
               BYTE_LANES = 2,
               DENSITY = 8,
     parameter[0:0] MICRON_SIM = 0,
-                   SKIP_CALIB = 0,
     parameter[1:0] ADDR_MAPPING = 1,
     parameter[2:0] RTT_NOM = 3'b001,
                    RTT_WR = 3'b000,
@@ -52,7 +51,6 @@ module ddr4_top #(
     // Prober config (Phase 8)
     parameter[1:0] BIST_MODE = 0,
     parameter DEBUG_CSR_ENABLE = 1,
-    parameter BIST_TEST_ADDR_BITS = 8,
     // Derived (for port widths)
     parameter SERDES_RATIO = 4,
               NUM_BG = (1 << BG_BITS),
@@ -247,7 +245,6 @@ module ddr4_top #(
         .BYTE_LANES(BYTE_LANES),
         .DENSITY(DENSITY),
         .MICRON_SIM(MICRON_SIM),
-        .SKIP_CALIB(SKIP_CALIB),
         .ADDR_MAPPING(ADDR_MAPPING),
         .RTT_NOM(RTT_NOM),
         .RTT_WR(RTT_WR),
@@ -324,8 +321,7 @@ module ddr4_top #(
         .BA_BITS(BA_BITS),
         .BG_BITS(BG_BITS),
         .DQ_BITS(DQ_BITS),
-        .BYTE_LANES(BYTE_LANES),
-        .SKIP_CALIB(SKIP_CALIB)
+        .BYTE_LANES(BYTE_LANES)
     ) u_phy (
         .i_controller_clk(i_controller_clk),
         .i_ddr4_clk(i_ddr4_clk),
@@ -398,9 +394,9 @@ module ddr4_top #(
         .BYTE_LANES(BYTE_LANES),
         .NUM_BANKS(NUM_BANKS),
         .ROW_BITS(ROW_BITS),
+        .MICRON_SIM(MICRON_SIM),
         .BIST_MODE(BIST_MODE),
-        .DEBUG_CSR_ENABLE(DEBUG_CSR_ENABLE),
-        .BIST_TEST_ADDR_BITS(BIST_TEST_ADDR_BITS)
+        .DEBUG_CSR_ENABLE(DEBUG_CSR_ENABLE)
     ) u_prober (
         .i_clk(i_controller_clk),
         .i_rst_n(i_rst_n),

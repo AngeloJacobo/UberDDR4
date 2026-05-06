@@ -42,7 +42,6 @@ module ddr4_controller #(
               BYTE_LANES = 2,   //number of byte lanes
               DENSITY = 8,      //device density in Gb (2, 4, 8, 16)
     parameter[0:0] MICRON_SIM = 0,   //shorten init delays for Micron model
-                   SKIP_CALIB = 0,   //skip PHY calibration (sim only)
     parameter[1:0] ADDR_MAPPING = 1, //0={row,bg,ba,col}, 1=BG-interleaved (default)
     parameter[2:0] RTT_NOM  = 3'b001, //MR1 A10:A8 (001=RZQ/4)
                    RTT_WR   = 3'b000, //MR2 A11,A10:A9 (000=off)
@@ -872,7 +871,7 @@ module ddr4_controller #(
     // ─── Stall: combinational, reflects current registered state ───
     always @* begin
         o_wb_stall = stage1_pending || !reset_done || refresh_active
-                     || (!SKIP_CALIB && !o_calib_complete);
+                     || !o_calib_complete;
     end
 
     // ── Sequential block ──
@@ -1172,9 +1171,7 @@ module ddr4_controller #(
             // takes over cmd_d directly while pause_counter is held.
             // See SPEC §9.2 for state descriptions.
             // ═══════════════════════════════════════════════════════════
-            if (SKIP_CALIB) begin
-                o_calib_complete <= reset_done;
-            end else begin
+            begin
                 if (calib_timer != 0)
                     calib_timer <= calib_timer - 1'b1;
                 if (calib_rr_timer != 0)
@@ -1625,7 +1622,6 @@ module ddr4_controller #(
 
         $display("── Sim Flags ──");
         $display("  MICRON_SIM            = %0d", MICRON_SIM);
-        $display("  SKIP_CALIB            = %0d", SKIP_CALIB);
         $display("══════════════════════════════════════════════════════════════");
     end
 `endif
