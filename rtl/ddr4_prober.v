@@ -64,8 +64,10 @@ module ddr4_prober #(
     input  wire                     i_wb_stall,
     input  wire                     i_wb_ack,
     input  wire [WB_DATA_BITS-1:0]  i_wb_data,
-    // Debug CSR read port
+    // Debug CSR port
     input  wire [3:0]               i_csr_sel,
+    input  wire                     i_csr_we,
+    input  wire [31:0]              i_csr_wdata,
     output wire [31:0]              o_csr_data,
     // Status from controller
     input  wire [3:0]               i_calib_state,
@@ -105,6 +107,22 @@ module ddr4_prober #(
     // ═══════════════════════════════════════════════════════════════════
     generate if (BIST_MODE != 0) begin : gen_bist
 
+        reg bist_csr_start_r, bist_csr_start_d;
+        always @(posedge i_clk) begin
+            if (!i_rst_n) begin
+                bist_csr_start_r <= 1'b0;
+                bist_csr_start_d <= 1'b0;
+            end else begin
+                bist_csr_start_d <= bist_csr_start_r;
+                if (i_csr_we && i_csr_sel == 4'hC && i_csr_wdata[0])
+                    bist_csr_start_r <= 1'b1;
+                else
+                    bist_csr_start_r <= 1'b0;
+            end
+        end
+
+        wire bist_start_any = i_start || bist_csr_start_r || bist_csr_start_d;
+
         reg [2:0] bist_state;
         reg [BIST_ADDR_BITS-1:0] write_addr;
         reg [BIST_ADDR_BITS-1:0] read_addr;
@@ -121,7 +139,7 @@ module ddr4_prober #(
         reg [WB_DATA_BITS-1:0] wb_data_r;
 
         // Outstanding request tracking for WB pipelining
-        reg [3:0] outstanding;
+        reg [4:0] outstanding;
         reg [8:0] wr_acks_pending;
 
         // Pattern generation — deterministic from address (XOR-fold full width)
@@ -219,7 +237,7 @@ module ddr4_prober #(
                 case (bist_state)
                     BIST_IDLE: begin
                         bist_reset_req_r <= 1'b0;
-                        if (i_start && i_calib_complete) begin
+                        if (bist_start_any && i_calib_complete) begin
                             `ifndef YOSYS
                             $display("[%0t] BIST START: first wr data=%0h",
                                 $realtime, gen_pattern({BIST_ADDR_BITS{1'b0}}));
@@ -359,7 +377,7 @@ module ddr4_prober #(
                     end
 
                     BIST_DONE: begin
-                        if (i_start) begin
+                        if (bist_start_any) begin
                             bist_state <= BIST_IDLE;
                             bist_reset_req_r <= 1'b0;
                         end
@@ -419,7 +437,6 @@ module ddr4_prober #(
                                     i_calib_state,
                                     i_phy_state};
                 4'h1: csr_data_r = {{(32-NUM_BANKS){1'b0}}, i_bank_status};
-                4'h2: csr_data_r = 32'd0; // reserved (bank row — complex to route)
                 4'h3: csr_data_r = o_correct_count;
                 4'h4: csr_data_r = o_error_count;
                 4'h5: begin
@@ -444,10 +461,9 @@ module ddr4_prober #(
                                       i_phy_wl_tap[17:9],
                                       i_phy_idelay_center[17:9]};
                 end
-                4'h8: csr_data_r = 32'd0; // perf: stall count (stub V1)
-                4'h9: csr_data_r = 32'd0; // perf: refresh collision (stub V1)
                 4'hA: csr_data_r = {24'd0, BYTE_LANES[3:0], 2'd0, BIST_MODE};
                 4'hB: csr_data_r = {16'd0, 8'd0, 8'd1}; // version 1.0
+                4'hC: csr_data_r = 32'd0; // write-only control register
                 default: csr_data_r = 32'd0;
             endcase
         end

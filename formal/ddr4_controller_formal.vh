@@ -6,8 +6,8 @@
 //   2. CKE/ODT/RESET_N all-phase consistency
 //   3. Command slot mutual exclusivity
 //   4. Zero-bubble stall (no unnecessary stall)
-//   5. Pipeline occupancy (mini_fifo oracle) — not k-induction provable (registered cmd_d)
-//   6. Pipeline data integrity (f_addr_decode cross-check) — not k-induction provable
+//   5. Pipeline occupancy (mini_fifo oracle)
+//   6. Pipeline data integrity (mini_fifo + f_addr_decode cross-check)
 //   6b. DDR4 command BG/BA integrity (WR/RD)
 //   7. BG counter gating (anyconst)
 //   8. Bank status (WR/RD only to active banks)
@@ -25,7 +25,7 @@
 //  16. Write ACK correctness
 //  17. rddata_en / wrdata_en pipeline correctness
 //  18. f_outstanding induction invariant (links fwb_slave to pipeline)
-//  19. Bounded stall / ACK latency (deferred — exceeds depth 8)
+//  19. Bounded stall / ACK latency (ifdef FORMAL_BOUNDED_STALL, depth 28)
 //
 // Properties added in Phase 6 audit:
 //  20. Command encoding — RAS_n / CAS_n / WE_n correctness (WR/RD/PRE)
@@ -61,16 +61,37 @@ end
 
 // ═══════════════════════════════════════════════════════════════════
 // 1. Wishbone B4 Protocol (ZipCPU fwb_slave)
-// F_MAX_STALL=0 / F_MAX_ACK_DELAY=0: no bounded latency in Phase 4C.
-// Phase 5 adds bounded-latency parameters.
+// F_MAX_STALL=0 / F_MAX_ACK_DELAY=0 unless FORMAL_BOUNDED_STALL is
+// defined, in which case Prop 19's computed bounds are passed.
 // ═══════════════════════════════════════════════════════════════════
+
+// ── Prop 19 bounded-stall localparams (must precede fwb_slave) ──
+`ifdef FORMAL_BOUNDED_STALL
+localparam F_MAX_STALL =
+    max_fn(WRITE_TO_PRECHARGE_DELAY, READ_TO_PRECHARGE_DELAY) + 1
+    + max_fn(max_fn(PRECHARGE_TO_ACTIVATE_DELAY, MAX_RRD_DELAY),
+             TFAW_CYCLES) + 1
+    + max_fn(ACTIVATE_TO_READWRITE_DELAY,
+             max_fn(CAS_TO_CAS_DELAY_SAME_BG, WRITE_TO_READ_DELAY_SAME_BG)) + 1;
+localparam F_MAX_ACK_DELAY = 0;
+localparam F_DLYBITS = $clog2(F_MAX_STALL + 1);
+wire [F_DLYBITS-1:0] f_stall_count_w;
+`else
+wire [1:0] f_stall_count_w;
+`endif
+
 wire [3:0] f_nreqs, f_nacks, f_outstanding;
 
 fwb_slave #(
     .AW(WB_ADDR_BITS),
     .DW(WB_DATA_BITS),
+`ifdef FORMAL_BOUNDED_STALL
+    .F_MAX_STALL(F_MAX_STALL),
+    .F_MAX_ACK_DELAY(F_MAX_ACK_DELAY),
+`else
     .F_MAX_STALL(0),
     .F_MAX_ACK_DELAY(0),
+`endif
     .F_LGDEPTH(4)
 ) fwb (
     .i_clk(i_controller_clk),
@@ -87,7 +108,8 @@ fwb_slave #(
     .i_wb_err(1'b0),
     .f_nreqs(f_nreqs),
     .f_nacks(f_nacks),
-    .f_outstanding(f_outstanding)
+    .f_outstanding(f_outstanding),
+    .f_stall_count(f_stall_count_w)
 );
 
 // Induction invariant: f_outstanding == pipeline occupancy + in-flight ACKs.
@@ -101,6 +123,9 @@ fwb_slave #(
 //   write_ack_q:    WR command fired, ACK pending (1 cycle)
 //   rddata_en_pipe_q: RD command fired, waiting for DFI rddata_valid
 //   read_ack_q:     rddata_valid received, ACK pending (1 cycle)
+// f_outstanding is a counter INSIDE fwb_slave — it has no structural
+// link to the pipeline registers. The solver can pick arbitrary initial
+// values for both. Must remain assume (base case proves from reset).
 always @* begin
     if (reset_done && i_wb_cyc && i_rst_n)
         assume(f_outstanding ==
@@ -117,13 +142,11 @@ end
 // sequential evaluation (f_past_valid) to avoid spurious induction
 // failures from arbitrary initial register state.
 // ═══════════════════════════════════════════════════════════════════
-// cmd_d is a register array — the sequential block always writes all 4 slots
-// with identical CKE/ODT/RESET_N. This MUST be an assume (not assert) for
-// k-induction: the solver can pick arbitrary initial cmd_d values where
-// slots disagree, and no other property constrains per-slot consistency.
-// The sequential block enforces consistency every cycle, and the basecase
-// proves it holds from reset for 8 cycles. The DFI output asserts below
-// verify the registered outputs are consistent one cycle later.
+// cmd_d is a register array — Yosys converts it to individual registers.
+// The scheduler reconstructs full command words for active slots, and
+// the memory-to-register decomposition prevents the solver from seeing
+// the structural identity. Must remain assume (base case proves it,
+// and the DFI output asserts below verify the registered outputs).
 always @* begin
     if (i_rst_n) begin
         assume(cmd_d[0][CMD_CKE] == cmd_d[1][CMD_CKE]);
@@ -174,12 +197,12 @@ end
 // ═══════════════════════════════════════════════════════════════════
 // 4. Zero-Bubble Stall
 // During normal operation (reset_done, not refresh, calibration done),
-// stall must be LOW whenever stage1 is free. SKIP_CALIB=0 adds a
+// stall must be LOW whenever stage1 is free. Calibration adds a
 // stall term until o_calib_complete — guarded here so the property
 // only fires after training completes.
 // ═══════════════════════════════════════════════════════════════════
 always @* begin
-    if (reset_done && !refresh_active && (SKIP_CALIB || o_calib_complete)) begin
+    if (reset_done && !refresh_active && o_calib_complete) begin
         if (!stage1_pending)
             assert(!o_wb_stall);
     end
@@ -193,7 +216,7 @@ always @(posedge i_controller_clk) begin
         && $past(stage1_pending) && $past(stage2_update)
         && $past(reset_done) && reset_done
         && !$past(refresh_active) && !refresh_active
-        && (SKIP_CALIB || ($past(o_calib_complete) && o_calib_complete))) begin
+        && $past(o_calib_complete) && o_calib_complete) begin
         // stage1 should have moved to stage2 (unless wb_accept refilled it)
         assert(stage2_pending);
     end
@@ -206,8 +229,11 @@ end
 // Without this, the solver constructs unreachable states where the
 // training pump and post-init scheduler both fire simultaneously.
 // ═══════════════════════════════════════════════════════════════════
+// reset_done and calib_state are independent registers — the FSM
+// transition from training to DONE spans many more cycles than depth 8.
+// Must remain assume (base case proves from reset).
 always @* begin
-    if (i_rst_n && !SKIP_CALIB) begin
+    if (i_rst_n) begin
         if (calib_state != CALIB_IDLE && calib_state != CALIB_DONE
             && calib_state != CALIB_ERROR && calib_state != CALIB_WL_EXIT)
             assume(!reset_done);
@@ -215,15 +241,177 @@ always @* begin
 end
 
 // ═══════════════════════════════════════════════════════════════════
-// 5–6. Pipeline Occupancy + Data Integrity
-// These properties use formal-only shadow registers that require
-// induction strengthening beyond what k-induction at depth 8 can
-// achieve (registered cmd_d design, unlike UberDDR3's combinational
-// cmd_d). Deferred to Phase 5 where timing assertions add enough
-// state constraints for induction, and multi-config sweep provides
-// additional coverage. Verified by simulation in Phase 4B (5-phase
-// test with all scheduler paths).
+// 5–6. Pipeline Occupancy + Data Integrity (mini_fifo oracle)
+//
+// Shadow FIFO independently tracks WB requests through the 2-stage
+// pipeline. Write to FIFO on wb_accept, read on sched_write/sched_read.
+// Proves: (a) pipeline never loses or duplicates requests (Prop 5),
+//         (b) address/direction preserved through pipeline (Prop 6).
+//
+// Same approach as UberDDR3 (ddr3_controller.v L4717–4800). DDR4's
+// registered cmd_d requires induction-strengthening invariants
+// (assumes) to tie FIFO data to pipeline register data, following
+// the same pattern as Prop 18 (f_outstanding) and Prop 2
+// (CKE/ODT consistency). Base case proves all invariants from reset.
 // ═══════════════════════════════════════════════════════════════════
+
+// ── mini_fifo instantiation ──
+localparam F_PIPE_DATA_WIDTH = WB_ADDR_BITS + 1;
+reg f_pipe_write, f_pipe_read;
+reg [F_PIPE_DATA_WIDTH-1:0] f_pipe_wdata;
+wire f_pipe_empty, f_pipe_full;
+wire [F_PIPE_DATA_WIDTH-1:0] f_pipe_rdata;
+wire [F_PIPE_DATA_WIDTH-1:0] f_pipe_rdata_next;
+
+always @* begin
+    f_pipe_write = wb_accept;
+    f_pipe_wdata = {i_wb_addr, i_wb_we};
+    f_pipe_read  = (sched_write || sched_read)
+                   && reset_done && o_calib_complete;
+end
+
+mini_fifo #(
+    .FIFO_WIDTH(1),
+    .DATA_WIDTH(F_PIPE_DATA_WIDTH)
+) f_pipeline_fifo (
+    .i_clk(i_controller_clk),
+    .i_rst_n(i_rst_n),
+    .read_fifo(f_pipe_read),
+    .write_fifo(f_pipe_write),
+    .empty(f_pipe_empty),
+    .full(f_pipe_full),
+    .write_data(f_pipe_wdata),
+    .read_data(f_pipe_rdata),
+    .read_data_next(f_pipe_rdata_next)
+);
+
+// ── f_addr_decode — independent address decode of FIFO entries ──
+wire                       f_pipe_we   = f_pipe_rdata[0];
+wire [WB_ADDR_BITS-1:0]    f_pipe_addr = f_pipe_rdata[F_PIPE_DATA_WIDTH-1:1];
+wire [BG_BITS+BA_BITS-1:0] f_pipe_bank;
+wire [COL_BITS-1:0]        f_pipe_col;
+wire [ROW_BITS-1:0]        f_pipe_row;
+
+f_addr_decode #(
+    .ADDR_MAPPING(ADDR_MAPPING),
+    .ROW_BITS(ROW_BITS),
+    .BG_BITS(BG_BITS),
+    .BA_BITS(BA_BITS),
+    .COL_BITS(COL_BITS),
+    .COL_LOW(COL_LOW)
+) f_pipe_decode (
+    .wb_addr(f_pipe_addr),
+    .bank(f_pipe_bank),
+    .col(f_pipe_col),
+    .row(f_pipe_row)
+);
+
+wire                       f_pipe_next_we   = f_pipe_rdata_next[0];
+wire [WB_ADDR_BITS-1:0]    f_pipe_next_addr = f_pipe_rdata_next[F_PIPE_DATA_WIDTH-1:1];
+wire [BG_BITS+BA_BITS-1:0] f_pipe_next_bank;
+wire [COL_BITS-1:0]        f_pipe_next_col;
+wire [ROW_BITS-1:0]        f_pipe_next_row;
+
+f_addr_decode #(
+    .ADDR_MAPPING(ADDR_MAPPING),
+    .ROW_BITS(ROW_BITS),
+    .BG_BITS(BG_BITS),
+    .BA_BITS(BA_BITS),
+    .COL_BITS(COL_BITS),
+    .COL_LOW(COL_LOW)
+) f_pipe_next_decode (
+    .wb_addr(f_pipe_next_addr),
+    .bank(f_pipe_next_bank),
+    .col(f_pipe_next_col),
+    .row(f_pipe_next_row)
+);
+
+// ── Init/calibration idle invariant ──
+// During init or calibration, no wb_accept can fire (o_wb_stall is
+// high), so the pipeline and FIFO must be idle. Without this, the
+// solver desynchronizes FIFO/pipeline state during init (when the
+// occupancy assertions are guarded), then triggers a false failure
+// at the init→normal transition.
+// Base case proves this from reset: stage_pending cleared by reset,
+// wb_accept blocked by stall, FIFO starts empty.
+always @* begin
+    if (i_rst_n && (!reset_done || !o_calib_complete)) begin
+        assert(!stage1_pending);
+        assert(!stage2_pending);
+        assert(f_pipe_empty);
+    end
+end
+
+// ── Prop 5: Pipeline occupancy ──
+// Assert: FIFO occupancy tracks pipeline stage pending flags exactly.
+// k-induction provable: FIFO write/read triggers correspond exactly
+// to pipeline entry (wb_accept) and exit (sched_write/read) events.
+always @* begin
+    if (reset_done && o_calib_complete && i_wb_cyc) begin
+        if (f_pipe_full)
+            assert(stage1_pending && stage2_pending);
+        if (f_pipe_empty)
+            assert(!stage1_pending && !stage2_pending);
+        if (!f_pipe_empty && !f_pipe_full)
+            assert(stage1_pending ^ stage2_pending);
+        if (stage1_pending && stage2_pending)
+            assert(f_pipe_full);
+        if (!stage1_pending && !stage2_pending)
+            assert(f_pipe_empty);
+    end
+end
+
+// ── Prop 6: Pipeline data integrity — induction invariants ──
+// FIFO and pipeline receive the same inputs (wb_addr/we on accept)
+// and are consumed by the same events (sched_write/read). The data
+// correlation is maintained structurally:
+//   - wb_accept writes {addr,we} to FIFO and decoded fields to stage1
+//   - stage2_update copies stage1→stage2, FIFO head tracks oldest
+//   - sched fires: FIFO reads head (==stage2), stage2 consumed
+always @* begin
+    if (reset_done && o_calib_complete && i_wb_cyc && !f_pipe_empty) begin
+        if (stage2_pending) begin
+            assert(f_pipe_we   == stage2_we);
+            assert(f_pipe_col  == stage2_col);
+            assert(f_pipe_bank == stage2_bank);
+            assert(f_pipe_row  == stage2_row);
+        end else if (stage1_pending) begin
+            assert(f_pipe_we   == stage1_we);
+            assert(f_pipe_col  == stage1_col);
+            assert(f_pipe_bank == stage1_bank);
+            assert(f_pipe_row  == stage1_row);
+        end
+    end
+end
+
+always @* begin
+    if (reset_done && o_calib_complete && i_wb_cyc && f_pipe_full) begin
+        assert(f_pipe_next_we   == stage1_we);
+        assert(f_pipe_next_col  == stage1_col);
+        assert(f_pipe_next_bank == stage1_bank);
+        assert(f_pipe_next_row  == stage1_row);
+    end
+end
+
+// ── Prop 6: Pipeline data integrity — assertions ──
+// When WR/RD fires, the FIFO oracle confirms the correct request
+// is being consumed: direction (we) and full address must match.
+always @* begin
+    if (reset_done && o_calib_complete && i_wb_cyc && !f_pipe_empty) begin
+        if (sched_write) begin
+            assert(f_pipe_we == 1'b1);
+            assert(f_pipe_col == stage2_col);
+            assert(f_pipe_bank == stage2_bank);
+            assert(f_pipe_row == stage2_row);
+        end
+        if (sched_read) begin
+            assert(f_pipe_we == 1'b0);
+            assert(f_pipe_col == stage2_col);
+            assert(f_pipe_bank == stage2_bank);
+            assert(f_pipe_row == stage2_row);
+        end
+    end
+end
 
 // 6b. DDR4 command output must match stage2 data when WR/RD fires
 // (no shadow registers — uses $past of controller signals directly)
@@ -557,15 +745,116 @@ always @(posedge i_controller_clk) begin
 end
 
 // ═══════════════════════════════════════════════════════════════════
-// 19. Bounded Stall / ACK Latency (deferred)
-// F_MAX_STALL ≈ 22 cycles for DDR4-2400 (row-miss worst case) —
-// exceeds k-induction depth 8, so shadow-counter stall bound is not
-// provable. Stall correctness is guaranteed by:
-//   - Prop 4: zero-bubble stall (no unnecessary stall)
-//   - Prop 11: earliest-issue throughput (scheduler always fires)
-//   - Prop 10: counter gating (commands blocked only by valid delays)
-// F_MAX_ACK_DELAY requires TPHY_RDLAT (Phase 6). Deferred.
+// 19. Bounded Stall / ACK Latency
+// Gated behind FORMAL_BOUNDED_STALL. Requires depth >= F_MAX_STALL.
+//
+// F_MAX_STALL = worst-case row-miss latency:
+//   max(WR→PRE, RD→PRE) + 1
+//   + max(PRE→ACT, tRRD, tFAW) + 1
+//   + max(ACT→RW, CCD_same_BG, WTR_same_BG) + 1
+// Extended from UberDDR3 (ddr3_controller.v L4445) for DDR4
+// bank-group contention (CCD/WTR/RRD) and tFAW.
+//
+// Three layers:
+//  a) Counter-bounding asserts — cap each delay counter (and
+//     tFAW timestamps) at its maximum loaded value.
+//  b) Remaining-stall invariant — f_stall + f_remaining <=
+//     F_MAX_STALL, where f_remaining is an upper bound on
+//     cycles until stage2 clears.  Self-strengthening: each
+//     cycle f_stall +1, f_remaining −1, sum non-increasing.
+//  c) !stage2_pending assume — when no request is active, stall
+//     counter is assumed bounded (same as UberDDR3 L5501–5503).
 // ═══════════════════════════════════════════════════════════════════
+`ifdef FORMAL_BOUNDED_STALL
+(* keep *) wire [$clog2(F_MAX_STALL+1):0] f_max_stall_w = F_MAX_STALL;
+
+// ── Stimulus constraint: no WB requests during init/refresh ──
+always @* begin
+    if (!reset_done || !o_calib_complete || refresh_active)
+        assume(!i_wb_stb);
+end
+
+// ── 19a. Counter-bounding asserts ──
+// Each counter is loaded with at most MAX_*_DELAY and decrements
+// to zero. Passes induction at depth 1: counter <= MAX at cycle k
+// → decremented (still <= MAX) or reloaded (<= MAX) at cycle k+1.
+integer f_cb;
+always @* begin
+    if (i_rst_n && reset_done && o_calib_complete) begin
+        for (f_cb = 0; f_cb < NUM_BANKS; f_cb = f_cb + 1) begin
+            assert(delay_before_precharge_counter_q[f_cb] <= MAX_PRECHARGE_DELAY);
+            assert(delay_before_activate_counter_q[f_cb]  <= MAX_ACTIVATE_DELAY);
+            assert(delay_before_write_counter_q[f_cb]     <= MAX_WRITE_DELAY);
+            assert(delay_before_read_counter_q[f_cb]      <= MAX_READ_DELAY);
+        end
+        for (f_cb = 0; f_cb < NUM_BG; f_cb = f_cb + 1) begin
+            assert(ccd_counter_q[f_cb] <= MAX_CCD_DELAY);
+            assert(wtr_counter_q[f_cb] <= MAX_WTR_DELAY);
+            assert(rrd_counter_q[f_cb] <= MAX_RRD_DELAY);
+        end
+        for (f_cb = 0; f_cb < 4; f_cb = f_cb + 1) begin
+            assert(activate_timestamp_q[f_cb] <= TFAW_CYCLES);
+        end
+    end
+end
+
+// ── 19b. Remaining-stall invariant ──
+// f_remaining = upper bound on cycles until stage2 clears (WR/RD
+// fires → stage2_update). Computed per bank state:
+//   Row miss  : precharge wait + PRE + max ACT-phase + ACT + max RW-phase + cmd
+//   Inactive  : max(activate, rrd, tFAW) + ACT + max RW-phase + cmd
+//   Row hit   : max(write/read, ccd, wtr) + cmd
+//
+// Self-strengthening: each cycle f_stall increments by 1 and
+// f_remaining decrements by at least 1 (all counters decrement,
+// scheduler actions load bounded values). At stall start
+// f_stall=0 and f_remaining <= F_MAX_STALL, so the sum never
+// exceeds F_MAX_STALL.
+localparam MAX_ACT_EXT = max_fn(max_fn(PRECHARGE_TO_ACTIVATE_DELAY,
+                                       MAX_RRD_DELAY),
+                                TFAW_CYCLES);
+localparam MAX_RW_EXT  = max_fn(max_fn(MAX_WRITE_DELAY, MAX_READ_DELAY),
+                                max_fn(MAX_CCD_DELAY, MAX_WTR_DELAY));
+
+reg [$clog2(F_MAX_STALL+1):0] f_remaining;
+always @* begin
+    f_remaining = 0;
+    if (stage2_pending) begin
+        if (bank_status_q[stage2_bank]
+            && bank_active_row_q[stage2_bank] != stage2_row) begin
+            f_remaining = delay_before_precharge_counter_q[stage2_bank]
+                          + 1 + MAX_ACT_EXT
+                          + 1 + MAX_RW_EXT
+                          + 1;
+        end else if (!bank_status_q[stage2_bank]) begin
+            f_remaining = max_fn(
+                            max_fn(delay_before_activate_counter_q[stage2_bank],
+                                   rrd_counter_q[stage2_bg]),
+                            activate_timestamp_q[activate_index_q])
+                          + 1 + MAX_RW_EXT
+                          + 1;
+        end else begin
+            f_remaining = max_fn(
+                            stage2_we
+                              ? delay_before_write_counter_q[stage2_bank]
+                              : delay_before_read_counter_q[stage2_bank],
+                            max_fn(ccd_counter_q[stage2_bg],
+                                   stage2_we ? 0
+                                             : wtr_counter_q[stage2_bg]))
+                          + 1;
+        end
+    end
+end
+
+always @* begin
+    if (i_rst_n && reset_done && o_calib_complete && i_wb_cyc) begin
+        if (stage2_pending && i_wb_stb && o_wb_stall)
+            assert(f_stall_count_w + f_remaining <= F_MAX_STALL);
+        if (!stage2_pending)
+            assume(f_stall_count_w < F_MAX_STALL);
+    end
+end
+`endif
 
 // ═══════════════════════════════════════════════════════════════════
 // 20. Command Encoding — RAS_n / CAS_n / WE_n correctness

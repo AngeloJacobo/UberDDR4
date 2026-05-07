@@ -81,12 +81,8 @@ module ddr4_top #(
     output wire [BYTE_LANES-1:0] o_ddr4_dm_n,
     inout wire [DQ_BITS*BYTE_LANES-1:0] io_ddr4_dq,
     inout wire [BYTE_LANES-1:0] io_ddr4_dqs_p, io_ddr4_dqs_n,
-    // BIST (Phase 8)
-    input wire i_bist_start,
-    output wire o_bist_busy, o_bist_pass, o_bist_fail,
-    output wire [31:0] o_bist_correct, o_bist_error,
     // Status
-    output wire o_calib_complete, o_calib_error
+    output wire o_init_done, o_init_failed
 );
 
     // ═══════════════════════════════════════════════════════════════════
@@ -209,7 +205,7 @@ module ddr4_top #(
                                      : ctrl_wb_rdata;
 
     // ═══════════════════════════════════════════════════════════════════
-    // §5 — BIST Auto-Start + Manual Trigger
+    // §5 — BIST Auto-Start + Init Status
     // ═══════════════════════════════════════════════════════════════════
     reg calib_complete_q;
     always @(posedge i_controller_clk) begin
@@ -220,16 +216,31 @@ module ddr4_top #(
     end
 
     wire bist_auto_start = calib_complete && !calib_complete_q && (BIST_MODE != 0);
-    wire bist_start      = bist_auto_start || i_bist_start;
+    wire bist_start      = bist_auto_start;
 
-    // Status outputs
-    assign o_calib_complete = calib_complete;
-    assign o_calib_error    = calib_error;
-    assign o_bist_busy      = prober_bist_busy;
-    assign o_bist_pass      = prober_bist_pass;
-    assign o_bist_fail      = prober_bist_fail;
-    assign o_bist_correct   = prober_correct;
-    assign o_bist_error     = prober_error;
+    wire csr_we = csr_ready && i_wb_we;
+
+    reg init_done_q, init_failed_q;
+    always @(posedge i_controller_clk) begin
+        if (!i_rst_n) begin
+            init_done_q   <= 1'b0;
+            init_failed_q <= 1'b0;
+        end else begin
+            if (calib_error)
+                init_failed_q <= 1'b1;
+            if (!init_done_q && !init_failed_q) begin
+                if (calib_complete && (BIST_MODE == 0))
+                    init_done_q <= 1'b1;
+                if (calib_complete && BIST_MODE != 0 && prober_bist_pass)
+                    init_done_q <= 1'b1;
+                if (calib_complete && BIST_MODE != 0 && prober_bist_fail)
+                    init_failed_q <= 1'b1;
+            end
+        end
+    end
+
+    assign o_init_done   = init_done_q;
+    assign o_init_failed = init_failed_q;
 
     // ═══════════════════════════════════════════════════════════════════
     // §6 — Controller Instantiation
@@ -418,6 +429,8 @@ module ddr4_top #(
         .i_wb_ack(bist_wb_ack),
         .i_wb_data(ctrl_wb_rdata),
         .i_csr_sel(i_wb_addr[3:0]),
+        .i_csr_we(csr_we),
+        .i_csr_wdata(i_wb_data[31:0]),
         .o_csr_data(prober_csr_data),
         .i_calib_state(ctrl_calib_state),
         .i_stage1_pending(ctrl_stage1_pending),

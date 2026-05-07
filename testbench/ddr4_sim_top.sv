@@ -124,7 +124,7 @@ module ddr4_sim_top;
     wire [BYTE_LANES-1:0] ddr4_dqs_p, ddr4_dqs_n;
 
     // ═══════════════════════════════════════════════════════════════════
-    // Wishbone / BIST Tie-Offs (static zero, init to 'z per convention)
+    // Wishbone Tie-Offs (init to 'z per convention)
     // ═══════════════════════════════════════════════════════════════════
     reg                      wb_cyc;
     reg                      wb_stb;
@@ -135,14 +135,8 @@ module ddr4_sim_top;
     wire                     wb_stall;
     wire                     wb_ack;
     wire [WB_DATA_BITS-1:0]  wb_rdata;
-    reg                      bist_start;
-    wire                     calib_complete;
-    wire                     calib_error;
-    wire                     bist_busy;
-    wire                     bist_pass;
-    wire                     bist_fail;
-    wire [31:0]              bist_correct;
-    wire [31:0]              bist_error;
+    wire                     init_done;
+    wire                     init_failed;
 
     initial begin
         wb_cyc     = 'z;
@@ -151,7 +145,6 @@ module ddr4_sim_top;
         wb_addr    = 'z;
         wb_data    = 'z;
         wb_sel     = 'z;
-        bist_start = 'z;
         #1;
         wb_cyc     = 1'b0;
         wb_stb     = 1'b0;
@@ -159,7 +152,6 @@ module ddr4_sim_top;
         wb_addr    = {EXT_ADDR_BITS{1'b0}};
         wb_data    = {WB_DATA_BITS{1'b0}};
         wb_sel     = {WB_SEL_BITS{1'b0}};
-        bist_start = 1'b0;
     end
 
     // ═══════════════════════════════════════════════════════════════════
@@ -208,15 +200,18 @@ module ddr4_sim_top;
         .io_ddr4_dq        (ddr4_dq),
         .io_ddr4_dqs_p     (ddr4_dqs_p),
         .io_ddr4_dqs_n     (ddr4_dqs_n),
-        .i_bist_start      (bist_start),
-        .o_bist_busy       (bist_busy),
-        .o_bist_pass       (bist_pass),
-        .o_bist_fail       (bist_fail),
-        .o_bist_correct    (bist_correct),
-        .o_bist_error      (bist_error),
-        .o_calib_complete  (calib_complete),
-        .o_calib_error     (calib_error)
+        .o_init_done       (init_done),
+        .o_init_failed     (init_failed)
     );
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Internal Monitoring Wires (hierarchical refs for debug display)
+    // ═══════════════════════════════════════════════════════════════════
+    wire calib_complete_int = u_dut.calib_complete;
+    wire bist_busy_int      = u_dut.prober_bist_busy;
+    wire bist_fail_int      = u_dut.prober_bist_fail;
+    wire [31:0] bist_correct_int = u_dut.prober_correct;
+    wire [31:0] bist_error_int   = u_dut.prober_error;
 
     // ═══════════════════════════════════════════════════════════════════
     // Micron DDR4 x8 Models — direct instantiation (no wrapper module)
@@ -467,19 +462,19 @@ module ddr4_sim_top;
         end
     end
 
-    // Calibration status monitor
+    // Init status monitor
     reg calib_complete_seen;
-    reg calib_error_seen;
-    initial begin calib_complete_seen = 1'b0; calib_error_seen = 1'b0; end
+    reg init_failed_seen;
+    initial begin calib_complete_seen = 1'b0; init_failed_seen = 1'b0; end
 
     always @(posedge controller_clk) begin
-        if (rst_n && calib_complete && !calib_complete_seen) begin
-            $display("[%0t] CALIB_COMPLETE asserted", $realtime);
+        if (rst_n && calib_complete_int && !calib_complete_seen) begin
+            $display("[%0t] CALIB_COMPLETE asserted (internal)", $realtime);
             calib_complete_seen <= 1'b1;
         end
-        if (rst_n && calib_error && !calib_error_seen) begin
-            $display("[%0t] CALIB_ERROR asserted — training timed out", $realtime);
-            calib_error_seen <= 1'b1;
+        if (rst_n && init_failed && !init_failed_seen) begin
+            $display("[%0t] INIT_FAILED asserted", $realtime);
+            init_failed_seen <= 1'b1;
         end
     end
 
@@ -527,7 +522,7 @@ module ddr4_sim_top;
     initial calib_results_checked = 1'b0;
 
     always @(posedge controller_clk) begin
-        if (calib_complete && !calib_results_checked) begin
+        if (calib_complete_int && !calib_results_checked) begin
             calib_results_checked <= 1'b1;
             $display("[%0t] ═══ CALIBRATION RESULTS ═══", $realtime);
             $display("[%0t]   FLY_BY_DELAY = %0d ps", $realtime, FLY_BY);
@@ -557,23 +552,23 @@ module ddr4_sim_top;
     end
 
     // ═══════════════════════════════════════════════════════════════════
-    // BIST Completion Monitor
+    // BIST Completion Monitor (uses hierarchical refs for display)
     // ═══════════════════════════════════════════════════════════════════
     reg bist_was_busy;
     reg bist_done_seen;
     initial begin bist_was_busy = 1'b0; bist_done_seen = 1'b0; end
 
     always @(posedge controller_clk) begin
-        if (bist_busy)
+        if (bist_busy_int)
             bist_was_busy <= 1'b1;
-        if (bist_was_busy && !bist_busy && !bist_done_seen) begin
+        if (bist_was_busy && !bist_busy_int && !bist_done_seen) begin
             bist_done_seen <= 1'b1;
-            if (!bist_fail)
+            if (!bist_fail_int)
                 $display("[%0t] BIST RESULT: PASS — correct=%0d errors=%0d",
-                    $realtime, bist_correct, bist_error);
+                    $realtime, bist_correct_int, bist_error_int);
             else
                 $display("[%0t] BIST RESULT: FAIL — correct=%0d errors=%0d",
-                    $realtime, bist_correct, bist_error);
+                    $realtime, bist_correct_int, bist_error_int);
         end
     end
 
@@ -584,7 +579,7 @@ module ddr4_sim_top;
     initial begin dfi_wr_seq = 0; dfi_rd_seq = 0; end
 
     always @(posedge controller_clk) begin
-        if (bist_busy) begin
+        if (bist_busy_int) begin
             if (|u_dut.u_controller.o_dfi_wrdata_en) begin
                 $display("[DBG-WR] #%0d p2rise=%04h full=%0h",
                     dfi_wr_seq,
@@ -642,6 +637,16 @@ module ddr4_sim_top;
                                     ROW2_BG3 = (2 << 10) | 3,
                                     ROW2_BG0_C1 = (2 << 10) | (1 << 2) | 0,
                                     ROW2_BG1_C1 = (2 << 10) | (1 << 2) | 1,
+                                    ROW0_BG0_BA3 = (3 << 8) | 0,
+                                    ROW0_BG1_BA1 = (1 << 8) | 1,
+                                    ROW0_BG1_BA2 = (2 << 8) | 1,
+                                    ROW0_BG1_BA3 = (3 << 8) | 1,
+                                    ROW0_BG2_BA1 = (1 << 8) | 2,
+                                    ROW0_BG2_BA2 = (2 << 8) | 2,
+                                    ROW0_BG2_BA3 = (3 << 8) | 2,
+                                    ROW0_BG3_BA1 = (1 << 8) | 3,
+                                    ROW0_BG3_BA2 = (2 << 8) | 3,
+                                    ROW0_BG3_BA3 = (3 << 8) | 3,
                                     CSR_BASE = 1 << WB_ADDR_BITS;
 
     task wb_write_one(input [EXT_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data);
@@ -725,17 +730,57 @@ module ddr4_sim_top;
         end
     endtask
 
+    task wb_read_check(
+        input [EXT_ADDR_BITS-1:0] addr,
+        input [WB_DATA_BITS-1:0]  expected
+    );
+        reg [WB_DATA_BITS-1:0] captured;
+        begin
+            wb_read_one(addr);
+            wb_stb = 1'b0;
+            while (!wb_ack) @(posedge controller_clk);
+            captured = wb_rdata;
+            wb_idle;
+            repeat (5) @(posedge controller_clk);
+            if (captured === expected) begin
+                $display("[%0t]   RD_CHK PASS: addr=0x%0h", $realtime, addr);
+            end else begin
+                $display("[%0t]   RD_CHK FAIL: addr=0x%0h exp=0x%0h got=0x%0h",
+                         $realtime, addr, expected, captured);
+                rd_err_count = rd_err_count + 1;
+            end
+        end
+    endtask
+
+    task wb_write_masked(
+        input [EXT_ADDR_BITS-1:0] addr,
+        input [WB_DATA_BITS-1:0]  data,
+        input [WB_SEL_BITS-1:0]   sel
+    );
+        begin
+            wb_stb = 1'b0;
+            @(posedge controller_clk);
+            while (wb_stall) @(posedge controller_clk);
+            wb_cyc  = 1'b1;
+            wb_stb  = 1'b1;
+            wb_we   = 1'b1;
+            wb_addr = addr;
+            wb_data = data;
+            wb_sel  = sel;
+            @(posedge controller_clk);
+        end
+    endtask
+
     integer wb_write_count;
     initial wb_write_count = 0;
 
     initial begin
-        wait (calib_complete_seen);
-        repeat (10) @(posedge controller_clk);
-        if (bist_busy || bist_was_busy) begin
-            $display("[%0t] Waiting for BIST to complete...", $realtime);
-            wait (bist_done_seen);
+        wait (init_done || init_failed);
+        if (init_failed) begin
+            $display("[%0t] FATAL: o_init_failed asserted!", $realtime);
+            $finish;
         end
-        @(posedge controller_clk);
+        repeat (10) @(posedge controller_clk);
         while (wb_stall) @(posedge controller_clk);
 
         // ── Phase A: Cold writes to 4 idle banks (ACT → WR) ──
@@ -750,6 +795,11 @@ module ddr4_sim_top;
         wb_write_one(ROW0_BG3, 128'h0D);
         $display("[%0t]   write BG3/BA0/row0", $realtime);
         drain_pipeline;
+        $display("[%0t]   Readback Phase A:", $realtime);
+        wb_read_check(ROW0_BG0, 128'h0A);
+        wb_read_check(ROW0_BG1, 128'h0B);
+        wb_read_check(ROW0_BG2, 128'h0C);
+        wb_read_check(ROW0_BG3, 128'h0D);
 
         // ── Phase B: Bank hits — same bank, same row still open (WR only) ──
         test_phase = "PHASE_B";
@@ -763,6 +813,11 @@ module ddr4_sim_top;
         wb_write_one(ROW0_BG3, 128'h1D);
         $display("[%0t]   write BG3/BA0/row0 (hit)", $realtime);
         drain_pipeline;
+        $display("[%0t]   Readback Phase B:", $realtime);
+        wb_read_check(ROW0_BG0, 128'h1A);
+        wb_read_check(ROW0_BG1, 128'h1B);
+        wb_read_check(ROW0_BG2, 128'h1C);
+        wb_read_check(ROW0_BG3, 128'h1D);
 
         // ── Phase C: Row miss — same bank, different row (PRE → ACT → WR) ──
         test_phase = "PHASE_C";
@@ -776,6 +831,11 @@ module ddr4_sim_top;
         wb_write_one(ROW1_BG3, 128'h2D);
         $display("[%0t]   write BG3/BA0/row1 (miss)", $realtime);
         drain_pipeline;
+        $display("[%0t]   Readback Phase C:", $realtime);
+        wb_read_check(ROW1_BG0, 128'h2A);
+        wb_read_check(ROW1_BG1, 128'h2B);
+        wb_read_check(ROW1_BG2, 128'h2C);
+        wb_read_check(ROW1_BG3, 128'h2D);
 
         // ── Phase D: Wait for refresh (PRE ALL closes all banks), then re-access ──
         test_phase = "WAIT_REF";
@@ -796,6 +856,11 @@ module ddr4_sim_top;
         wb_write_one(ROW0_BG3, 128'h3D);
         $display("[%0t]   write BG3/BA0/row0 (post-refresh)", $realtime);
         drain_pipeline;
+        $display("[%0t]   Readback Phase D:", $realtime);
+        wb_read_check(ROW0_BG0, 128'h3A);
+        wb_read_check(ROW0_BG1, 128'h3B);
+        wb_read_check(ROW0_BG2, 128'h3C);
+        wb_read_check(ROW0_BG3, 128'h3D);
 
         // ── Phase E: Same-BG different-bank writes (tRRD_L / tCCD_L stress) ──
         test_phase = "PHASE_E";
@@ -807,10 +872,12 @@ module ddr4_sim_top;
         wb_write_one(ROW0_BG0_BA2, 128'h4C);
         $display("[%0t]   write BG0/BA2/row0 (same BG, diff bank)", $realtime);
         drain_pipeline;
+        $display("[%0t]   Readback Phase E:", $realtime);
+        wb_read_check(ROW0_BG0,     128'h4A);
+        wb_read_check(ROW0_BG0_BA1, 128'h4B);
+        wb_read_check(ROW0_BG0_BA2, 128'h4C);
 
-        // ── Phase F: Read requests (exercises sched_read path) ──
-        // Reads won't return data (no PHY data path yet), but the scheduler
-        // issues RD commands and the Micron model validates timing.
+        // ── Phase F: Read + data verify (exercises sched_read path) ──
         test_phase = "PHASE_F";
         $display("[%0t] ═══ Phase F: Read requests (ACT→RD, bank hit RD) ═══", $realtime);
         wb_write_one(ROW0_BG0, 128'h5A);
@@ -818,15 +885,11 @@ module ddr4_sim_top;
         wb_write_one(ROW0_BG1, 128'h5B);
         $display("[%0t]   write BG1/BA0/row0 (open bank)", $realtime);
         drain_pipeline;
-        wb_read_one(ROW0_BG0);
-        $display("[%0t]   read BG0/BA0/row0 (bank hit RD)", $realtime);
-        wb_read_one(ROW0_BG1);
-        $display("[%0t]   read BG1/BA0/row0 (bank hit RD)", $realtime);
-        wb_read_one(ROW0_BG2);
-        $display("[%0t]   read BG2/BA0/row0 (cold bank ACT→RD)", $realtime);
-        wb_read_one(ROW0_BG3);
-        $display("[%0t]   read BG3/BA0/row0 (cold bank ACT→RD)", $realtime);
-        drain_pipeline;
+        $display("[%0t]   Readback Phase F (BG0/BG1=hit, BG2/BG3=cold ACT→RD):", $realtime);
+        wb_read_check(ROW0_BG0, 128'h5A);
+        wb_read_check(ROW0_BG1, 128'h5B);
+        wb_read_check(ROW0_BG2, 128'h3C);
+        wb_read_check(ROW0_BG3, 128'h3D);
 
         // ── Phase G: Same-bank rapid re-access (tRC stress: ACT→ACT same bank) ──
         test_phase = "PHASE_G";
@@ -840,6 +903,9 @@ module ddr4_sim_top;
         wb_write_one(ROW0_BG0, 128'h6C);
         $display("[%0t]   write BG0/BA0/row0 (miss → PRE+ACT+WR same bank again)", $realtime);
         drain_pipeline;
+        $display("[%0t]   Readback Phase G:", $realtime);
+        wb_read_check(ROW0_BG0, 128'h6C);
+        wb_read_check(ROW1_BG0, 128'h6B);
 
         // ── Phase H: Write-then-read same BG (tWTR stress) ──
         test_phase = "PHASE_H";
@@ -853,6 +919,9 @@ module ddr4_sim_top;
         wb_read_one(ROW0_BG0);
         $display("[%0t]   read BG0/BA0/row0 (diff BG → tWTR_S applies to BG1)", $realtime);
         drain_pipeline;
+        $display("[%0t]   Readback Phase H:", $realtime);
+        wb_read_check(ROW0_BG0, 128'h7A);
+        wb_read_check(ROW0_BG1, 128'h7B);
 
         // ── Phase I: Write→Read data round-trip verification ──
         test_phase = "PHASE_I";
@@ -930,48 +999,327 @@ module ddr4_sim_top;
             end
         end
 
-        // ── CSR Read Test: read debug registers 0x0–0xB ──
+        // ── Phase K: Read→Write turnaround stress (RD→WR delay) ──
+        test_phase = "PHASE_K";
+        $display("[%0t] ═══ Phase K: Read→Write turnaround (RD→WR delay) ═══", $realtime);
+        wb_write_one(ROW0_BG0, 128'hA0A0_A0A0_A0A0_A0A0_A0A0_A0A0_A0A0_A0A0);
+        wb_write_one(ROW0_BG1, 128'hB0B0_B0B0_B0B0_B0B0_B0B0_B0B0_B0B0_B0B0);
+        drain_pipeline;
+        wb_read_one(ROW0_BG0);
+        $display("[%0t]   read BG0 (loads RD→WR delay on all banks)", $realtime);
+        wb_write_one(ROW0_BG0, 128'hA1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1);
+        $display("[%0t]   write BG0 immediately after read (same BG)", $realtime);
+        wb_write_one(ROW0_BG1, 128'hB1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1);
+        $display("[%0t]   write BG1 immediately after read (diff BG)", $realtime);
+        drain_pipeline;
+        $display("[%0t]   Readback Phase K:", $realtime);
+        wb_read_check(ROW0_BG0, 128'hA1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1);
+        wb_read_check(ROW0_BG1, 128'hB1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1);
+
+        // ── Phase L: Byte-lane masking (DM verification) ──
+        test_phase = "PHASE_L";
+        $display("[%0t] ═══ Phase L: Byte-lane masking (DM verification) ═══", $realtime);
+        begin : phase_l_blk
+            localparam [EXT_ADDR_BITS-1:0] PL_ADDR0 = (5 << 10) | 0;
+            localparam [EXT_ADDR_BITS-1:0] PL_ADDR1 = (5 << 10) | 1;
+
+            wb_write_one(PL_ADDR0, 128'hAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
+            drain_pipeline;
+            wb_write_masked(PL_ADDR0, 128'h5555_5555_5555_5555_5555_5555_5555_5555, 16'h00FF);
+            drain_pipeline;
+            $display("[%0t]   Sub-test 1: sel=0x00FF (lower 8 bytes written)", $realtime);
+            wb_read_check(PL_ADDR0, 128'hAAAA_AAAA_AAAA_AAAA_5555_5555_5555_5555);
+
+            wb_write_one(PL_ADDR1, 128'hCCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC);
+            drain_pipeline;
+            wb_write_masked(PL_ADDR1, 128'h3333_3333_3333_3333_3333_3333_3333_3333, 16'hFF00);
+            drain_pipeline;
+            $display("[%0t]   Sub-test 2: sel=0xFF00 (upper 8 bytes written)", $realtime);
+            wb_read_check(PL_ADDR1, 128'h3333_3333_3333_3333_CCCC_CCCC_CCCC_CCCC);
+
+            wb_write_one(PL_ADDR0, {128{1'b1}});
+            drain_pipeline;
+            wb_write_masked(PL_ADDR0, {128{1'b0}}, 16'h0001);
+            drain_pipeline;
+            $display("[%0t]   Sub-test 3: sel=0x0001 (only byte 0 written)", $realtime);
+            wb_read_check(PL_ADDR0, 128'hFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FF00);
+        end
+
+        // ── Phase M: tFAW stress (5 rapid activates) ──
+        test_phase = "PHASE_M";
+        $display("[%0t] ═══ Phase M: tFAW stress (5 rapid ACTs) ═══", $realtime);
+        begin : phase_m_blk
+            integer ref_start_m;
+            wb_idle;
+            ref_start_m = ref_count;
+            $display("[%0t]   Waiting for refresh to close all banks...", $realtime);
+            wait (ref_count > ref_start_m);
+            @(posedge controller_clk);
+            while (wb_stall) @(posedge controller_clk);
+            $display("[%0t]   5 writes to 5 cold banks:", $realtime);
+            wb_write_one(ROW0_BG0,     128'hFA01);
+            wb_write_one(ROW0_BG1,     128'hFA02);
+            wb_write_one(ROW0_BG2,     128'hFA03);
+            wb_write_one(ROW0_BG3,     128'hFA04);
+            wb_write_one(ROW0_BG0_BA1, 128'hFA05);
+            drain_pipeline;
+            $display("[%0t]   Readback Phase M:", $realtime);
+            wb_read_check(ROW0_BG0,     128'hFA01);
+            wb_read_check(ROW0_BG1,     128'hFA02);
+            wb_read_check(ROW0_BG2,     128'hFA03);
+            wb_read_check(ROW0_BG3,     128'hFA04);
+            wb_read_check(ROW0_BG0_BA1, 128'hFA05);
+        end
+
+        // ── Phase N: Pipeline saturation (32 back-to-back writes) ──
+        test_phase = "PHASE_N";
+        $display("[%0t] ═══ Phase N: Pipeline saturation (32 writes) ═══", $realtime);
+        begin : phase_n_blk
+            integer pn_idx;
+            integer pn_err;
+            reg [WB_DATA_BITS-1:0] pn_exp;
+            reg [WB_DATA_BITS-1:0] pn_captured;
+            pn_err = 0;
+
+            wb_cyc = 1'b1;
+            wb_stb = 1'b1;
+            wb_we  = 1'b1;
+            wb_sel = {WB_SEL_BITS{1'b1}};
+            wb_addr = 27'h2000;
+            wb_data = gen_pattern_tb(8'd0);
+
+            for (pn_idx = 0; pn_idx < 32; pn_idx = pn_idx + 1) begin
+                @(posedge controller_clk);
+                while (wb_stall) @(posedge controller_clk);
+                if (pn_idx < 31) begin
+                    wb_addr = 27'h2000 + pn_idx + 1;
+                    wb_data = gen_pattern_tb(pn_idx[7:0] + 8'd1);
+                end else begin
+                    wb_stb = 1'b0;
+                end
+            end
+            wb_we = 1'b0;
+
+            drain_pipeline;
+
+            for (pn_idx = 0; pn_idx < 32; pn_idx = pn_idx + 1) begin
+                wb_read_one(27'h2000 + pn_idx);
+                wb_stb = 1'b0;
+                while (!wb_ack) @(posedge controller_clk);
+                pn_captured = wb_rdata;
+                wb_idle;
+                repeat (5) @(posedge controller_clk);
+                pn_exp = gen_pattern_tb(pn_idx[7:0]);
+                if (pn_captured !== pn_exp) begin
+                    $display("[%0t]   PHASE_N FAIL: addr=%0d exp=%0h got=%0h",
+                        $realtime, pn_idx, pn_exp, pn_captured);
+                    pn_err = pn_err + 1;
+                end
+            end
+            wb_idle;
+
+            if (pn_err == 0)
+                $display("[%0t] PASS: Phase N — all 32 pipelined write→read checks passed", $realtime);
+            else begin
+                $display("[%0t] FAIL: Phase N — %0d of 32 checks failed", $realtime, pn_err);
+                rd_err_count = rd_err_count + pn_err;
+            end
+        end
+
+        // ── Phase O: Refresh-during-traffic (data integrity across refresh) ──
+        test_phase = "PHASE_O";
+        $display("[%0t] ═══ Phase O: Refresh-during-traffic ═══", $realtime);
+        begin : phase_o_blk
+            integer ref_start_o;
+            integer po_iter;
+            integer po_i;
+            reg [EXT_ADDR_BITS-1:0] po_addr;
+
+            ref_start_o = ref_count;
+            po_iter = 0;
+            $display("[%0t]   Issuing continuous traffic, waiting for 2 refreshes...", $realtime);
+
+            while (ref_count < ref_start_o + 2) begin
+                for (po_i = 0; po_i < 8; po_i = po_i + 1) begin
+                    po_addr = (6 << 10) | ((po_i >> 2) << 8) | (po_i & 3);
+                    wb_write_one(po_addr, gen_pattern_tb(po_i[7:0]));
+                end
+                po_iter = po_iter + 1;
+            end
+            drain_pipeline;
+
+            $display("[%0t]   Traffic complete after %0d iterations, verifying...", $realtime, po_iter);
+            for (po_i = 0; po_i < 8; po_i = po_i + 1) begin
+                po_addr = (6 << 10) | ((po_i >> 2) << 8) | (po_i & 3);
+                wb_read_check(po_addr, gen_pattern_tb(po_i[7:0]));
+            end
+            $display("[%0t]   Refreshes during traffic: %0d",
+                     $realtime, ref_count - ref_start_o);
+        end
+
+        // ── Phase P: Address boundary corners ──
+        test_phase = "PHASE_P";
+        $display("[%0t] ═══ Phase P: Address boundary corners ═══", $realtime);
+        wb_write_read_check((63 << 2) | 3, 128'hBEEF_0001_BEEF_0001_BEEF_0001_BEEF_0001);
+        $display("[%0t]   max col_upper + BG3", $realtime);
+        wb_write_read_check(10'h3FF, 128'hBEEF_0002_BEEF_0002_BEEF_0002_BEEF_0002);
+        $display("[%0t]   addr 1023 (max 10-bit)", $realtime);
+        wb_write_read_check((3 << 10) | (3 << 8) | (63 << 2) | 3,
+            128'hBEEF_0003_BEEF_0003_BEEF_0003_BEEF_0003);
+        $display("[%0t]   row3/BA3/max_col/BG3 (addr 4095)", $realtime);
+
+        // ── Phase Q: Multi-bank-group interleaving (all 16 banks) ──
+        test_phase = "PHASE_Q";
+        $display("[%0t] ═══ Phase Q: Multi-BG interleaving (16 banks) ═══", $realtime);
+        begin : phase_q_blk
+            integer pq_bg, pq_ba;
+            integer pq_err_start;
+            reg [EXT_ADDR_BITS-1:0] pq_addr;
+            reg [WB_DATA_BITS-1:0] pq_data;
+            pq_err_start = rd_err_count;
+
+            for (pq_ba = 0; pq_ba < 4; pq_ba = pq_ba + 1) begin
+                for (pq_bg = 0; pq_bg < 4; pq_bg = pq_bg + 1) begin
+                    pq_addr = (7 << 10) | (pq_ba << 8) | pq_bg;
+                    pq_data = {112'd0, pq_bg[3:0], pq_ba[3:0], 8'hAA};
+                    wb_write_one(pq_addr, pq_data);
+                end
+            end
+            drain_pipeline;
+
+            $display("[%0t]   Readback all 16 banks:", $realtime);
+            for (pq_ba = 0; pq_ba < 4; pq_ba = pq_ba + 1) begin
+                for (pq_bg = 0; pq_bg < 4; pq_bg = pq_bg + 1) begin
+                    pq_addr = (7 << 10) | (pq_ba << 8) | pq_bg;
+                    pq_data = {112'd0, pq_bg[3:0], pq_ba[3:0], 8'hAA};
+                    wb_read_check(pq_addr, pq_data);
+                end
+            end
+
+            if (rd_err_count == pq_err_start)
+                $display("[%0t] PASS: Phase Q — all 16 banks verified", $realtime);
+            else
+                $display("[%0t] FAIL: Phase Q — %0d of 16 bank checks failed",
+                         $realtime, rd_err_count - pq_err_start);
+        end
+
+        // ── CSR Read Test: read debug registers 0x0–0xC + value verification ──
         test_phase = "CSR";
-        $display("[%0t] ═══ CSR Read Test: registers 0x0–0xB ═══", $realtime);
+        $display("[%0t] ═══ CSR Read Test: registers 0x0–0xC ═══", $realtime);
         begin : csr_read_block
             integer csr_idx;
             reg [WB_DATA_BITS-1:0] csr_val;
-            for (csr_idx = 0; csr_idx < 12; csr_idx = csr_idx + 1) begin
+            reg [31:0] csr_vals [0:12];
+            for (csr_idx = 0; csr_idx < 13; csr_idx = csr_idx + 1) begin
                 wb_read_one(CSR_BASE | csr_idx);
                 wb_stb = 1'b0;
                 while (!wb_ack) @(posedge controller_clk);
                 csr_val = wb_rdata;
+                csr_vals[csr_idx] = csr_val[31:0];
                 wb_idle;
                 $display("[%0t]   CSR[0x%0h] = 0x%08h", $realtime, csr_idx, csr_val[31:0]);
                 repeat (2) @(posedge controller_clk);
             end
+
+            if (csr_vals[3] !== 32'd1024) begin
+                $display("[%0t]   CSR FAIL: CSR[3] correct_count=%0d, expected 1024",
+                         $realtime, csr_vals[3]);
+                rd_err_count = rd_err_count + 1;
+            end
+            if (csr_vals[4] !== 32'd0) begin
+                $display("[%0t]   CSR FAIL: CSR[4] error_count=%0d, expected 0",
+                         $realtime, csr_vals[4]);
+                rd_err_count = rd_err_count + 1;
+            end
+            if (csr_vals[5][4] !== 1'b1 || csr_vals[5][5] !== 1'b0 || csr_vals[5][3] !== 1'b0) begin
+                $display("[%0t]   CSR FAIL: CSR[5] status=0x%0h (expected pass=1, fail=0, busy=0)",
+                         $realtime, csr_vals[5]);
+                rd_err_count = rd_err_count + 1;
+            end
+            if (csr_vals[10] !== 32'h21) begin
+                $display("[%0t]   CSR FAIL: CSR[0xA] config=0x%0h, expected 0x21",
+                         $realtime, csr_vals[10]);
+                rd_err_count = rd_err_count + 1;
+            end
+            if (csr_vals[11] !== 32'h0001) begin
+                $display("[%0t]   CSR FAIL: CSR[0xB] version=0x%0h, expected 0x0001",
+                         $realtime, csr_vals[11]);
+                rd_err_count = rd_err_count + 1;
+            end
         end
         $display("[%0t] CSR read test complete", $realtime);
 
-        // ── BIST Re-trigger Test ──
+        // ── BIST Re-trigger Test (via CSR 0xC write) ──
         test_phase = "RETRIG";
-        $display("[%0t] ═══ BIST Re-trigger Test ═══", $realtime);
-        bist_start = 1'b1;
-        repeat (5) @(posedge controller_clk);
-        bist_start = 1'b0;
+        $display("[%0t] ═══ BIST Re-trigger Test (via CSR 0xC) ═══", $realtime);
+        wb_write_one(CSR_BASE | 4'hC, {{(WB_DATA_BITS-1){1'b0}}, 1'b1});
+        drain_pipeline;
         begin : retrig_block
             integer retrig_timeout;
+            reg [31:0] csr5_val;
             retrig_timeout = 0;
-            wait (bist_busy);
-            $display("[%0t]   BIST re-triggered (busy asserted)", $realtime);
-            while (bist_busy && retrig_timeout < 200000) begin
-                @(posedge controller_clk);
-                retrig_timeout = retrig_timeout + 1;
+            repeat (100) @(posedge controller_clk);
+            csr5_val = 32'd0;
+            while (retrig_timeout < 200000) begin
+                wb_read_one(CSR_BASE | 4'h5);
+                wb_stb = 1'b0;
+                while (!wb_ack) @(posedge controller_clk);
+                csr5_val = wb_rdata[31:0];
+                wb_idle;
+                if (!csr5_val[3]) break;
+                repeat (1000) @(posedge controller_clk);
+                retrig_timeout = retrig_timeout + 1000;
             end
             if (retrig_timeout >= 200000) begin
                 $display("[%0t] FAIL: BIST re-trigger timed out", $realtime);
                 rd_err_count = rd_err_count + 1;
-            end else if (!bist_fail) begin
-                $display("[%0t]   BIST re-trigger PASS — correct=%0d errors=%0d",
-                    $realtime, bist_correct, bist_error);
+            end else if (csr5_val[4]) begin
+                $display("[%0t]   BIST re-trigger PASS (via CSR)", $realtime);
             end else begin
-                $display("[%0t]   BIST re-trigger FAIL — correct=%0d errors=%0d",
-                    $realtime, bist_correct, bist_error);
+                $display("[%0t]   BIST re-trigger FAIL (via CSR)", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end
+        end
+
+        // ── Post-retrigger CSR value verification ──
+        test_phase = "CSR2";
+        $display("[%0t] ═══ Post-retrigger CSR verification ═══", $realtime);
+        begin : csr_post_retrig
+            reg [31:0] cv3, cv4, cv5;
+
+            wb_read_one(CSR_BASE | 4'h3);
+            wb_stb = 1'b0;
+            while (!wb_ack) @(posedge controller_clk);
+            cv3 = wb_rdata[31:0];
+            wb_idle;
+            repeat (2) @(posedge controller_clk);
+
+            wb_read_one(CSR_BASE | 4'h4);
+            wb_stb = 1'b0;
+            while (!wb_ack) @(posedge controller_clk);
+            cv4 = wb_rdata[31:0];
+            wb_idle;
+            repeat (2) @(posedge controller_clk);
+
+            wb_read_one(CSR_BASE | 4'h5);
+            wb_stb = 1'b0;
+            while (!wb_ack) @(posedge controller_clk);
+            cv5 = wb_rdata[31:0];
+            wb_idle;
+            repeat (2) @(posedge controller_clk);
+
+            $display("[%0t]   Post-retrig CSR[3]=%0d CSR[4]=%0d CSR[5]=0x%0h",
+                     $realtime, cv3, cv4, cv5);
+            if (cv3 !== 32'd1024) begin
+                $display("[%0t]   CSR2 FAIL: correct_count=%0d, expected 1024", $realtime, cv3);
+                rd_err_count = rd_err_count + 1;
+            end
+            if (cv4 !== 32'd0) begin
+                $display("[%0t]   CSR2 FAIL: error_count=%0d, expected 0", $realtime, cv4);
+                rd_err_count = rd_err_count + 1;
+            end
+            if (cv5[4] !== 1'b1 || cv5[5] !== 1'b0) begin
+                $display("[%0t]   CSR2 FAIL: status=0x%0h (expected pass=1, fail=0)", $realtime, cv5);
                 rd_err_count = rd_err_count + 1;
             end
         end
@@ -1003,7 +1351,7 @@ module ddr4_sim_top;
     initial begin act_count = 0; wr_count = 0; rd_count = 0; pre_count = 0; end
 
     always @(posedge controller_clk) begin
-        if (reset_done_seen && !all_tests_done && !bist_busy) begin
+        if (reset_done_seen && !all_tests_done && !bist_busy_int) begin
             for (mon_ph = 0; mon_ph < 4; mon_ph = mon_ph + 1) begin
                 if (mon_is_act[mon_ph]) begin
                     act_count = act_count + 1;
@@ -1072,21 +1420,21 @@ module ddr4_sim_top;
         $display("");
         $display("[%0t] ═══════════════════════════════════════════════", $realtime);
         $display("[%0t] SUMMARY: ACT=%0d  WR=%0d  RD=%0d  PRE=%0d  REF=%0d  RD_ERR=%0d  BIST_ERR=%0d",
-                 $realtime, act_count, wr_count, rd_count, pre_count, ref_count, rd_err_count, bist_error);
-        if (rd_err_count == 0 && bist_error == 0)
+                 $realtime, act_count, wr_count, rd_count, pre_count, ref_count, rd_err_count, bist_error_int);
+        if (rd_err_count == 0 && bist_error_int == 0)
             $display("[%0t] PASS: All test phases + BIST + %0d refresh cycles, zero violations",
                      $realtime, ref_count);
         else
             $display("[%0t] FAIL: rd_err=%0d bist_err=%0d",
-                     $realtime, rd_err_count, bist_error);
+                     $realtime, rd_err_count, bist_error_int);
         $display("[%0t] Simulation finished successfully", $realtime);
         $display("[%0t] ═══════════════════════════════════════════════", $realtime);
         $finish;
     end
 
     initial begin
-        #300_000_000;
-        $display("[%0t] TIMEOUT: simulation did not complete within 300 us", $realtime);
+        #500_000_000;
+        $display("[%0t] TIMEOUT: simulation did not complete within 500 us", $realtime);
         $finish;
     end
 

@@ -190,6 +190,18 @@ module ddr4_phy #(
     end
     assign sync_rst = rst_sync_q[1];
 
+    // 2-FF synchronizer for i_controller_clk domain (training FSM reset)
+    reg [1:0] ctrl_rst_sync_q;
+    wire ctrl_rst_n;
+
+    always @(posedge i_controller_clk or negedge i_rst_n) begin
+        if (!i_rst_n)
+            ctrl_rst_sync_q <= 2'b00;
+        else
+            ctrl_rst_sync_q <= {ctrl_rst_sync_q[0], 1'b1};
+    end
+    assign ctrl_rst_n = ctrl_rst_sync_q[1];
+
     // IDELAYCTRL reset: released after SERDES/delay primitives
     // sync_rst is in i_ddr4_clk domain — synchronize into i_ref_clk first
     reg [1:0] refclk_rst_sync_q;
@@ -451,7 +463,7 @@ module ddr4_phy #(
 
     reg [3:0] wrdata_en_shift;
     always @(posedge i_controller_clk) begin
-        if (!i_rst_n)
+        if (!ctrl_rst_n)
             wrdata_en_shift <= 4'b0;
         else
             wrdata_en_shift <= {wrdata_en_shift[2:0], wrdata_en_any};
@@ -767,7 +779,7 @@ module ddr4_phy #(
     reg [8:0] wl_tap        [BYTE_LANES-1:0];
     reg [8:0] wl_dq_tap     [BYTE_LANES-1:0];
     reg       wl_prev_dq0   [BYTE_LANES-1:0];
-    reg [8:0] dqs_initial_tap;
+    reg [8:0] dqs_initial_tap [BYTE_LANES-1:0];
     reg [7:0] vtc_settle_counter;
 
     assign wl_active = (phy_state == PHY_WL_SAMPLE) || (phy_state == PHY_WL_ADJUST)
@@ -792,7 +804,7 @@ module ddr4_phy #(
     integer dfi_pack_lane, dfi_pack_bit, dfi_pack_phase, dfi_pack_idx;
 
     always @(posedge i_controller_clk) begin
-        if (!i_rst_n) begin
+        if (!ctrl_rst_n) begin
             o_dfi_rddata       <= {(4*DFI_DATA_WIDTH){1'b0}};
             o_dfi_rddata_valid <= 4'b0;
             o_dfi_rdlvl_resp   <= {BYTE_LANES{1'b0}};
@@ -810,6 +822,7 @@ module ddr4_phy #(
                 wl_tap[dfi_pack_idx]           <= 9'b0;
                 wl_dq_tap[dfi_pack_idx]        <= 9'b0;
                 wl_prev_dq0[dfi_pack_idx]      <= 1'b0;
+                dqs_initial_tap[dfi_pack_idx]  <= 9'b0;
             end
             phy_state           <= PHY_IDLE;
             train_lane          <= 0;
@@ -819,7 +832,6 @@ module ddr4_phy #(
             sweep_tap           <= 9'b0;
             odelay_dqs_cntvalue <= 9'b0;
             odelay_dq_cntvalue  <= 9'b0;
-            dqs_initial_tap     <= 9'b0;
             wl_dqs_strobe       <= 1'b0;
             wl_dqs_strobe_d1    <= 1'b0;
             en_vtc_q            <= 1'b1;
@@ -893,12 +905,12 @@ module ddr4_phy #(
                             en_vtc_q <= 1'b0;
                             o_dfi_wrlvl_resp <= {BYTE_LANES{1'b0}};
                             train_lane <= 0;
-                            dqs_initial_tap <= odelay_dqs_cntvalueout[0];
                             odelay_dqs_cntvalue <= odelay_dqs_cntvalueout[0];
                             odelay_dq_cntvalue  <= 9'd0;
                             for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES;
                                  dfi_pack_idx = dfi_pack_idx + 1) begin
-                                wl_tap[dfi_pack_idx]    <= odelay_dqs_cntvalueout[0];
+                                dqs_initial_tap[dfi_pack_idx] <= odelay_dqs_cntvalueout[dfi_pack_idx];
+                                wl_tap[dfi_pack_idx]    <= odelay_dqs_cntvalueout[dfi_pack_idx];
                                 wl_dq_tap[dfi_pack_idx] <= 9'd0;
                                 wl_prev_dq0[dfi_pack_idx] <= 1'b0;
                             end
@@ -1137,10 +1149,10 @@ module ddr4_phy #(
                         `endif
                         if (train_lane < BYTE_LANES - 1) begin
                             train_lane <= train_lane + 1'b1;
-                            wl_tap[train_lane + 1'b1]    <= dqs_initial_tap;
+                            wl_tap[train_lane + 1'b1]    <= dqs_initial_tap[train_lane + 1'b1];
                             wl_dq_tap[train_lane + 1'b1] <= 9'd0;
                             wl_prev_dq0[train_lane + 1'b1] <= 1'b0;
-                            odelay_dqs_cntvalue <= dqs_initial_tap;
+                            odelay_dqs_cntvalue <= dqs_initial_tap[train_lane + 1'b1];
                             odelay_dq_cntvalue  <= 9'd0;
                             phy_timer <= 3'd4;
                             phy_state <= PHY_WL_SAMPLE;

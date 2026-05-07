@@ -1,12 +1,18 @@
 [tasks]
 prove_map0
 prove_map1
+prove_map0_bounded
+prove_map1_bounded
 
 [options]
 prove_map0: mode prove
 prove_map0: depth 8
 prove_map1: mode prove
 prove_map1: depth 8
+prove_map0_bounded: mode prove
+prove_map0_bounded: depth 28
+prove_map1_bounded: mode prove
+prove_map1_bounded: depth 28
 
 [engines]
 smtbmc
@@ -14,6 +20,8 @@ smtbmc
 [script]
 prove_map0: read -formal -DADDR_MAPPING=0 ddr4_controller.v
 prove_map1: read -formal -DADDR_MAPPING=1 ddr4_controller.v
+prove_map0_bounded: read -formal -DADDR_MAPPING=0 -DFORMAL_BOUNDED_STALL ddr4_controller.v
+prove_map1_bounded: read -formal -DADDR_MAPPING=1 -DFORMAL_BOUNDED_STALL ddr4_controller.v
 read -formal fwb_slave.v
 read -formal mini_fifo.v
 read -formal f_addr_decode.v
