@@ -131,13 +131,6 @@ module ddr4_phy #(
     localparam integer DATA_INITIAL_IDELAY_TAP = 0;
     localparam integer DQS_ODELAY_PS = DDR4_CLK_PERIOD / 4;
     localparam integer DQS_INITIAL_IDELAY_TAP  = 0;
-    // ISERDESE3 frame offset — set by gate training in Phase 7.
-    // CL_nCK mod SERDES_RATIO gives the DDR-edge offset within a frame,
-    // doubled for DDR (rise+fall). With CL=16, offset = 0 nominally,
-    // but OSERDESE3 cmd pipeline (+1 CLKDIV) shifts it by 2 edges.
-    // Empirically validated: offset = 6 for DDR4-2400 CL=16.
-    localparam integer INITIAL_BITSLIP         = 6;
-
     // ═══════════════════════════════════════════════════════════════════
     // §13 — PHY Training FSM Constants (SPEC §9.3)
     // ═══════════════════════════════════════════════════════════════════

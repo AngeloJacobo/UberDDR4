@@ -448,7 +448,7 @@ module ddr4_prober #(
                         csr_data_r[5]   = o_bist_fail;
                     end
                 end
-                4'h6: csr_data_r = {1'b0,
+                4'h6: csr_data_r = {7'd0,
                                     i_phy_bitslip[2:0],
                                     i_phy_wl_tap[8:0],
                                     i_phy_idelay_center[8:0],

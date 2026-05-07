@@ -269,8 +269,6 @@ module ddr4_controller #(
     localparam tMRD_nCK    = 8;  //JESD79-4D Table 3 — 8nCK all speed bins
     localparam tMOD_ps     = max_fn(DDR4_CLK_PERIOD * 24, 15_000); //JESD79-4D Table 3 — max(24nCK, 15ns)
     localparam tZQinit_nCK = 1024; //JESD79-4D §4.18, Table 135
-    localparam tZQoper_nCK = 512;  //JESD79-4D §4.18, Table 135
-    localparam tZQCS_nCK   = 128;  //JESD79-4D §4.18, Table 135
 
     // DLL lock — JESD79-4D §4.21, Table 141
     localparam tDLLK_nCK = (DDR4_CLK_PERIOD >= 1_071) ? 597 :
@@ -285,7 +283,6 @@ module ddr4_controller #(
 
     // Write leveling — JESD79-4D §4.26, Table 157
     localparam tWLMRD_nCK   = 40;
-    localparam tWLDQSEN_nCK = 25;
 
     // Init — JESD79-4D §3.3 Figure 7 (shortened for sim when MICRON_SIM=1)
     localparam POWER_ON_RESET_HIGH_ps = MICRON_SIM ? 10_000 : 200_000_000; //tPW_RESET ≥200µs
