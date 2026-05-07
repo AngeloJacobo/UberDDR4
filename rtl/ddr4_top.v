@@ -3,8 +3,19 @@
 // Filename: ddr4_top.v
 // Project:  UberDDR4 - An Open Source DDR4 Controller
 //
-// Purpose:  Top module instantiating the controller and PHY, connected via
-//  DFI 3.1 internal bus. Use this as the top module for Wishbone integration.
+// Purpose:  Top module instantiating the DDR4 controller, PHY, and optional
+//  BIST/debug prober, connected via a DFI 3.1 internal bus.  Use this as the
+//  top module for Wishbone integration.
+//
+//  Architecture:
+//    User WB --+--> [WB Mux] --> ddr4_controller <--DFI--> ddr4_phy --> DDR4
+//              |        ^
+//              |        |
+//              +-> ddr4_prober (BIST engine + debug CSR)
+//
+//  The Wishbone mux gives BIST priority when active; user transactions
+//  are stalled until BIST completes.  Address MSB selects between DRAM
+//  access (MSB=0) and debug CSR reads (MSB=1).
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -48,7 +59,7 @@ module ddr4_top #(
     parameter[0:0] DRIVE_IMP = 0,
     parameter[5:0] CL = 0,
     parameter[4:0] CWL_PARAM = 0,
-    // Prober config (Phase 8)
+    // BIST / debug prober configuration
     parameter[1:0] BIST_MODE = 0,
     parameter DEBUG_CSR_ENABLE = 1,
     // Derived (for port widths)
@@ -85,9 +96,11 @@ module ddr4_top #(
     output wire o_init_done, o_init_failed
 );
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §1 — DFI 3.1 Internal Bus
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // DFI 3.1 Internal Bus
+    // -----------------------------------------------------------------
+    // These wires carry the full DFI 3.1 interface between the
+    // controller and PHY.  4-phase command/data (SERDES_RATIO=4).
     wire [4*17-1:0]             dfi_address;
     wire [4*BA_BITS-1:0]        dfi_bank;
     wire [4*BG_BITS-1:0]        dfi_bg;
@@ -107,9 +120,9 @@ module ddr4_top #(
     wire [BYTE_LANES-1:0]       dfi_rdlvl_resp, dfi_wrlvl_resp;
     wire                        dfi_rdlvl_req, dfi_rdlvl_gate_req, dfi_wrlvl_req;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §2 — Debug Status Wires (controller → prober, PHY → prober)
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // Debug Status Wires (controller -> prober, PHY -> prober)
+    // -----------------------------------------------------------------
     wire [3:0]              ctrl_calib_state;
     wire                    ctrl_stage1_pending;
     wire                    ctrl_stage2_pending;
@@ -123,9 +136,9 @@ module ddr4_top #(
     wire [9*BYTE_LANES-1:0] phy_wl_tap;
     wire [3*BYTE_LANES-1:0] phy_bitslip;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §3 — Prober (BIST + CSR) Wires
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // Prober (BIST + CSR) Wires
+    // -----------------------------------------------------------------
     wire                     prober_bist_busy;
     wire                     prober_bist_pass;
     wire                     prober_bist_fail;
@@ -140,13 +153,16 @@ module ddr4_top #(
     wire [WB_SEL_BITS-1:0]   prober_wb_sel;
     wire [31:0]              prober_csr_data;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §4 — WB Address Decode + BIST Priority Mux
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // WB Address Decode + BIST Priority Mux
+    // -----------------------------------------------------------------
+    // When BIST is running, it owns the controller WB port; user
+    // transactions see stall=1, ack=0.  When idle, the user port
+    // passes through directly.
     wire bist_active = prober_bist_busy;
 
-    // Address MSB decode: MSB=1 → Debug CSR, MSB=0 → DRAM access
-    // Qualified by STB per WB B4 RULE 3.60
+    // Address MSB decode: MSB=1 -> debug CSR, MSB=0 -> DRAM access.
+    // Qualified by STB per WB B4 RULE 3.60.
     wire debug_access;
     generate if (DEBUG_CSR_ENABLE) begin : gen_dbg_decode
         assign debug_access = i_wb_cyc && i_wb_stb && i_wb_addr[WB_ADDR_BITS];
@@ -181,7 +197,9 @@ module ddr4_top #(
     wire bist_wb_stall = bist_active ? ctrl_wb_stall : 1'b1;
     wire bist_wb_ack   = bist_active ? ctrl_wb_ack   : 1'b0;
 
-    // Outstanding DRAM request counter — prevents CSR ACK from masking DRAM ACKs
+    // Outstanding DRAM request counter -- prevents a CSR ACK from being
+    // returned while DRAM read ACKs are still in-flight (would corrupt
+    // the WB pipeline ordering).
     reg [3:0] dram_outstanding_q;
     wire dram_request_accepted = i_wb_cyc && dram_stb && !user_wb_stall;
     wire dram_ack_returned     = user_wb_ack;
@@ -204,9 +222,13 @@ module ddr4_top #(
     assign o_wb_data  = csr_ready    ? {{(WB_DATA_BITS-32){1'b0}}, prober_csr_data}
                                      : ctrl_wb_rdata;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §5 — BIST Auto-Start + Init Status
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // BIST Auto-Start + Init Status
+    // -----------------------------------------------------------------
+    // On rising edge of calib_complete (if BIST_MODE != 0), auto-start
+    // fires the BIST engine once.  init_done and init_failed are sticky:
+    //   - init_done:   calibration OK and (BIST passed or BIST disabled)
+    //   - init_failed: calibration error OR BIST failure
     reg calib_complete_q;
     always @(posedge i_controller_clk) begin
         if (!i_rst_n)
@@ -242,9 +264,12 @@ module ddr4_top #(
     assign o_init_done   = init_done_q;
     assign o_init_failed = init_failed_q;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §6 — Controller Instantiation
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // Controller Instantiation
+    // -----------------------------------------------------------------
+    // Handles JEDEC DDR4 initialization, refresh, bank tracking, and
+    // read/write scheduling.  Exposes a Wishbone B4 slave port and
+    // drives the DFI 3.1 interface toward the PHY.
     ddr4_controller #(
         .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),
         .DDR4_CLK_PERIOD(DDR4_CLK_PERIOD),
@@ -322,9 +347,11 @@ module ddr4_top #(
         .o_bank_status(ctrl_bank_status)
     );
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §7 — PHY Instantiation
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // PHY Instantiation
+    // -----------------------------------------------------------------
+    // Xilinx 7-series PHY: ISERDES/OSERDES, IDELAY calibration,
+    // write-leveling, read gate training.  Directly drives DDR4 I/O.
     ddr4_phy #(
         .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),
         .DDR4_CLK_PERIOD(DDR4_CLK_PERIOD),
@@ -395,9 +422,11 @@ module ddr4_top #(
         .o_phy_bitslip(phy_bitslip)
     );
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §8 — Prober Instantiation (BIST + Debug CSR)
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // Prober Instantiation (BIST + Debug CSR)
+    // -----------------------------------------------------------------
+    // Combined BIST engine and debug register file.  See ddr4_prober.v
+    // for the CSR map and BIST phase descriptions.
     ddr4_prober #(
         .WB_ADDR_BITS(WB_ADDR_BITS),
         .WB_DATA_BITS(WB_DATA_BITS),

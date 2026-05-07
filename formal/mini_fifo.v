@@ -1,6 +1,19 @@
-// mini_fifo.v — 2-entry FIFO oracle for pipeline formal verification
-// Reused from UberDDR3 (ZipCPU pattern). Tracks what enters and exits
-// the controller pipeline as an independent reference model.
+// mini_fifo.v -- 2-entry FIFO oracle for pipeline formal verification
+//
+// Purpose: acts as an independent shadow model of the controller's
+// 2-stage pipeline. Every WB request accepted by the controller is
+// simultaneously written into this FIFO (with address + direction),
+// and every scheduler fire (WR/RD) pops the FIFO. The formal harness
+// then asserts:
+//   - Occupancy match: FIFO full/empty tracks stage1/stage2 pending
+//     flags exactly (Prop 5).
+//   - Data integrity: FIFO head data matches the pipeline's decoded
+//     address fields (Prop 6), cross-checked by f_addr_decode.
+//
+// If the pipeline ever drops, duplicates, or reorders a request, the
+// FIFO falls out of sync and the assertion fires.
+//
+// Reused from UberDDR3 (ZipCPU pattern).
 //
 // Engineer: Angelo C. Jacobo
 // Copyright (c) 2025, Angelo C. Jacobo

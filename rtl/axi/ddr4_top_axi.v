@@ -4,8 +4,12 @@
 // Project:  UberDDR4 - An Open Source DDR4 Controller
 //
 // Purpose:  Top module which instantiates ddr4_top and an AXI4-to-Wishbone
-//  bridge (ZipCPU axim2wbsp). Use this as top module when integrating
+//  bridge (ZipCPU axim2wbsp).  Use this as the top module when integrating
 //  UberDDR4 with an AXI4 interconnect.
+//
+//  The AXI byte address is wider than the WB word address by AXI_LSBS
+//  bits (= log2(data_width_bytes)).  The bridge strips these LSBs and
+//  translates AXI bursts into pipelined WB transactions.
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -46,6 +50,7 @@ module ddr4_top_axi #(
     parameter      ADDR_MAPPING = 1,
     parameter[1:0] BIST_MODE  = 1,
     parameter       DEBUG_CSR_ENABLE = 1,
+    // Derived parameters -- do not override
     parameter
                    SERDES_RATIO  = 4,
                    WB_DATA_BITS  = DQ_BITS * BYTE_LANES * 2 * SERDES_RATIO,
@@ -53,6 +58,8 @@ module ddr4_top_axi #(
                    COL_LOW       = $clog2(SERDES_RATIO * 2 * DQ_BITS * BYTE_LANES / 8),
                    WB_ADDR_BITS  = ROW_BITS + BG_BITS + BA_BITS + COL_BITS - COL_LOW,
                    EXT_ADDR_BITS = WB_ADDR_BITS + DEBUG_CSR_ENABLE,
+                   // AXI_LSBS: number of byte-offset bits stripped by the
+                   // bridge (AXI uses byte addresses, WB uses word addresses)
                    AXI_LSBS      = $clog2(WB_DATA_BITS) - 3,
                    AXI_ADDR_WIDTH = EXT_ADDR_BITS + AXI_LSBS,
                    AXI_DATA_WIDTH = WB_DATA_BITS
@@ -62,7 +69,7 @@ module ddr4_top_axi #(
     input wire i_ref_clk,
     input wire i_rst_n,
 
-    // AXI4 Slave Interface — Write Address Channel
+    // AXI4 Slave Interface -- Write Address Channel
     input  wire                       s_axi_awvalid,
     output wire                       s_axi_awready,
     input  wire [AXI_ID_WIDTH-1:0]    s_axi_awid,
@@ -74,18 +81,18 @@ module ddr4_top_axi #(
     input  wire [3:0]                 s_axi_awcache,
     input  wire [2:0]                 s_axi_awprot,
     input  wire [3:0]                 s_axi_awqos,
-    // AXI4 Slave Interface — Write Data Channel
+    // AXI4 Slave Interface -- Write Data Channel
     input  wire                       s_axi_wvalid,
     output wire                       s_axi_wready,
     input  wire [AXI_DATA_WIDTH-1:0]  s_axi_wdata,
     input  wire [AXI_DATA_WIDTH/8-1:0] s_axi_wstrb,
     input  wire                       s_axi_wlast,
-    // AXI4 Slave Interface — Write Response Channel
+    // AXI4 Slave Interface -- Write Response Channel
     output wire                       s_axi_bvalid,
     input  wire                       s_axi_bready,
     output wire [AXI_ID_WIDTH-1:0]    s_axi_bid,
     output wire [1:0]                 s_axi_bresp,
-    // AXI4 Slave Interface — Read Address Channel
+    // AXI4 Slave Interface -- Read Address Channel
     input  wire                       s_axi_arvalid,
     output wire                       s_axi_arready,
     input  wire [AXI_ID_WIDTH-1:0]    s_axi_arid,
@@ -97,7 +104,7 @@ module ddr4_top_axi #(
     input  wire [3:0]                 s_axi_arcache,
     input  wire [2:0]                 s_axi_arprot,
     input  wire [3:0]                 s_axi_arqos,
-    // AXI4 Slave Interface — Read Data Channel
+    // AXI4 Slave Interface -- Read Data Channel
     output wire                       s_axi_rvalid,
     input  wire                       s_axi_rready,
     output wire [AXI_ID_WIDTH-1:0]    s_axi_rid,
@@ -126,7 +133,7 @@ module ddr4_top_axi #(
     output wire o_init_failed
 );
 
-    // ─── Internal Wishbone bus ───
+    // --- Internal Wishbone bus ---
     wire                     wb_cyc;
     wire                     wb_stb;
     wire                     wb_we;
@@ -137,7 +144,7 @@ module ddr4_top_axi #(
     wire                     wb_ack;
     wire [WB_DATA_BITS-1:0]  wb_rdata;
 
-    // ─── DDR4 Controller ───
+    // --- DDR4 Controller (Wishbone top-level, see ddr4_top.v) ---
     ddr4_top #(
         .CONTROLLER_CLK_PERIOD (CONTROLLER_CLK_PERIOD),
         .DDR4_CLK_PERIOD       (DDR4_CLK_PERIOD),
@@ -184,7 +191,9 @@ module ddr4_top_axi #(
         .o_init_failed     (o_init_failed)
     );
 
-    // ─── AXI4-to-Wishbone Bridge (ZipCPU) ───
+    // --- AXI4-to-Wishbone Bridge (ZipCPU axim2wbsp) ---
+    // Translates full AXI4 (bursts, IDs, etc.) into pipelined WB B4
+    // transactions.  LGFIFO=5 gives 32-entry deep request FIFOs.
     axim2wbsp #(
         .C_AXI_ID_WIDTH    (AXI_ID_WIDTH),
         .C_AXI_DATA_WIDTH  (AXI_DATA_WIDTH),

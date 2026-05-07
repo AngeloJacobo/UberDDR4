@@ -1,7 +1,16 @@
-// f_addr_decode.v — Independent address decoder for formal verification
-// Mirrors the controller's Wishbone address decode as a separate
-// implementation. Any bug in the controller's decode is caught because
-// the FIFO oracle's reference decode differs.
+// f_addr_decode.v -- Independent address decoder for formal verification
+//
+// Purpose: provides a second, structurally independent implementation
+// of the Wishbone-to-DDR4 address decode. The formal harness feeds the
+// same wb_addr into this module and into the controller's pipeline
+// registers, then asserts the outputs match. If the controller's decode
+// has a bug (wrong bit slice, swapped fields, etc.), the mismatch fires
+// an assertion failure that the solver cannot satisfy -- catching the
+// bug with no simulation required.
+//
+// Supports both address mappings:
+//   map0: {row, bg, ba, col_upper}
+//   map1: {row, ba, col_upper, bg} (BG-interleaved for throughput)
 //
 // Engineer: Angelo C. Jacobo
 // Copyright (c) 2025, Angelo C. Jacobo
@@ -31,7 +40,7 @@ module f_addr_decode #(
             assign bank = wb_addr[COL_HIGH +: BG_BITS+BA_BITS];
             assign row  = wb_addr[COL_HIGH+BG_BITS+BA_BITS +: ROW_BITS];
         end else begin : map1
-            // ADDR_MAPPING==1: {row, ba, col_upper, bg} — BG-interleaved
+            // ADDR_MAPPING==1: {row, ba, col_upper, bg}  --  BG-interleaved
             // bank encoding: {bg, ba} matching controller's wb_bank = {wb_bg, wb_ba}
             assign bank[BG_BITS+BA_BITS-1:BA_BITS]  = wb_addr[BG_BITS-1:0];
             assign col                              = {wb_addr[BG_BITS +: COL_HIGH], {COL_LOW{1'b0}}};

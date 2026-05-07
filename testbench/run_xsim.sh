@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
 #
-# run_xsim.sh — Compile and run UberDDR4 simulation with Vivado xsim
+# run_xsim.sh  -  Compile and run UberDDR4 simulation with Vivado xsim
+#
+# Compiles the controller RTL, Micron DDR4 behavioral model, and the
+# testbench (ddr4_sim_top.sv), then elaborates and runs the simulation.
+# The result is checked by grepping the log for PASS/FAIL/TIMEOUT markers
+# that the testbench $display statements emit.
 #
 # Prerequisites:
-#   source /path/to/Vivado/2023.1/settings64.sh
+#   source /path/to/Vivado/2023.1/settings64.sh   # sets $XILINX_VIVADO
+#   ./UberDDR4/testbench/setup_micron_model.sh     # creates model symlinks
 #
 # Usage:
 #   ./UberDDR4/testbench/run_xsim.sh          # from repo root
 #   ./UberDDR4/testbench/run_xsim.sh --clean   # delete xsim.dir first
+#
+# Environment:
+#   EXTRA_DEFINES  -  extra xvlog -d flags, e.g. "-d SIM_FLY_BY_DELAY=200"
+#                     (used by regression_test.sh to sweep configurations)
 #
 set -euo pipefail
 
@@ -20,15 +30,15 @@ RESET="\033[0m"
 
 step() {
     echo ""
-    echo -e "${BOLD}${CYAN}▸ $1${RESET}"
+    echo -e "${BOLD}${CYAN}> $1${RESET}"
 }
 
 pass() {
-    echo -e "${BOLD}${GREEN}✔ $1${RESET}"
+    echo -e "${BOLD}${GREEN}OK $1${RESET}"
 }
 
 fail() {
-    echo -e "${BOLD}${RED}✘ $1${RESET}" >&2
+    echo -e "${BOLD}${RED}X $1${RESET}" >&2
 }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -67,6 +77,11 @@ step "Compiling RTL"
   UberDDR4/rtl/ddr4_prober.v \
   UberDDR4/rtl/ddr4_top.v
 
+# Micron model defines:
+#   DDR4_8G_X8   - 8Gbit x8 density/width (must match DUT DENSITY param)
+#   FIXED_2400   - lock speed grade to DDR4-2400 (834ps tCK)
+#   ALLOW_JITTER - relax Micron model timing checks for sim clock jitter
+#   VCD_DUMP     - tell the TB to dump VCD (xsim can't do SHM)
 step "Compiling simulation sources"
 "$XVLOG" -sv -d DDR4_8G_X8 -d FIXED_2400 -d ALLOW_JITTER -d VCD_DUMP \
   $EXTRA_DEFS \
@@ -83,6 +98,9 @@ step "Compiling simulation sources"
 step "Compiling Xilinx glbl"
 "$XVLOG" "$XILINX_VIVADO"/data/verilog/src/glbl.v
 
+# -L unisims_ver  - Xilinx unisim primitives (ISERDESE3, OSERDESE3, etc.)
+# -L secureip     - encrypted Xilinx IP (needed by some unisim models)
+# glbl            - Xilinx global reset/GTS module (always required for xsim)
 step "Elaborating"
 "$XELAB" -timescale 1ps/1ps \
   -L unisims_ver -L secureip ddr4_sim_top glbl -s sim_snapshot

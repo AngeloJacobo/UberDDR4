@@ -1,7 +1,30 @@
-// ddr4_controller_formal.vh — Formal properties for ddr4_controller.v
+// ddr4_controller_formal.vh -- Formal properties for ddr4_controller.v
 // Included inside ddr4_controller.v under `ifdef FORMAL
 //
-// Properties verified in Phase 4C:
+// Verification strategy:
+//   k-induction proofs (SymbiYosys + smtbmc) at depth 8 for unbounded
+//   tasks, depth 28 for bounded-stall tasks. Each address mapping
+//   (ADDR_MAPPING=0 and 1) is proven independently.
+//
+//   Key techniques:
+//   - fwb_slave (ZipCPU): monitors the Wishbone B4 pipelined bus for
+//     protocol violations (stall rules, outstanding count, etc.)
+//   - mini_fifo oracle: a 2-entry FIFO shadows the pipeline, tracking
+//     each accepted WB request from accept to scheduler fire. Proves
+//     the pipeline never loses, duplicates, or reorders requests.
+//   - f_addr_decode: independent address decoder cross-checks the
+//     controller's internal decode. Any mismatch between the oracle's
+//     decode and the pipeline registers triggers an assertion failure.
+//   - anyconst bank/BG: universally quantified -- the solver picks a
+//     fixed bank (or BG) and proves the property for it, which covers
+//     all possible values without iterating.
+//   - Induction-strengthening assumes: some invariants (f_outstanding,
+//     CKE/ODT consistency, training-FSM exclusion) must be assumes in
+//     the induction step because the solver can desynchronize
+//     independent register state at depth 8. Base case proves them
+//     from reset, so soundness is maintained.
+//
+// Properties:
 //   1. Wishbone B4 protocol (fwb_slave)
 //   2. CKE/ODT/RESET_N all-phase consistency
 //   3. Command slot mutual exclusivity
@@ -12,25 +35,19 @@
 //   7. BG counter gating (anyconst)
 //   8. Bank status (WR/RD only to active banks)
 //   9. Command encoding (ACT_n correctness)
-//
-// Properties added in Phase 4D:
 //  10. Per-bank counter gating (anyconst bank)
 //  11. Earliest-issue throughput (no dead cycles)
 //  12. Counter loading correctness (JEDEC minimum delays)
 //  13. tFAW window assertion
 //  14. Scheduler mutual exclusion
 //  15. Anticipation command integrity
-//
-// Properties added in Phase 5:
 //  16. Write ACK correctness
 //  17. rddata_en / wrdata_en pipeline correctness
 //  18. f_outstanding induction invariant (links fwb_slave to pipeline)
 //  19. Bounded stall / ACK latency (ifdef FORMAL_BOUNDED_STALL, depth 28)
-//
-// Properties added in Phase 6 audit:
-//  20. Command encoding — RAS_n / CAS_n / WE_n correctness (WR/RD/PRE)
+//  20. Command encoding -- RAS_n / CAS_n / WE_n correctness (WR/RD/PRE)
 //  21. Column address integrity in cmd_d (WR/RD)
-//  22. Cover properties — reachability (write/read ACK, all scheduler
+//  22. Cover properties -- reachability (write/read ACK, all scheduler
 //      actions, anticipation co-fire, dual-slot, multi-read pipeline)
 //
 // Timing properties coverage:
@@ -43,15 +60,15 @@
 // Copyright (c) 2025, Angelo C. Jacobo
 // License: GPL v3
 
-// ═══════════════════════════════════════════════════════════════════
-// f_past_valid — required for $past() references
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
+// f_past_valid --  required for $past() references
+// ===================================================================
 reg f_past_valid;
 initial f_past_valid = 1'b0;
 always @(posedge i_controller_clk) f_past_valid <= 1'b1;
 
 // Assume i_wb_cyc is always high during normal operation. DDR4
-// controllers don't handle mid-stream bus abort — the master keeps
+// controllers don't handle mid-stream bus abort --  the master keeps
 // cyc asserted for the entire session. Without this, the solver can
 // desync formal counters from stage registers by toggling cyc.
 always @* begin
@@ -59,13 +76,13 @@ always @* begin
         assume(i_wb_cyc);
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 1. Wishbone B4 Protocol (ZipCPU fwb_slave)
 // F_MAX_STALL=0 / F_MAX_ACK_DELAY=0 unless FORMAL_BOUNDED_STALL is
 // defined, in which case Prop 19's computed bounds are passed.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 
-// ── Prop 19 bounded-stall localparams (must precede fwb_slave) ──
+// -- Prop 19 bounded-stall localparams (must precede fwb_slave) --
 `ifdef FORMAL_BOUNDED_STALL
 localparam F_MAX_STALL =
     max_fn(WRITE_TO_PRECHARGE_DELAY, READ_TO_PRECHARGE_DELAY) + 1
@@ -123,7 +140,7 @@ fwb_slave #(
 //   write_ack_q:    WR command fired, ACK pending (1 cycle)
 //   rddata_en_pipe_q: RD command fired, waiting for DFI rddata_valid
 //   read_ack_q:     rddata_valid received, ACK pending (1 cycle)
-// f_outstanding is a counter INSIDE fwb_slave — it has no structural
+// f_outstanding is a counter INSIDE fwb_slave --  it has no structural
 // link to the pipeline registers. The solver can pick arbitrary initial
 // values for both. Must remain assume (base case proves from reset).
 always @* begin
@@ -135,14 +152,14 @@ always @* begin
                + read_ack_q);
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 2. CKE / ODT / RESET_N All-Phase Consistency
 // DDR4 requires these signals to be identical across all 4 DFI phases
 // every cycle. cmd_d is registered, so we check after at least one
 // sequential evaluation (f_past_valid) to avoid spurious induction
 // failures from arbitrary initial register state.
-// ═══════════════════════════════════════════════════════════════════
-// cmd_d is a register array — Yosys converts it to individual registers.
+// ===================================================================
+// cmd_d is a register array --  Yosys converts it to individual registers.
 // The scheduler reconstructs full command words for active slots, and
 // the memory-to-register decomposition prevents the solver from seeing
 // the structural identity. Must remain assume (base case proves it,
@@ -160,7 +177,7 @@ always @* begin
         assume(cmd_d[2][CMD_RESET_N] == cmd_d[3][CMD_RESET_N]);
     end
 end
-// Assert the registered DFI outputs — these are latched from cmd_d, so if
+// Assert the registered DFI outputs --  these are latched from cmd_d, so if
 // cmd_d is consistent, o_dfi_* will be consistent one cycle later.
 always @(posedge i_controller_clk) begin
     if (f_past_valid && i_rst_n && $past(i_rst_n)) begin
@@ -176,12 +193,12 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 3. Command Slot Mutual Exclusivity
 // At most 2 slots can have cs_n=0 per cycle. If 2 active, one must
 // be on ACTIVATE_SLOT or PRECHARGE_SLOT (bank management alongside
-// data command — the bank anticipation path).
-// ═══════════════════════════════════════════════════════════════════
+// data command --  the bank anticipation path).
+// ===================================================================
 wire [3:0] f_active_slots = {~cmd_d[3][CMD_CS_N], ~cmd_d[2][CMD_CS_N],
                               ~cmd_d[1][CMD_CS_N], ~cmd_d[0][CMD_CS_N]};
 always @(posedge i_controller_clk) begin
@@ -194,13 +211,13 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 4. Zero-Bubble Stall
 // During normal operation (reset_done, not refresh, calibration done),
 // stall must be LOW whenever stage1 is free. Calibration adds a
-// stall term until o_calib_complete — guarded here so the property
+// stall term until o_calib_complete --  guarded here so the property
 // only fires after training completes.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 always @* begin
     if (reset_done && !refresh_active && o_calib_complete) begin
         if (!stage1_pending)
@@ -222,14 +239,14 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 4b. Training FSM Induction Invariant
 // Active training states (GATE/EYE/WL) only exist before reset_done.
 // CALIB_WL_EXIT may overlap with reset_done (it waits for it).
 // Without this, the solver constructs unreachable states where the
 // training pump and post-init scheduler both fire simultaneously.
-// ═══════════════════════════════════════════════════════════════════
-// reset_done and calib_state are independent registers — the FSM
+// ===================================================================
+// reset_done and calib_state are independent registers --  the FSM
 // transition from training to DONE spans many more cycles than depth 8.
 // Must remain assume (base case proves from reset).
 always @* begin
@@ -240,22 +257,22 @@ always @* begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
-// 5–6. Pipeline Occupancy + Data Integrity (mini_fifo oracle)
+// ===================================================================
+// 5-6. Pipeline Occupancy + Data Integrity (mini_fifo oracle)
 //
 // Shadow FIFO independently tracks WB requests through the 2-stage
 // pipeline. Write to FIFO on wb_accept, read on sched_write/sched_read.
 // Proves: (a) pipeline never loses or duplicates requests (Prop 5),
 //         (b) address/direction preserved through pipeline (Prop 6).
 //
-// Same approach as UberDDR3 (ddr3_controller.v L4717–4800). DDR4's
+// Same approach as UberDDR3 (ddr3_controller.v L4717-4800). DDR4's
 // registered cmd_d requires induction-strengthening invariants
 // (assumes) to tie FIFO data to pipeline register data, following
 // the same pattern as Prop 18 (f_outstanding) and Prop 2
 // (CKE/ODT consistency). Base case proves all invariants from reset.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 
-// ── mini_fifo instantiation ──
+// -- mini_fifo instantiation --
 localparam F_PIPE_DATA_WIDTH = WB_ADDR_BITS + 1;
 reg f_pipe_write, f_pipe_read;
 reg [F_PIPE_DATA_WIDTH-1:0] f_pipe_wdata;
@@ -285,7 +302,7 @@ mini_fifo #(
     .read_data_next(f_pipe_rdata_next)
 );
 
-// ── f_addr_decode — independent address decode of FIFO entries ──
+// -- f_addr_decode --  independent address decode of FIFO entries --
 wire                       f_pipe_we   = f_pipe_rdata[0];
 wire [WB_ADDR_BITS-1:0]    f_pipe_addr = f_pipe_rdata[F_PIPE_DATA_WIDTH-1:1];
 wire [BG_BITS+BA_BITS-1:0] f_pipe_bank;
@@ -326,12 +343,12 @@ f_addr_decode #(
     .row(f_pipe_next_row)
 );
 
-// ── Init/calibration idle invariant ──
+// -- Init/calibration idle invariant --
 // During init or calibration, no wb_accept can fire (o_wb_stall is
 // high), so the pipeline and FIFO must be idle. Without this, the
 // solver desynchronizes FIFO/pipeline state during init (when the
 // occupancy assertions are guarded), then triggers a false failure
-// at the init→normal transition.
+// at the init->normal transition.
 // Base case proves this from reset: stage_pending cleared by reset,
 // wb_accept blocked by stall, FIFO starts empty.
 always @* begin
@@ -342,7 +359,7 @@ always @* begin
     end
 end
 
-// ── Prop 5: Pipeline occupancy ──
+// -- Prop 5: Pipeline occupancy --
 // Assert: FIFO occupancy tracks pipeline stage pending flags exactly.
 // k-induction provable: FIFO write/read triggers correspond exactly
 // to pipeline entry (wb_accept) and exit (sched_write/read) events.
@@ -361,12 +378,12 @@ always @* begin
     end
 end
 
-// ── Prop 6: Pipeline data integrity — induction invariants ──
+// -- Prop 6: Pipeline data integrity --  induction invariants --
 // FIFO and pipeline receive the same inputs (wb_addr/we on accept)
 // and are consumed by the same events (sched_write/read). The data
 // correlation is maintained structurally:
 //   - wb_accept writes {addr,we} to FIFO and decoded fields to stage1
-//   - stage2_update copies stage1→stage2, FIFO head tracks oldest
+//   - stage2_update copies stage1->stage2, FIFO head tracks oldest
 //   - sched fires: FIFO reads head (==stage2), stage2 consumed
 always @* begin
     if (reset_done && o_calib_complete && i_wb_cyc && !f_pipe_empty) begin
@@ -393,7 +410,7 @@ always @* begin
     end
 end
 
-// ── Prop 6: Pipeline data integrity — assertions ──
+// -- Prop 6: Pipeline data integrity --  assertions --
 // When WR/RD fires, the FIFO oracle confirms the correct request
 // is being consumed: direction (we) and full address must match.
 always @* begin
@@ -414,7 +431,7 @@ always @* begin
 end
 
 // 6b. DDR4 command output must match stage2 data when WR/RD fires
-// (no shadow registers — uses $past of controller signals directly)
+// (no shadow registers --  uses $past of controller signals directly)
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
         if ($past(sched_write)) begin
@@ -434,11 +451,11 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
-// 7. BG Counter Gating (anyconst — proves for ALL bank groups)
+// ===================================================================
+// 7. BG Counter Gating (anyconst --  proves for ALL bank groups)
 // The solver picks a fixed BG and proves the property holds for it.
 // Since the BG is unconstrained, this covers all possible BG values.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 (* anyconst *) reg [BG_BITS-1:0] f_bg_const;
 
 always @* begin
@@ -461,11 +478,11 @@ always @* begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
-// 8. Bank Status — WR/RD only to active banks with correct row
+// ===================================================================
+// 8. Bank Status --  WR/RD only to active banks with correct row
 // No data command should target a closed bank. The scheduler checks
 // bank_status_q before issuing WR/RD.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 always @* begin
     if (reset_done) begin
         if (sched_write || sched_read) begin
@@ -475,12 +492,12 @@ always @* begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
-// 9. Command Encoding — ACT_n correctness
+// ===================================================================
+// 9. Command Encoding --  ACT_n correctness
 // ACT commands must have act_n=0. All other commands (WR/RD/PRE/REF/
 // MRS/NOP/DES) must have act_n=1. Verified via cmd_d one cycle after
 // the scheduler decision.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n)) begin
         // ACTIVATE: act_n must be 0
@@ -501,12 +518,12 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
-// 10. Per-Bank Counter Gating (anyconst — proves for ALL banks)
+// ===================================================================
+// 10. Per-Bank Counter Gating (anyconst --  proves for ALL banks)
 // The scheduler must never fire a command when the target bank's
 // per-bank counter hasn't expired. Complements property 7 (which
 // covers per-BG counters). Uses a separate anyconst bank register.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 (* anyconst *) reg [BG_BITS+BA_BITS-1:0] f_bank_const;
 
 always @* begin
@@ -524,13 +541,13 @@ always @* begin
         assert(delay_before_activate_counter_d[f_bank_const] == 0);
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 11. Earliest-Issue Throughput
 // Proves the scheduler fires commands at the earliest possible cycle.
 // If all blocking conditions are clear, the command MUST issue.
 // Catches priority inversion, dead code paths, missing conditions.
-// All purely combinational — k-induction safe.
-// ═══════════════════════════════════════════════════════════════════
+// All purely combinational --  k-induction safe.
+// ===================================================================
 always @* begin
     if (reset_done && stage2_pending && refresh_idle && i_wb_cyc) begin
         if (bank_status_q[stage2_bank]
@@ -558,16 +575,16 @@ always @* begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 12. Counter Loading Correctness
 // After each command, verify the target bank/BG counters are loaded
 // with at least the correct JEDEC minimum. Uses $past on scheduler
 // flags + anyconst bank/BG. Catches wrong delay constant, missing
 // only-raise guard, counter loaded for wrong bank, asymmetric
 // read/write loading bugs.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 
-// 12a — After ACTIVATE or ANTICIPATE: per-bank counters + bank status
+// 12a --  After ACTIVATE or ANTICIPATE: per-bank counters + bank status
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
         if ($past(sched_activate) && $past(stage2_bank) == f_bank_const) begin
@@ -591,7 +608,7 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// 12a-bg — After ACTIVATE: per-BG rrd counter (same-BG / diff-BG)
+// 12a-bg --  After ACTIVATE: per-BG rrd counter (same-BG / diff-BG)
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
         if ($past(sched_activate) && $past(stage2_bg) == f_bg_const)
@@ -603,7 +620,7 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// 12b — After PRECHARGE: activate counter + bank status cleared
+// 12b --  After PRECHARGE: activate counter + bank status cleared
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
         if ($past(sched_precharge) && $past(stage2_bank) == f_bank_const) begin
@@ -614,7 +631,7 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// 12c — After WRITE: precharge counter + BG ccd/wtr counters
+// 12c --  After WRITE: precharge counter + BG ccd/wtr counters
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
         if ($past(sched_write) && $past(stage2_bank) == f_bank_const)
@@ -631,7 +648,7 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// 12d — After READ: precharge + RD→WR turnaround (all banks) + BG ccd
+// 12d --  After READ: precharge + RD->WR turnaround (all banks) + BG ccd
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
         if ($past(sched_read) && $past(stage2_bank) == f_bank_const)
@@ -647,11 +664,11 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 13. tFAW Window Assertion
 // ACT requires oldest tFAW timestamp expired (== 0 for _q).
 // Anticipation uses _d (post-decrement), so _q <= 1 is equivalent.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 always @* begin
     if (reset_done && i_wb_cyc) begin
         if (sched_activate)
@@ -661,21 +678,21 @@ always @* begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 14. Scheduler Mutual Exclusion
 // At most one of {PRE, ACT, WR, RD} fires per cycle (else-if chain).
 // Anticipation is separate and can co-fire with WR/RD.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 always @* begin
     if (reset_done)
         assert((sched_precharge + sched_activate + sched_write + sched_read) <= 1);
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 15. Anticipation Command Integrity
 // When anticipation fires, the ACT command on ACTIVATE_SLOT must
 // carry the correct BG/BA from stage1's next-bank fields.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done)) begin
         if ($past(sched_anticipate)) begin
@@ -688,8 +705,8 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
-// Phase 5 — Timing Properties
+// ===================================================================
+// Timing Properties
 //
 // All JEDEC timing constraints (tRCD, tRP, tRAS, tRC, tCCD_L/S,
 // tRRD_L/S, tWTR_L/S, tWR, tRTP, tFAW) are proven by the
@@ -704,15 +721,15 @@ end
 // induction step. The decomposed approach is mathematically
 // equivalent and fully proven.
 //
-// Properties 16-19 below cover the NEW Phase 5 logic: write ACK,
-// data enable pipelines, and bounded stall latency.
-// ═══════════════════════════════════════════════════════════════════
+// Properties 16-19 below cover write ACK, data enable pipelines,
+// and bounded stall latency.
+// ===================================================================
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 16. Write ACK Correctness
 // write_ack_q is a 1-cycle registered version of sched_write.
 // Proves the WB ACK for writes fires at exactly the right time.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n)) begin
         assert(write_ack_q == $past(sched_write));
@@ -721,12 +738,12 @@ end
 
 // o_wb_ack is gated by reset_done in the RTL, so no ACK leaks during init
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 17. rddata_en / wrdata_en Pipeline Correctness
 // The shift registers must be clear during init/refresh.
 // wrdata_en must assert exactly WRITE_DATA_DELAY cycles after WR.
 // rddata_en must assert exactly READ_DELAY cycles after RD.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 
 // Pipelines must be clear after reset is applied and before init completes
 always @(posedge i_controller_clk) begin
@@ -744,40 +761,40 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 // 19. Bounded Stall / ACK Latency
 // Gated behind FORMAL_BOUNDED_STALL. Requires depth >= F_MAX_STALL.
 //
 // F_MAX_STALL = worst-case row-miss latency:
-//   max(WR→PRE, RD→PRE) + 1
-//   + max(PRE→ACT, tRRD, tFAW) + 1
-//   + max(ACT→RW, CCD_same_BG, WTR_same_BG) + 1
+//   max(WR->PRE, RD->PRE) + 1
+//   + max(PRE->ACT, tRRD, tFAW) + 1
+//   + max(ACT->RW, CCD_same_BG, WTR_same_BG) + 1
 // Extended from UberDDR3 (ddr3_controller.v L4445) for DDR4
 // bank-group contention (CCD/WTR/RRD) and tFAW.
 //
 // Three layers:
-//  a) Counter-bounding asserts — cap each delay counter (and
+//  a) Counter-bounding asserts --  cap each delay counter (and
 //     tFAW timestamps) at its maximum loaded value.
-//  b) Remaining-stall invariant — f_stall + f_remaining <=
+//  b) Remaining-stall invariant --  f_stall + f_remaining <=
 //     F_MAX_STALL, where f_remaining is an upper bound on
 //     cycles until stage2 clears.  Self-strengthening: each
-//     cycle f_stall +1, f_remaining −1, sum non-increasing.
-//  c) !stage2_pending assume — when no request is active, stall
-//     counter is assumed bounded (same as UberDDR3 L5501–5503).
-// ═══════════════════════════════════════════════════════════════════
+//     cycle f_stall +1, f_remaining -1, sum non-increasing.
+//  c) !stage2_pending assume --  when no request is active, stall
+//     counter is assumed bounded (same as UberDDR3 L5501-5503).
+// ===================================================================
 `ifdef FORMAL_BOUNDED_STALL
 (* keep *) wire [$clog2(F_MAX_STALL+1):0] f_max_stall_w = F_MAX_STALL;
 
-// ── Stimulus constraint: no WB requests during init/refresh ──
+// -- Stimulus constraint: no WB requests during init/refresh --
 always @* begin
     if (!reset_done || !o_calib_complete || refresh_active)
         assume(!i_wb_stb);
 end
 
-// ── 19a. Counter-bounding asserts ──
+// -- 19a. Counter-bounding asserts --
 // Each counter is loaded with at most MAX_*_DELAY and decrements
 // to zero. Passes induction at depth 1: counter <= MAX at cycle k
-// → decremented (still <= MAX) or reloaded (<= MAX) at cycle k+1.
+// -> decremented (still <= MAX) or reloaded (<= MAX) at cycle k+1.
 integer f_cb;
 always @* begin
     if (i_rst_n && reset_done && o_calib_complete) begin
@@ -798,9 +815,9 @@ always @* begin
     end
 end
 
-// ── 19b. Remaining-stall invariant ──
+// -- 19b. Remaining-stall invariant --
 // f_remaining = upper bound on cycles until stage2 clears (WR/RD
-// fires → stage2_update). Computed per bank state:
+// fires -> stage2_update). Computed per bank state:
 //   Row miss  : precharge wait + PRE + max ACT-phase + ACT + max RW-phase + cmd
 //   Inactive  : max(activate, rrd, tFAW) + ACT + max RW-phase + cmd
 //   Row hit   : max(write/read, ccd, wtr) + cmd
@@ -856,12 +873,12 @@ always @* begin
 end
 `endif
 
-// ═══════════════════════════════════════════════════════════════════
-// 20. Command Encoding — RAS_n / CAS_n / WE_n correctness
+// ===================================================================
+// 20. Command Encoding --  RAS_n / CAS_n / WE_n correctness
 // Complements property 9 (ACT_n only). Verifies the full 3-bit
 // command opcode in cmd_d matches JEDEC JESD79-4D Table 35 for
 // each scheduler action.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
         if ($past(sched_write)) begin
@@ -882,12 +899,12 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
-// 21. Column Address in cmd_d — WR/RD column field integrity
+// ===================================================================
+// 21. Column Address in cmd_d --  WR/RD column field integrity
 // Verifies the address bits in cmd_d match stage2_col at the time
 // the scheduler fires. A10=0 (no auto-precharge). A11 carries
 // col[10] only when COL_BITS > 10 (x4 devices).
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done) && $past(i_wb_cyc)) begin
         if ($past(sched_write)) begin
@@ -901,11 +918,11 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// ═══════════════════════════════════════════════════════════════════
-// 22. Cover Properties — reachability confirmation
+// ===================================================================
+// 22. Cover Properties --  reachability confirmation
 // Proves the design can reach interesting operating states. Without
 // these, an over-constrained model could vacuously pass all asserts.
-// ═══════════════════════════════════════════════════════════════════
+// ===================================================================
 
 // Basic reachability: pipeline produces ACKs
 always @(posedge i_controller_clk) begin

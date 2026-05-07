@@ -1,12 +1,19 @@
 #!/bin/bash
 #
-# run_compile.sh — UberDDR4 build & verification sweep
+# run_compile.sh  -  UberDDR4 build & verification sweep
 #
-# Runs: Yosys synthesis (controller only) → SymbiYosys formal proofs →
-#       Vivado xsim simulation → summary with PASS/FAIL.
+# Three-stage verification pipeline:
+#   1. lint   - Yosys synthesis check (controller only, catches elaboration
+#               errors, undriven nets, width mismatches)
+#   2. formal - SymbiYosys bounded model checking (properties defined in
+#               formal/ddr4_singleconfig.sby)
+#   3. sim    - Vivado xsim full simulation (delegates to run_xsim.sh)
+#
+# Each stage records PASS/FAIL independently. The exit code equals the
+# number of failures (0 = all green).
 #
 # Usage:
-#   ./run_compile.sh              # full sweep
+#   ./run_compile.sh              # full sweep (lint + formal + sim)
 #   ./run_compile.sh lint         # Yosys synthesis check only
 #   ./run_compile.sh formal       # formal proofs only
 #   ./run_compile.sh sim          # simulation only
@@ -38,7 +45,7 @@ record() {
 }
 
 run_yosys() {
-    echo -e "${CYAN}▸ Yosys synthesis check (controller)${NC}"
+    echo -e "${CYAN}> Yosys synthesis check (controller)${NC}"
     if yosys -q -p "
         read_verilog -sv ./rtl/ddr4_controller.v;
         synth -top ddr4_controller" 2>&1; then
@@ -50,7 +57,7 @@ run_yosys() {
 
 run_formal() {
     echo ""
-    echo -e "${CYAN}▸ SymbiYosys formal verification (single-config)${NC}"
+    echo -e "${CYAN}> SymbiYosys formal verification (single-config)${NC}"
     rm -rf formal/ddr4_singleconfig_*
 
     if sby -f formal/ddr4_singleconfig.sby 2>&1; then
@@ -69,7 +76,7 @@ run_formal() {
 
 run_sim() {
     echo ""
-    echo -e "${CYAN}▸ Vivado xsim simulation (default config)${NC}"
+    echo -e "${CYAN}> Vivado xsim simulation (default config)${NC}"
 
     if [ -z "$XILINX_VIVADO" ]; then
         echo "ERROR: XILINX_VIVADO not set. Source Vivado settings64.sh first."
@@ -94,9 +101,9 @@ run_sim() {
 
 print_summary() {
     echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}===============================================${NC}"
     echo -e "${CYAN}  UberDDR4 Verification Summary${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}===============================================${NC}"
     for r in "${RESULTS[@]}"; do
         echo -e "  $r"
     done
@@ -106,7 +113,7 @@ print_summary() {
     else
         echo -e "  ${RED}$FAIL_COUNT FAILED${NC}, $PASS_COUNT passed"
     fi
-    echo -e "${CYAN}═══════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}===============================================${NC}"
 }
 
 case "${1:-all}" in

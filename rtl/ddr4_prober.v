@@ -83,9 +83,36 @@ module ddr4_prober #(
     input  wire [3*BYTE_LANES-1:0]  i_phy_bitslip
 );
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §1 — BIST FSM States
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // BIST Architecture Overview
+    // -----------------------------------------------------------------
+    // The BIST engine exercises the DDR4 data path in three phases:
+    //
+    //   Phase 1 - Burst:       Sequential write of the entire address
+    //                          range, then sequential read-back.
+    //   Phase 2 - Random:      Bit-reversed (scrambled) address write
+    //                          then read-back.  Forces frequent row
+    //                          precharge/activate to stress timing.
+    //   Phase 3 - Alternating: Write one address, immediately read it
+    //                          back, repeat for the full range.  Tests
+    //                          tight write-to-read turnaround.
+    //
+    // BIST_MODE selects which phases run (0=disabled, 1=burst only,
+    // 2=all three).  BURST_END / RANDOM_END / ALT_END control how
+    // deep each phase sweeps.
+    //
+    // BIST can be triggered two ways:
+    //   1. Auto-start -- ddr4_top pulses i_start on rising edge of
+    //      calib_complete (one-shot).
+    //   2. CSR trigger -- software writes bit[0] of CSR register 0xC.
+    //
+    // The engine uses Wishbone B4 pipelined mode, tracking outstanding
+    // requests so it can overlap writes with read-back ACKs.
+    // -----------------------------------------------------------------
+
+    // -----------------------------------------------------------------
+    // BIST FSM States
+    // -----------------------------------------------------------------
     localparam [2:0] BIST_IDLE           = 3'd0,
                      BIST_BURST_WRITE    = 3'd1,
                      BIST_BURST_READ     = 3'd2,
@@ -102,9 +129,9 @@ module ddr4_prober #(
 
     wire [2:0] bist_state_w;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §2 — BIST Logic (gated by BIST_MODE)
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // BIST Logic (gated by BIST_MODE)
+    // -----------------------------------------------------------------
     generate if (BIST_MODE != 0) begin : gen_bist
 
         reg bist_csr_start_r, bist_csr_start_d;
@@ -121,6 +148,8 @@ module ddr4_prober #(
             end
         end
 
+        // Start from either external trigger (auto-start) or CSR write.
+        // Two-stage register catches a single-cycle CSR pulse reliably.
         wire bist_start_any = i_start || bist_csr_start_r || bist_csr_start_d;
 
         reg [2:0] bist_state;
@@ -138,11 +167,19 @@ module ddr4_prober #(
         reg [WB_ADDR_BITS-1:0] wb_addr_r;
         reg [WB_DATA_BITS-1:0] wb_data_r;
 
-        // Outstanding request tracking for WB pipelining
+        // Outstanding request tracking for WB pipelining.
+        // `outstanding` counts total in-flight requests (writes + reads).
+        // `wr_acks_pending` counts write ACKs not yet received.  WB B4
+        // returns ACKs in-order, so when wr_acks_pending==0 the next ACK
+        // is guaranteed to be a read -- that is when we compare data.
         reg [4:0] outstanding;
         reg [8:0] wr_acks_pending;
 
-        // Pattern generation — deterministic from address (XOR-fold full width)
+        // Pattern generation -- deterministic from address.
+        // XOR-folds the address with a swapped copy and a constant to
+        // produce a 32-bit seed, then replicates it across the full
+        // data width.  The constant 0xA55A3CC3 ensures addr=0 still
+        // produces a non-trivial pattern (no stuck-at-0 masking).
         function [WB_DATA_BITS-1:0] gen_pattern;
             input [BIST_ADDR_BITS-1:0] addr;
             reg [31:0] seed;
@@ -154,8 +191,8 @@ module ddr4_prober #(
             end
         endfunction
 
-        // Bit-reversal address scramble — forces row changes on sequential
-        // counter values, maximizing precharge/activate stress
+        // Bit-reversal address scramble -- forces row changes on sequential
+        // counter values, maximizing precharge/activate stress.
         function [BIST_ADDR_BITS-1:0] scramble_addr;
             input [BIST_ADDR_BITS-1:0] addr;
             integer i;
@@ -258,7 +295,7 @@ module ddr4_prober #(
                         end
                     end
 
-                    // ── Phase 1: Burst Sequential Write ──
+                    // -- Burst Sequential Write --
                     BIST_BURST_WRITE: begin
                         if (!i_wb_stall) begin
                             write_addr <= write_addr + 1'b1;
@@ -266,7 +303,7 @@ module ddr4_prober #(
                             wb_data_r  <= gen_pattern(write_addr + 1'b1);
                             if (write_addr == BURST_END) begin
                                 `ifndef YOSYS
-                                $display("[%0t] BIST W→R: wr_pend=%0d outstanding=%0d",
+                                $display("[%0t] BIST W->R: wr_pend=%0d outstanding=%0d",
                                     $realtime, wr_acks_pending, outstanding);
                                 `endif
                                 bist_state <= BIST_BURST_READ;
@@ -279,7 +316,7 @@ module ddr4_prober #(
                         end
                     end
 
-                    // ── Phase 1: Burst Sequential Read ──
+                    // -- Burst Sequential Read --
                     BIST_BURST_READ: begin
                         if (!i_wb_stall) begin
                             read_addr <= read_addr + 1'b1;
@@ -291,7 +328,7 @@ module ddr4_prober #(
                         end
                     end
 
-                    // ── Phase 2: Random-Order Write ──
+                    // -- Random-Order Write (bit-reversed addresses) --
                     BIST_RANDOM_WRITE: begin
                         if (outstanding == 0 && !wb_stb_r) begin
                             wb_stb_r <= 1'b1;
@@ -325,7 +362,7 @@ module ddr4_prober #(
                         end
                     end
 
-                    // ── Phase 2: Random-Order Read ──
+                    // -- Random-Order Read --
                     BIST_RANDOM_READ: begin
                         if (!i_wb_stall && wb_stb_r) begin
                             read_addr <= read_addr + 1'b1;
@@ -337,7 +374,7 @@ module ddr4_prober #(
                         end
                     end
 
-                    // ── Phase 3: Alternating Write/Read (serialized per pair) ──
+                    // -- Alternating Write/Read (serialized per address) --
                     BIST_ALT_WRITE_READ: begin
                         if (outstanding == 0 && !wb_stb_r) begin
                             if (!alt_phase) begin
@@ -365,7 +402,7 @@ module ddr4_prober #(
                         end
                     end
 
-                    // ── Drain outstanding ACKs ──
+                    // -- Drain outstanding ACKs --
                     BIST_FINISH: begin
                         wb_stb_r <= 1'b0;
                         if (outstanding == 0) begin
@@ -420,9 +457,24 @@ module ddr4_prober #(
 
     end endgenerate
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §3 — Debug CSR Register File (gated by DEBUG_CSR_ENABLE)
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // Debug CSR Register File (gated by DEBUG_CSR_ENABLE)
+    // -----------------------------------------------------------------
+    // Read-only register file exposed through the Wishbone address
+    // space (addr MSB=1 in ddr4_top).  4-bit selector -> 16 registers.
+    //
+    // CSR Map:
+    //   0x0 -- Controller + PHY state summary
+    //   0x1 -- Per-bank active/idle status
+    //   0x3 -- BIST correct count
+    //   0x4 -- BIST error count
+    //   0x5 -- BIST FSM state + pass/fail flags
+    //   0x6 -- PHY lane 0: IDELAY center, write-leveling tap, bitslip
+    //   0x7 -- PHY lane 1 (same fields, if BYTE_LANES > 1)
+    //   0xA -- Configuration readback (BYTE_LANES, BIST_MODE)
+    //   0xB -- IP version (currently 1.0)
+    //   0xC -- Write-only: bit[0] triggers BIST start
+    // -----------------------------------------------------------------
     generate if (DEBUG_CSR_ENABLE) begin : gen_csr
 
         reg [31:0] csr_data_r;

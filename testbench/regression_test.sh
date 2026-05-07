@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# regression_test.sh — UberDDR4 calibration regression suite
+# regression_test.sh  -  UberDDR4 calibration regression suite
 #
 # Runs multiple simulation configurations to stress-test the PHY training
 # FSM with realistic fly-by delays and address mapping variants.
@@ -27,16 +27,22 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LOG_DIR="$REPO_ROOT/UberDDR4/testbench/regression_logs"
 
 # Test definitions: "NAME|EXTRA_DEFINES"
-# Fly-by values model real PCB CK daisy-chain routing skew (DDR4-2400, tCK=833ps)
+#
+# Each entry sweeps a different PHY calibration scenario. The fly-by delay
+# values (50-400ps) model real PCB CK daisy-chain routing skew for
+# DDR4-2400 (tCK=833ps). The two map0 tests verify sequential address
+# mapping (ADDR_MAPPING=0) as an alternative to the default BG-interleaved.
+#
+# Every test runs the full testbench (init, BIST, phases A-Q, CSR checks).
 ALL_TESTS=(
-    "calib_baseline|"
-    "calib_flyby_50|-d SIM_FLY_BY_DELAY=50"
-    "calib_flyby_100|-d SIM_FLY_BY_DELAY=100"
-    "calib_flyby_200|-d SIM_FLY_BY_DELAY=200"
-    "calib_flyby_300|-d SIM_FLY_BY_DELAY=300"
-    "calib_flyby_400|-d SIM_FLY_BY_DELAY=400"
-    "calib_map0|-d SIM_ADDR_MAPPING=0"
-    "calib_map0_flyby_200|-d SIM_ADDR_MAPPING=0 -d SIM_FLY_BY_DELAY=200"
+    "calib_baseline|"                                                     # no fly-by, BG-interleaved
+    "calib_flyby_50|-d SIM_FLY_BY_DELAY=50"                              # 50ps skew
+    "calib_flyby_100|-d SIM_FLY_BY_DELAY=100"                            # 100ps skew
+    "calib_flyby_200|-d SIM_FLY_BY_DELAY=200"                            # 200ps skew
+    "calib_flyby_300|-d SIM_FLY_BY_DELAY=300"                            # 300ps skew
+    "calib_flyby_400|-d SIM_FLY_BY_DELAY=400"                            # 400ps skew (worst-case)
+    "calib_map0|-d SIM_ADDR_MAPPING=0"                                   # sequential mapping
+    "calib_map0_flyby_200|-d SIM_ADDR_MAPPING=0 -d SIM_FLY_BY_DELAY=200" # seq + 200ps
 )
 
 if [[ -z "${XILINX_VIVADO:-}" ]]; then
@@ -63,7 +69,7 @@ total=${#TESTS[@]}
 mkdir -p "$LOG_DIR"
 
 echo ""
-echo -e "${BOLD}${CYAN}═══ UberDDR4 Calibration Regression Suite ═══${RESET}"
+echo -e "${BOLD}${CYAN}=== UberDDR4 Calibration Regression Suite ===${RESET}"
 echo -e "${DIM}Vivado: $XILINX_VIVADO${RESET}"
 echo -e "${DIM}Tests:  $total${RESET}"
 echo ""
@@ -134,7 +140,7 @@ unset EXTRA_DEFINES
 
 # Summary
 echo ""
-echo -e "${BOLD}═══ REGRESSION SUMMARY ═══${RESET}"
+echo -e "${BOLD}=== REGRESSION SUMMARY ===${RESET}"
 echo ""
 printf "  %-30s %-6s %s\n" "TEST" "RESULT" "TIME"
 printf "  %-30s %-6s %s\n" "----" "------" "----"

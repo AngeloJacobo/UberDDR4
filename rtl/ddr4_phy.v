@@ -7,6 +7,29 @@
 //  Handles OSERDESE3/ISERDESE3/IDELAYE3/ODELAYE3 primitives and the
 //  DFI 3.1 data path. Includes PHY-owned training FSM (gate, eye, WL).
 //
+// Architecture overview:
+//  The PHY sits between the DFI 3.1 interface and the DDR4 SDRAM pins.
+//  One controller clock cycle = 4 DDR4 unit intervals (8:1 DDR SERDES).
+//
+//  Write path:  DFI wrdata -> OSERDESE3 (8:1 DDR) -> ODELAYE3 -> IOBUF -> pad
+//  Read path:   pad -> IOBUF -> IDELAYE3 -> ISERDESE3 (1:8 DDR) -> bitslip
+//               barrel shifter -> DFI rddata
+//  Clock path:  OSERDESE3 (constant 01010101 toggle) -> OBUFDS -> CK/CK#
+//  Cmd/Addr:    OSERDESE3 (SDR 4:1, doubled bits) -> OBUF -> DDR4 CA pins
+//
+//  Training FSM (runs once after IDELAYCTRL ready, driven by MC):
+//   1. Gate training:  Bitslip alignment using MPR page 0 pattern.
+//                      ISERDESE3 has no BITSLIP pin, so we do it in fabric
+//                      with a 16-bit barrel shifter per DQ bit.
+//   2. Eye training:   Sweep IDELAYE3 taps across the DQ data eye, find
+//                      first/last passing tap, load the center tap.
+//   3. Write leveling: Sweep ODELAYE3 DQS tap to find the 0->1 CK edge
+//                      on DQ[0]. DQ ODELAYE3 tracks DQS to keep 90 deg.
+//
+//  EN_VTC (voltage-temperature compensation): held LOW during training
+//  so delay taps can be changed. Set HIGH in normal operation so the
+//  IDELAYE3/ODELAYE3 primitives track PVT drift automatically.
+//
 // Engineer: Angelo C. Jacobo
 //
 ////////////////////////////////////////////////////////////////////////////////
@@ -71,14 +94,14 @@ module ddr4_phy #(
     // DFI Status
     input wire                              i_dfi_init_start,
     output wire                             o_dfi_init_complete,
-    // DFI Training (MC → PHY)
+    // DFI Training (MC -> PHY)
     input wire                              i_dfi_rdlvl_en,
     input wire                              i_dfi_rdlvl_gate_en,
     input wire                              i_dfi_wrlvl_en,
     input wire                              i_dfi_wrlvl_strobe,
     input wire [3:0]                        i_dfi_lvl_pattern,
     input wire                              i_dfi_lvl_periodic,
-    // DFI Training (PHY → MC)
+    // DFI Training (PHY -> MC)
     output reg [BYTE_LANES-1:0]             o_dfi_rdlvl_resp,
     output reg [BYTE_LANES-1:0]             o_dfi_wrlvl_resp,
     output wire                             o_dfi_rdlvl_req,
@@ -101,7 +124,7 @@ module ddr4_phy #(
     inout  wire [BYTE_LANES-1:0]            io_ddr4_dqs_n,
     // Status
     output wire                             o_idelayctrl_rdy,
-    // Debug status (flat packed for synthesis, Phase 8)
+    // Debug status (flat packed for synthesis)
     output wire [3:0]                       o_phy_state,
     output wire [9*BYTE_LANES-1:0]          o_phy_idelay_center,
     output wire [9*BYTE_LANES-1:0]          o_phy_wl_tap,
@@ -121,19 +144,19 @@ module ddr4_phy #(
                CMD_BG_START = 20,
                CMD_BA_START = 18;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §2 — ODELAYE3/IDELAYE3 DELAY_VALUE Configuration (SPEC §7)
-    // DQS output 90° shifted relative to DQ via ODELAYE3 DELAY_VALUE (ps).
-    // BISC calibrates ps→taps automatically (UG571 §2, p.183).
-    // WL (Phase 7D) reads CNTVALUEOUT for the BISC-calibrated starting tap.
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // ODELAYE3/IDELAYE3 delay configuration
+    // DQS output is 90 deg shifted relative to DQ via ODELAYE3 (ps).
+    // BISC calibrates ps->taps automatically (UG571 ch.2, p.183).
+    // Write leveling reads CNTVALUEOUT for the BISC-calibrated starting tap.
+    // -----------------------------------------------------------------
     localparam integer DATA_INITIAL_ODELAY_TAP = 0;
     localparam integer DATA_INITIAL_IDELAY_TAP = 0;
     localparam integer DQS_ODELAY_PS = DDR4_CLK_PERIOD / 4;
     localparam integer DQS_INITIAL_IDELAY_TAP  = 0;
-    // ═══════════════════════════════════════════════════════════════════
-    // §13 — PHY Training FSM Constants (SPEC §9.3)
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // PHY Training FSM state encoding
+    // -----------------------------------------------------------------
     localparam[3:0] PHY_IDLE          = 4'd0,
                     PHY_GATE_BITSLIP  = 4'd1,
                     PHY_GATE_DQS_FIND = 4'd2,
@@ -147,8 +170,8 @@ module ddr4_phy #(
                     PHY_WL_CHECK      = 4'd10,
                     PHY_WL_DONE       = 4'd11;
 
-    // MPR page 0 after ISERDESE3 8:1 DDR deserialize (JEDEC §4.25)
-    // Q[0]=D0=0(rise), Q[1]=D1=1(fall), ... Q[7]=D7=1(fall) → 8'b10101010
+    // MPR page 0 after ISERDESE3 8:1 DDR deserialize (JEDEC JESD79-4D ch.4.25)
+    // Q[0]=D0=0(rise), Q[1]=D1=1(fall), ... Q[7]=D7=1(fall) -> 8'b10101010
     localparam [7:0] MPR_PATTERN = 8'b10101010;
 
     // Eye training: sweep IDELAYE3 in steps of 4 (512/4 = 128 iterations)
@@ -157,7 +180,7 @@ module ddr4_phy #(
     // Write leveling: sweep ODELAYE3 DQS in steps of 4
     localparam [3:0] WL_TAP_STEP = 4'd4;
 
-    // VTC settle: ~200 controller_clk cycles after EN_VTC assertion (SPEC §7.5)
+    // VTC settle: ~200 controller_clk cycles after EN_VTC assertion (UG571)
     localparam [7:0] VTC_SETTLE_CYCLES = 8'd200;
 
     // Derived constants for DFI data indexing
@@ -166,12 +189,15 @@ module ddr4_phy #(
     localparam MASK_PHASE_W  = 2 * BYTE_LANES;               // mask bits per phase
     localparam DM_ENABLED    = (DQ_BITS != 4);                // x4 has no DM pin
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §5 — Synchronous Reset
-    // 2-FF synchronizer: i_rst_n (async, active-low) → sync_rst (sync, active-high)
-    // Per UG571 §7.6: all SERDES/delay primitives share this reset.
-    // IDELAYCTRL reset is released separately (see §14).
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // Synchronous Reset
+    // 2-FF synchronizer: i_rst_n (async, active-low) -> sync_rst (sync, active-high)
+    // Per UG571 ch.7.6: all SERDES/delay primitives share this reset.
+    // IDELAYCTRL reset is released separately (see IDELAYCTRL section below).
+    //
+    // Why 2-FF? Async assert, sync deassert avoids metastability on the
+    // deassert edge. The shift register flushes in 2 clocks.
+    // -----------------------------------------------------------------
     reg [1:0] rst_sync_q;
     wire sync_rst;
 
@@ -195,8 +221,8 @@ module ddr4_phy #(
     end
     assign ctrl_rst_n = ctrl_rst_sync_q[1];
 
-    // IDELAYCTRL reset: released after SERDES/delay primitives
-    // sync_rst is in i_ddr4_clk domain — synchronize into i_ref_clk first
+    // IDELAYCTRL reset: released after SERDES/delay primitives.
+    // sync_rst is in i_ddr4_clk domain -- synchronize into i_ref_clk first.
     reg [1:0] refclk_rst_sync_q;
     reg [2:0] idelayctrl_rst_pipe_q;
     wire idelayctrl_rst;
@@ -216,9 +242,10 @@ module ddr4_phy #(
     end
     assign idelayctrl_rst = idelayctrl_rst_pipe_q[2];
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Stubs: training request outputs (Phase 7)
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // DFI training request outputs
+    // PHY-initiated training requests are not used; MC drives training.
+    // -----------------------------------------------------------------
     assign o_dfi_rdlvl_req     = 1'b0;
     assign o_dfi_rdlvl_gate_req = 1'b0;
     assign o_dfi_wrlvl_req     = 1'b0;
@@ -228,10 +255,11 @@ module ddr4_phy #(
     assign o_dfi_init_complete = idelayctrl_rdy_w;
     assign o_idelayctrl_rdy   = idelayctrl_rdy_w;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §6 — Clock Output Path
-    // OSERDESE3 (DATA_WIDTH=8, constant 01010101 toggle) → OBUFDS → CK/CK#
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // Clock Output Path
+    // OSERDESE3 (DATA_WIDTH=8, constant 01010101 toggle) -> OBUFDS -> CK/CK#
+    // The SERDES toggles every UI, producing the DDR4 memory clock.
+    // -----------------------------------------------------------------
     wire ck_oserdes_out;
 
     OSERDESE3 #(
@@ -257,18 +285,23 @@ module ddr4_phy #(
         .OB(o_ddr4_ck_n)
     );
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §7 — Command/Address Output Path (DFI 3.1 §3.2, each ctrl cycle = 4 DDR4 UI)
-    // Each CA pin: OSERDESE3 (SDR 4:1, DATA_WIDTH=8) → OBUF
+    // -----------------------------------------------------------------
+    // Command/Address Output Path (DFI 3.1, each ctrl cycle = 4 DDR4 UI)
+    // Each CA pin: OSERDESE3 (SDR 4:1, DATA_WIDTH=8) -> OBUF
     // D = {slot3, slot3, slot2, slot2, slot1, slot1, slot0, slot0}
-    // D[0] is transmitted first (UG571 Table 2-8)
-    // ═══════════════════════════════════════════════════════════════════
+    // D[0] is transmitted first (UG571 Table 2-8).
+    // Each DFI phase maps to one DDR4 command slot. Bits are doubled
+    // because OSERDESE3 DATA_WIDTH=8 in DDR mode gives 4 edges, but
+    // CA pins are SDR (active on rising edge only). Doubling each bit
+    // ensures the same value appears on both the rising and falling
+    // edge of each UI, so the DRAM sees a clean SDR command.
+    // -----------------------------------------------------------------
 
     // Pack DFI command inputs into per-slot command words for easy bit extraction
     // DDR4 pin mux (JESD79-4D Table 35): physical pins A16/A15/A14 carry
     // {RAS_n, CAS_n, WE_n} when ACT_n=1, or row address bits when ACT_n=0.
     // The DFI interface keeps these as separate signals; the PHY muxes them
-    // onto the address bus here (UBERDDR4_PLAN §8.3, SPEC §2.3).
+    // onto the address bus here.
     wire [CMD_LEN-1:0] dfi_cmd [3:0];
 
     generate
@@ -282,7 +315,7 @@ module ddr4_phy #(
                 i_dfi_address[17*slot +: 14]
             };
 
-            // BG padding: always 2 bits in cmd word (PLAN §6.4: bg at [20:19])
+            // BG padding: always 2 bits in cmd word (bg at [20:19])
             wire [1:0] slot_bg_padded = i_dfi_bg[BG_BITS*slot +: BG_BITS];
 
             assign dfi_cmd[slot] = {
@@ -392,7 +425,7 @@ module ddr4_phy #(
     endgenerate
 
     // Single-bit control pins: CS_n, ACT_n, CKE, ODT, RESET_n
-    // Helper macro pattern: OSERDESE3 → OBUF for a single command-word bit
+    // Helper macro pattern: OSERDESE3 -> OBUF for a single command-word bit
     generate
         genvar cpin;
         for (cpin = 0; cpin < 5; cpin = cpin + 1) begin : gen_ctrl
@@ -426,7 +459,7 @@ module ddr4_phy #(
                 .T(1'b0)
             );
 
-            // Output buffer — connect to the right pin
+            // Output buffer -- connect to the right pin
             if (cpin == 0) begin : cs_buf
                 OBUF obuf_cs (.I(ctrl_oserdes_out), .O(o_ddr4_cs_n));
             end else if (cpin == 1) begin : act_buf
@@ -441,17 +474,17 @@ module ddr4_phy #(
         end
     endgenerate
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §12 — Write Tri-State Control + DQS Pattern (SPEC §12.4, §12.3)
+    // -----------------------------------------------------------------
+    // Write Tri-State Control + DQS Pattern
     // PHY manages OE from dfi_wrdata_en: data + postamble.
-    // OSERDESE3 T=1 → tri-state, T=0 → driven.
+    // OSERDESE3 T=1 -> tri-state, T=0 -> driven.
     //
     // OSERDESE3 pipeline adds 1 CLKDIV latency to both OQ and T_OUT.
     // The shift register must compensate: each enable term here becomes
-    // 1 cycle later at the pad.  Effective pad timing:
+    // 1 cycle later at the pad. Effective pad timing:
     //   DQS: preamble(1) + data(N) + postamble(1) = shift[0..2] + wrdata_en
     //   DQ:  data(N) + postamble(1)                = shift[0..1] + wrdata_en
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
     wire wrdata_en_any = |i_dfi_wrdata_en;
 
     reg [3:0] wrdata_en_shift;
@@ -470,7 +503,7 @@ module ddr4_phy #(
     wire dqs_tristate = ~dqs_output_enable;
     wire dq_tristate  = ~dq_output_enable;
 
-    // WL state detection — used by DQS pattern and tristate overrides
+    // WL state detection -- used by DQS pattern and tristate overrides
     wire wl_active;
 
     // DQS pattern: toggle during data, single rising edge during WL strobe
@@ -492,15 +525,26 @@ module ddr4_phy #(
     wire wl_dqs_drive = wl_dqs_strobe | wl_dqs_strobe_d1;
     wire dqs_tristate_wl = wl_active ? ~wl_dqs_drive : dqs_tristate;
 
-    // EN_VTC: LOW during training (tap changes), HIGH in normal operation (SPEC §7.5)
+    // EN_VTC: LOW during training (tap changes), HIGH in normal operation (UG571).
     // TIME mode requires VTC active after calibration for PVT drift compensation.
     reg en_vtc_q;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §8 — DQ Data Path (per bit, per byte lane) — SPEC §12.2, §8.4
-    // Write: OSERDESE3(8:1 DDR) → ODELAYE3 → IOBUF → DQ pad
-    // Read:  DQ pad → IOBUF → IDELAYE3 → ISERDESE3(1:8 DDR)
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // DQ Data Path (per bit, per byte lane)
+    // Write: OSERDESE3(8:1 DDR) -> ODELAYE3 -> IOBUF -> DQ pad
+    // Read:  DQ pad -> IOBUF -> IDELAYE3 -> ISERDESE3(1:8 DDR)
+    //
+    // ISERDESE3 Q[7:0] mapping (8:1 DDR deserialize, UG571 Table 3-2):
+    //   Q[0] = first bit captured (phase 0, rise)
+    //   Q[1] = second bit captured (phase 0, fall)
+    //   ...
+    //   Q[7] = eighth bit captured (phase 3, fall)
+    // So Q[2*p] = DFI phase p rise beat, Q[2*p+1] = DFI phase p fall beat.
+    //
+    // OSERDESE3 D[7:0] mapping (8:1 DDR serialize, UG571 Table 2-8):
+    //   D[0] = first bit transmitted (phase 0, rise)
+    //   D[7] = last bit transmitted (phase 3, fall)
+    // -----------------------------------------------------------------
     wire [7:0] iserdes_dq_q  [TOTAL_DQ-1:0];
     wire [7:0] iserdes_dqs_q [BYTE_LANES-1:0]; // raw DQS ISERDESE3 (gate training)
 
@@ -521,7 +565,7 @@ module ddr4_phy #(
             for (dq_bit = 0; dq_bit < DQ_BITS; dq_bit = dq_bit + 1) begin : gen_dq_bit
                 localparam integer DQ_IDX = dq_lane * DQ_BITS + dq_bit;
 
-                // DFI wrdata → OSERDESE3 D mapping (SPEC §12.2)
+                // DFI wrdata -> OSERDESE3 D mapping
                 // D[0]=first transmitted, {p3_fall, p3_rise, ..., p0_fall, p0_rise}
                 wire [7:0] dq_wr_d = {
                     i_dfi_wrdata[3*DFI_DATA_WIDTH + BEAT_WIDTH + DQ_IDX],
@@ -545,7 +589,7 @@ module ddr4_phy #(
                     .RST(sync_rst), .T(dq_tristate)
                 );
 
-                // DQ write path: OSERDESE3 → ODELAYE3 → IOBUF (PLAN §7.3)
+                // DQ write path: OSERDESE3 -> ODELAYE3 -> IOBUF
                 wire odelay_dq_out;
                 (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
                 ODELAYE3 #(
@@ -607,11 +651,13 @@ module ddr4_phy #(
         end
     endgenerate
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §9 — DQS Strobe Path (per byte lane) — SPEC §12.3, §12.4
-    // Write: OSERDESE3(dqs_pattern) → ODELAYE3 → IOBUFDS → DQS±
-    // Read:  DQS± → IOBUFDS → IDELAYE3 → ISERDESE3 (training only)
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // DQS Strobe Path (per byte lane)
+    // Write: OSERDESE3(dqs_pattern) -> ODELAYE3 -> IOBUFDS -> DQS+/-
+    // Read:  DQS+/- -> IOBUFDS -> IDELAYE3 -> ISERDESE3 (training only)
+    // The DQS ISERDESE3 is only used during gate training and write
+    // leveling feedback. Normal reads use the DQ ISERDESE3 outputs.
+    // -----------------------------------------------------------------
     generate
         genvar dqs_lane;
         for (dqs_lane = 0; dqs_lane < BYTE_LANES; dqs_lane = dqs_lane + 1) begin : gen_dqs
@@ -673,7 +719,7 @@ module ddr4_phy #(
                 .CASC_RETURN(1'b0), .CASC_OUT()
             );
 
-            // DQS ISERDESE3 — used during training (gate + WL feedback)
+            // DQS ISERDESE3 -- used during training (gate + WL feedback)
             ISERDESE3 #(
                 .DATA_WIDTH(8), .FIFO_ENABLE("FALSE"),
                 .FIFO_SYNC_MODE("FALSE"),
@@ -689,16 +735,16 @@ module ddr4_phy #(
         end
     endgenerate
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §10 — DM_n Mask Path (per byte lane, x8/x16 only) — SPEC §5.2
-    // dfi_wrdata_mask (active-HIGH) inverted → DM_n (active-LOW)
-    // x4 devices: DM_ENABLED=0, stub DM_n=1
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // DM_n Mask Path (per byte lane, x8/x16 only)
+    // dfi_wrdata_mask (active-HIGH) inverted -> DM_n (active-LOW on DRAM)
+    // x4 devices: DM_ENABLED=0, DM_n tied high (no mask pin)
+    // -----------------------------------------------------------------
     generate
         if (DM_ENABLED) begin : gen_dm
             genvar dm_lane;
             for (dm_lane = 0; dm_lane < BYTE_LANES; dm_lane = dm_lane + 1) begin : gen_dm_lane
-                // DFI mask → DM_n OSERDESE3 D mapping (inverted, SPEC §5.2)
+                // DFI mask -> DM_n OSERDESE3 D mapping (inverted for active-low)
                 wire [7:0] dm_d = {
                     ~i_dfi_wrdata_mask[3*MASK_PHASE_W + BYTE_LANES + dm_lane],
                     ~i_dfi_wrdata_mask[3*MASK_PHASE_W + dm_lane],
@@ -746,29 +792,31 @@ module ddr4_phy #(
         end
     endgenerate
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §11 — Fabric Bitslip Barrel Shifter (SPEC §8.7)
-    // ISERDESE3 has no BITSLIP pin; alignment done in fabric using a
-    // {prev, cur} 16-bit window per DQ bit, indexed by per-lane count.
-    // Phase 6: bitslip_count=0 (no calibration). Phase 7 sets it.
-    // ═══════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------
+    // Fabric Bitslip Barrel Shifter
+    // ISERDESE3 has no BITSLIP pin (unlike ISERDESE2), so alignment is
+    // done in fabric. We keep {prev_cycle, cur_cycle} = 16-bit window
+    // per DQ bit and barrel-shift by the per-lane bitslip_count.
+    // Gate training determines the correct bitslip_count for each lane.
+    // Before training, bitslip_count=0 (no correction applied).
+    // -----------------------------------------------------------------
     reg [7:0]  prev_iserdes_q [TOTAL_DQ-1:0];
     reg [2:0]  bitslip_count_q [BYTE_LANES-1:0];
     wire [7:0] aligned_dq [TOTAL_DQ-1:0];
 
-    // §13 — PHY training FSM state registers
+    // PHY training FSM state registers
     reg [3:0] phy_state;
     reg [$clog2(BYTE_LANES > 1 ? BYTE_LANES : 2)-1:0] train_lane;
     reg [2:0] phy_timer;
     reg [3:0] bitslip_shift_count;
 
-    // Eye training registers (Phase 7C)
+    // Eye training registers (IDELAYE3 sweep)
     reg [8:0] sweep_tap;
     reg [8:0] first_pass_tap [BYTE_LANES-1:0];
     reg [8:0] last_pass_tap  [BYTE_LANES-1:0];
     reg       eye_found      [BYTE_LANES-1:0];
 
-    // Write leveling registers (Phase 7D)
+    // Write leveling registers (ODELAYE3 DQS sweep)
     reg [8:0] wl_tap        [BYTE_LANES-1:0];
     reg [8:0] wl_dq_tap     [BYTE_LANES-1:0];
     reg       wl_prev_dq0   [BYTE_LANES-1:0];
@@ -789,11 +837,19 @@ module ddr4_phy #(
         end
     endgenerate
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §11b — DFI Read Data Packing + rddata_valid (SPEC §8.5)
+    // -----------------------------------------------------------------
+    // DFI Read Data Packing + rddata_valid
     // Pack aligned ISERDESE3 outputs into flat o_dfi_rddata vector.
     // rddata_valid follows rddata_en with 1-cycle capture latency.
-    // ═══════════════════════════════════════════════════════════════════
+    //
+    // How packing works:
+    //   For each DQ bit, the aligned_dq[idx] byte contains 8 beats.
+    //   aligned_dq[idx][2*phase]     -> DFI rddata rise beat for that phase
+    //   aligned_dq[idx][2*phase + 1] -> DFI rddata fall beat for that phase
+    //   The flat DFI vector groups bits as:
+    //     [phase*DFI_DATA_WIDTH + lane*DQ_BITS + bit] = rise beat
+    //     [phase*DFI_DATA_WIDTH + BEAT_WIDTH + lane*DQ_BITS + bit] = fall beat
+    // -----------------------------------------------------------------
     integer dfi_pack_lane, dfi_pack_bit, dfi_pack_phase, dfi_pack_idx;
 
     always @(posedge i_controller_clk) begin
@@ -843,7 +899,7 @@ module ddr4_phy #(
             for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
                 prev_iserdes_q[dfi_pack_idx] <= iserdes_dq_q[dfi_pack_idx];
 
-            // Pack aligned read data into DFI format (SPEC §8.5)
+            // Pack aligned read data into DFI format.
             // Gated by rddata_en: capture once, hold until next read.
             // Without gating, the next cycle overwrites valid data with X
             // (ISERDESE3 Q reverts to X once the DRAM stops driving DQ).
@@ -865,12 +921,12 @@ module ddr4_phy #(
             // rddata_valid: assert 1 cycle after rddata_en
             o_dfi_rddata_valid <= i_dfi_rddata_en;
 
-            // ═══════════════════════════════════════════════════════════
-            // §13 — PHY Training FSM (SPEC §9.3)
+            // ---------------------------------------------------------
+            // PHY Training FSM
             // Gate training: bitslip alignment using MPR page 0.
             // Eye training: IDELAYE3 DQ tap sweep, find eye, center.
-            // Write leveling: ODELAYE3 DQS tap sweep, find 0→1 on DQ[0].
-            // ═══════════════════════════════════════════════════════════
+            // Write leveling: ODELAYE3 DQS tap sweep, find 0->1 on DQ[0].
+            // ---------------------------------------------------------
             begin
                 case (phy_state)
                     PHY_IDLE: begin
@@ -912,7 +968,7 @@ module ddr4_phy #(
                         end
                     end
 
-                    // ── Gate training (Phase 7B) ──────────────────────
+                    // -- Gate training (bitslip alignment) -------------
                     PHY_GATE_BITSLIP: begin
                         if (phy_timer != 0)
                             phy_timer <= phy_timer - 1'b1;
@@ -964,7 +1020,7 @@ module ddr4_phy #(
                             phy_state <= PHY_IDLE;
                     end
 
-                    // ── Eye training (Phase 7C) ──────────────────────
+                    // -- Eye training (IDELAYE3 DQ sweep) -------------
                     PHY_EYE_SWEEP: begin
                         if (phy_timer != 0) begin
                             if (phy_timer == 3'd3)
@@ -980,7 +1036,7 @@ module ddr4_phy #(
                                 last_pass_tap[train_lane] <= sweep_tap;
                                 // Advance to next tap or finish if at 511
                                 if (sweep_tap >= 9'd508) begin
-                                    // At or past last valid step — eye stays open to end
+                                    // At or past last valid step -- eye stays open to end
                                     phy_state <= PHY_EYE_CENTER;
                                 end else begin
                                     sweep_tap <= sweep_tap + {5'b0, TAP_SWEEP_STEP};
@@ -990,10 +1046,10 @@ module ddr4_phy #(
                             end else begin
                                 // Data mismatch
                                 if (eye_found[train_lane]) begin
-                                    // Eye has closed — we have both boundaries
+                                    // Eye has closed -- we have both boundaries
                                     phy_state <= PHY_EYE_CENTER;
                                 end else begin
-                                    // Haven't found eye yet — keep sweeping
+                                    // Haven't found eye yet -- keep sweeping
                                     if (sweep_tap >= 9'd508) begin
                                         // Exhausted all taps without finding eye
                                         `ifndef YOSYS
@@ -1031,7 +1087,7 @@ module ddr4_phy #(
                             phy_timer <= phy_timer - 1'b1;
                         end else if (|i_dfi_rddata_en) begin
                             if (aligned_dq[train_lane * DQ_BITS] == MPR_PATTERN) begin
-                                // Verified — advance to next lane or finish
+                                // Verified -- advance to next lane or finish
                                 if (train_lane < BYTE_LANES - 1) begin
                                     train_lane <= train_lane + 1'b1;
                                     sweep_tap <= 9'd0;
@@ -1051,7 +1107,7 @@ module ddr4_phy #(
                                     `endif
                                 end
                             end else begin
-                                // Verification failed — flag and proceed
+                                // Verification failed -- flag and proceed
                                 `ifndef YOSYS
                                 $display("[%0t] PHY eye: lane %0d verify FAILED at center tap",
                                     $realtime, train_lane);
@@ -1076,7 +1132,7 @@ module ddr4_phy #(
                             phy_state <= PHY_IDLE;
                     end
 
-                    // ── Write leveling (Phase 7D) ────────────────────
+                    // -- Write leveling (ODELAYE3 DQS sweep) ----------
                     PHY_WL_SAMPLE: begin
                         if (phy_timer != 0) begin
                             if (phy_timer == 3'd3) begin
@@ -1095,10 +1151,10 @@ module ddr4_phy #(
                         if (phy_timer != 0)
                             phy_timer <= phy_timer - 1'b1;
                         else begin
-                            // Write leveling edge detection (JESD79-4D §4.18):
-                            // prev initialized to 0; detect 0→1 CK crossing.
+                            // Write leveling edge detection (JESD79-4D ch.4.18):
+                            // prev initialized to 0; detect 0->1 CK crossing.
                             // Lockstep: both DQ and DQS taps incremented
-                            // together to preserve the 90° offset.
+                            // together to preserve the 90 deg offset.
                             `ifndef YOSYS
                             $display("[%0t] PHY WL sweep: lane %0d dqs_tap=%0d dq_tap=%0d DQ=%0b prev=%0b",
                                 $realtime, train_lane, wl_tap[train_lane],
@@ -1180,11 +1236,13 @@ module ddr4_phy #(
         end
     end
 
-    // ═══════════════════════════════════════════════════════════════════
-    // §14 — IDELAYCTRL
+    // -----------------------------------------------------------------
+    // IDELAYCTRL
     // Required for IDELAYE3/ODELAYE3 in TIME mode (UG571).
-    // Reset released after SERDES primitives per UG571 §7.6.
-    // ═══════════════════════════════════════════════════════════════════
+    // Reset released after SERDES primitives per UG571 ch.7.6.
+    // Once RDY asserts, the delay taps are calibrated and the PHY
+    // signals dfi_init_complete to the memory controller.
+    // -----------------------------------------------------------------
     (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
     IDELAYCTRL idelayctrl_inst (
         .REFCLK(i_ref_clk),
@@ -1192,9 +1250,10 @@ module ddr4_phy #(
         .RDY(idelayctrl_rdy_w)
     );
 
-    // ═══════════════════════════════════════
-    // §15 — Debug Status Assigns (Phase 8)
-    // ═══════════════════════════════════════
+    // -----------------------------------------------------------------
+    // Debug Status Assigns
+    // Expose training results for ILA / chipscope probing.
+    // -----------------------------------------------------------------
     assign o_phy_state = phy_state;
     generate
         genvar dbg_lane;

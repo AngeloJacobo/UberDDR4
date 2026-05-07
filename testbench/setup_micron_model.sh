@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# setup_micron_model.sh — Create symlinks for the Micron DDR4 behavioral model
+# setup_micron_model.sh  -  Create symlinks for the Micron DDR4 behavioral model
 #
 # The Micron DDR4 model ships with Vivado and cannot be redistributed.
 # This script creates symlinks in testbench/micron/ pointing to the model
@@ -12,6 +12,8 @@
 #
 # Usage (from repo root):
 #   ./UberDDR4/testbench/setup_micron_model.sh
+#
+# Safe to re-run: ln -sf overwrites existing symlinks without error.
 #
 set -euo pipefail
 

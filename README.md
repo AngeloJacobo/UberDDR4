@@ -1,11 +1,11 @@
 
-# UberDDR4 — Open Source DDR4 SDRAM Controller
+# UberDDR4 -- Open Source DDR4 SDRAM Controller
 
 An open-source, fully parameterized DDR4 SDRAM controller targeting Xilinx UltraScale+ FPGAs. Built as the successor to [UberDDR3](https://github.com/AngeloJacobo/UberDDR3), this 4:1 memory controller provides a Wishbone B4 pipelined interface (with optional AXI4 wrapper) and handles the complete DDR4 initialization sequence, refresh scheduling, bank/bank-group management, PHY calibration, and built-in self-test.
 
 **Features:**
 - Configurable timing parameters auto-derived from clock periods (DDR4-1600 through DDR4-2400)
-- 4 bank groups × 4 banks with full tFAW/tRRD/tCCD_L tracking
+- 4 bank groups x 4 banks with full tFAW/tRRD/tCCD_L tracking
 - Bank-group interleaved address mapping for maximum throughput
 - Write leveling, read gate training (bitslip), and read eye training (IDELAY tap sweep)
 - Built-in self-test (BIST) with burst, random, and alternating write-read patterns
@@ -22,8 +22,9 @@ This project is funded through [NGI0 Entrust](https://nlnet.nl/entrust), a fund 
 - [Getting Started](#getting-started)
   - [Instantiate Design](#heavy_check_mark-instantiate-design)
   - [Create Constraint File](#heavy_check_mark-create-constraint-file)
-- [Lint and Formal Verification](#lint-and-formal-verification)
-- [Simulation](#simulation)
+- [Running Lint](#running-lint)
+- [Running Formal Verification](#running-formal-verification)
+- [Running Simulation](#running-simulation)
 - [Architecture](#architecture)
   - [CSR Register Map](#csr-register-map)
 - [File Structure](#file-structure)
@@ -43,9 +44,9 @@ For **AXI4** integration, use [`rtl/axi/ddr4_top_axi.v`](rtl/axi/ddr4_top_axi.v)
 | Parameter | Default | Description |
 | :---: | :---: | :--- |
 | `CONTROLLER_CLK_PERIOD` | 3333 | Controller clock period in ps (e.g., 3333 ps = 300 MHz) |
-| `DDR4_CLK_PERIOD` | 833 | DDR4 memory clock period in ps (must be ¼ of controller clock) |
-| `ROW_BITS` | 16 | Row address width (14–17) |
-| `COL_BITS` | 10 | Column address width (10–12) |
+| `DDR4_CLK_PERIOD` | 833 | DDR4 memory clock period in ps (must be 1/4 of controller clock) |
+| `ROW_BITS` | 16 | Row address width (14-17) |
+| `COL_BITS` | 10 | Column address width (10-12) |
 | `BA_BITS` | 2 | Bank address width (always 2 for DDR4) |
 | `BG_BITS` | 2 | Bank group bits (2 for x4/x8, 1 for x16) |
 | `DQ_BITS` | 8 | Device data width per chip (4, 8, or 16) |
@@ -68,7 +69,7 @@ For **AXI4** integration, use [`rtl/axi/ddr4_top_axi.v`](rtl/axi/ddr4_top_axi.v)
 | Port | Description |
 | :---: | :--- |
 | `i_controller_clk` | Controller clock with period `CONTROLLER_CLK_PERIOD` |
-| `i_ddr4_clk` | DDR4 PHY clock with period `DDR4_CLK_PERIOD` (4× controller clock) |
+| `i_ddr4_clk` | DDR4 PHY clock with period `DDR4_CLK_PERIOD` (4x controller clock) |
 | `i_ref_clk` | 200 MHz reference clock for IDELAYCTRL |
 | `i_rst_n` | Active-low asynchronous reset |
 
@@ -92,8 +93,8 @@ Generate all clocks from a single MMCM/PLL.
 
 | Port | Description |
 | :---: | :--- |
-| `o_init_done` | Sticky — asserted when calibration (and BIST if enabled) completes successfully |
-| `o_init_failed` | Sticky — asserted on calibration error or BIST failure |
+| `o_init_done` | Sticky -- asserted when calibration (and BIST if enabled) completes successfully |
+| `o_init_failed` | Sticky -- asserted on calibration error or BIST failure |
 
 ## :heavy_check_mark: Create Constraint File
 
@@ -101,40 +102,105 @@ DDR4 I/O pins must be placed in a single I/O bank with SSTL12 or POD12 I/O stand
 
 ***
 
-# Lint and Formal Verification
+# Running Lint
 
-Run [`./run_compile.sh`](run_compile.sh) from the top-level directory to lint, formally verify, and simulate:
+Yosys synthesis check catches width mismatches, unused signals, and inferred latches. Run from the repo root:
 
 ```bash
-./run_compile.sh lint     # Yosys synthesis check
-./run_compile.sh formal   # SymbiYosys formal proofs (4 tasks)
-./run_compile.sh sim      # Xilinx xsim simulation
-./run_compile.sh all      # All of the above
+./run_compile.sh lint
 ```
 
-### Formal Verification Tasks
-
-| Task | Depth | Description |
-| :---: | :---: | :--- |
-| `prove_map0` | 8 | ADDR_MAPPING=0, unbounded k-induction |
-| `prove_map1` | 8 | ADDR_MAPPING=1, unbounded k-induction |
-| `prove_map0_bounded` | 28 | ADDR_MAPPING=0 + bounded stall property |
-| `prove_map1_bounded` | 28 | ADDR_MAPPING=1 + bounded stall property |
-
-25 properties are proven covering Wishbone protocol compliance, refresh scheduling, bank state consistency, timing parameter enforcement, and command serialization.
+This reads every RTL file through Yosys `synth_xilinx` and reports any warnings. No bitstream is produced -- it is a lint-only pass.
 
 ***
 
-# Simulation
+# Running Formal Verification
 
-The simulation uses the [Micron DDR4 SDRAM Verilog Model](https://www.micron.com). Place the Micron model files (`.sv` and `.sva`) under `testbench/` alongside the provided wrapper.
+The formal properties live in [`formal/ddr4_controller_formal.vh`](formal/ddr4_controller_formal.vh) and are included inside `ddr4_controller.v` under `` `ifdef FORMAL ``. The proofs use [SymbiYosys](https://github.com/YosysHQ/sby) with the smtbmc engine (Yices 2 / Boolector).
 
-### Running with Vivado xsim
+### Quick start
 
 ```bash
-cd testbench
-bash run_xsim.sh
+# Run via the top-level wrapper (runs all 4 single-config tasks):
+./run_compile.sh formal
+
+# Or run individual tasks directly:
+sby -f formal/ddr4_singleconfig.sby prove_map0
+sby -f formal/ddr4_singleconfig.sby prove_map1
+sby -f formal/ddr4_singleconfig.sby prove_map0_bounded
+sby -f formal/ddr4_singleconfig.sby prove_map1_bounded
 ```
+
+### Multi-config parameter sweep
+
+A separate .sby file sweeps 24 configurations across different ROW_BITS, COL_BITS, BA_BITS, BG_BITS, and DQ_BITS values:
+
+```bash
+sby -f formal/ddr4_multiconfig.sby
+```
+
+### Formal verification tasks
+
+| Task | Depth | What it proves |
+| :---: | :---: | :--- |
+| `prove_map0` | 8 | All 22 properties with ADDR_MAPPING=0 (row-bg-ba-col), unbounded k-induction |
+| `prove_map1` | 8 | All 22 properties with ADDR_MAPPING=1 (row-ba-col-bg, BG-interleaved), unbounded |
+| `prove_map0_bounded` | 28 | ADDR_MAPPING=0 + bounded worst-case stall latency (Prop 19) |
+| `prove_map1_bounded` | 28 | ADDR_MAPPING=1 + bounded worst-case stall latency (Prop 19) |
+
+25 properties are proven covering Wishbone B4 protocol compliance, bank state consistency, JEDEC timing enforcement (tRCD/tRP/tRAS/tRC/tCCD/tRRD/tWTR/tFAW), command encoding, pipeline data integrity, and scheduler throughput. See the header of `ddr4_controller_formal.vh` for the full property list and verification strategy.
+
+***
+
+# Running Simulation
+
+The simulation uses the [Micron DDR4 SDRAM Verilog Model](https://www.micron.com) under Xilinx Vivado `xsim`.
+
+### Prerequisites
+
+- Vivado (tested with 2023.1+). Set `XILINX_VIVADO` if not on `PATH`.
+- Micron DDR4 model files (`.sv` and `.sva`). Place them under `testbench/` alongside the provided `ddr4_model_wrapper.sv`.
+
+### Running the default simulation
+
+```bash
+bash testbench/run_xsim.sh
+```
+
+Or from the top-level wrapper:
+
+```bash
+./run_compile.sh sim
+```
+
+### Running with fly-by delay override
+
+The `SIM_FLY_BY_DELAY` parameter models PCB trace propagation delay. Override it to test timing margin sensitivity:
+
+```bash
+EXTRA_DEFINES="-d SIM_FLY_BY_DELAY=100" bash testbench/run_xsim.sh
+```
+
+### Running the full regression
+
+The regression script sweeps 8 configurations (DDR4-2400/1600, DQ 8/16, both address mappings):
+
+```bash
+bash testbench/regression_test.sh
+```
+
+### Expected output
+
+A passing run prints `PASS` for each test phase and ends with:
+
+```
+[SUMMARY] All tests PASSED
+$finish called
+```
+
+A failing test prints `FAIL` with the phase name and expected vs. actual data, then the simulation terminates.
+
+### Test phases
 
 The testbench (`ddr4_sim_top.sv`) executes 19 self-checking test phases:
 
@@ -142,12 +208,12 @@ The testbench (`ddr4_sim_top.sv`) executes 19 self-checking test phases:
 | :---: | :--- |
 | A | Sequential burst writes to BG0/BA0 |
 | B | Sequential burst writes to BG0/BA1 |
-| C | Cross-bank-group writes (BG0 → BG1) |
+| C | Cross-bank-group writes (BG0 -> BG1) |
 | D | Cross-row writes (page miss) |
 | E | Multi-bank-group sequential writes |
 | F | Sequential read-back with data verification |
-| G–H | Additional row/bank read-back |
-| I | Pipeline stress — back-to-back writes |
+| G-H | Additional row/bank read-back |
+| I | Pipeline stress -- back-to-back writes |
 | J | Full pipeline read-back |
 | K | Read-to-write turnaround stress |
 | L | Data masking (byte-lane selective writes) |
@@ -159,29 +225,27 @@ The testbench (`ddr4_sim_top.sv`) executes 19 self-checking test phases:
 | CSR | Debug CSR register read/verify |
 | RETRIG | BIST re-trigger via CSR and post-check |
 
-A regression script (`testbench/regression_test.sh`) sweeps 8 configurations across DDR4-2400/1600, DQ 8/16, and both address mappings.
-
 ***
 
 # Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│               ddr4_top.v                    │
-│  ┌──────────────┐  ┌──────────────────────┐ │
-│  │ ddr4_prober  │  │   ddr4_controller    │ │
-│  │ (BIST + CSR) │  │   (scheduling,       │ │
-│  │              │  │    timing, refresh)   │ │
-│  └──────┬───────┘  └──────────┬───────────┘ │
-│         │    Wishbone mux     │ DFI 3.1     │
-│  WB ────┤                     │             │
-│         │              ┌──────┴───────────┐ │
-│         │              │    ddr4_phy      │ │
-│         │              │  (SERDES, IDELAY,│ │
-│         │              │   training FSM)  │ │
-│         │              └──────┬───────────┘ │
-└─────────┼─────────────────────┼─────────────┘
-          │                     │ DDR4 SDRAM
++---------------------------------------------+
+|               ddr4_top.v                    |
+|  +--------------+  +----------------------+ |
+|  | ddr4_prober  |  |   ddr4_controller    | |
+|  | (BIST + CSR) |  |   (scheduling,       | |
+|  |              |  |    timing, refresh)   | |
+|  +------+-------+  +----------+-----------+ |
+|         |    Wishbone mux     | DFI 3.1     |
+|  WB ----+                     |             |
+|         |              +------+-----------+ |
+|         |              |    ddr4_phy      | |
+|         |              |  (SERDES, IDELAY,| |
+|         |              |   training FSM)  | |
+|         |              +------+-----------+ |
++---------+---------------------+-------------+
+          |                     | DDR4 SDRAM
      o_init_done          ck/addr/cmd/dq/dqs
      o_init_failed
 ```
@@ -189,7 +253,7 @@ A regression script (`testbench/regression_test.sh`) sweeps 8 configurations acr
 For AXI4 integration, `ddr4_top_axi.v` wraps `ddr4_top` with the ZipCPU `axim2wbsp` bridge:
 
 ```
-AXI4 slave ──► axim2wbsp ──► ddr4_top (Wishbone) ──► DDR4
+AXI4 slave --> axim2wbsp --> ddr4_top (Wishbone) --> DDR4
 ```
 
 ### CSR Register Map
@@ -215,33 +279,33 @@ When `DEBUG_CSR_ENABLE=1`, the top address bit selects between DRAM access (bit=
 
 ```
 UberDDR4/
-├── rtl/
-│   ├── ddr4_controller.v      # Memory controller (scheduling, timing, refresh)
-│   ├── ddr4_phy.v             # UltraScale+ PHY (SERDES, IDELAY, training)
-│   ├── ddr4_prober.v          # BIST engine + debug CSR register file
-│   ├── ddr4_top.v             # Top-level (Wishbone interface)
-│   └── axi/
-│       ├── ddr4_top_axi.v     # AXI4 top wrapper
-│       ├── axim2wbsp.v        # ZipCPU AXI-to-WB bridge
-│       ├── aximrd2wbsp.v      # AXI read channel bridge
-│       ├── aximwr2wbsp.v      # AXI write channel bridge
-│       ├── axi_addr.v         # AXI address calculator
-│       ├── sfifo.v            # Synchronous FIFO
-│       ├── skidbuffer.v       # Skid buffer
-│       └── wbarbiter.v        # Wishbone arbiter
-├── formal/
-│   ├── ddr4_controller_formal.vh  # Formal properties (25 assertions)
-│   ├── ddr4_singleconfig.sby      # SymbiYosys config (4 tasks)
-│   ├── ddr4_multiconfig.sby       # Multi-config sweep (24 tasks)
-│   ├── fwb_slave.v                # Wishbone formal slave
-│   ├── mini_fifo.v                # Helper FIFO for formal
-│   └── f_addr_decode.v            # Address decode checker
-├── testbench/
-│   ├── ddr4_sim_top.sv            # Top-level simulation testbench
-│   ├── ddr4_model_wrapper.sv      # Micron model wrapper
-│   ├── run_xsim.sh               # Vivado xsim run script
-│   └── regression_test.sh         # 8-config regression suite
-└── run_compile.sh                 # Build & verification sweep
+|-- rtl/
+|   |-- ddr4_controller.v      # Memory controller (scheduling, timing, refresh)
+|   |-- ddr4_phy.v             # UltraScale+ PHY (SERDES, IDELAY, training)
+|   |-- ddr4_prober.v          # BIST engine + debug CSR register file
+|   |-- ddr4_top.v             # Top-level (Wishbone interface)
+|   +-- axi/
+|       |-- ddr4_top_axi.v     # AXI4 top wrapper
+|       |-- axim2wbsp.v        # ZipCPU AXI-to-WB bridge
+|       |-- aximrd2wbsp.v      # AXI read channel bridge
+|       |-- aximwr2wbsp.v      # AXI write channel bridge
+|       |-- axi_addr.v         # AXI address calculator
+|       |-- sfifo.v            # Synchronous FIFO
+|       |-- skidbuffer.v       # Skid buffer
+|       +-- wbarbiter.v        # Wishbone arbiter
+|-- formal/
+|   |-- ddr4_controller_formal.vh  # Formal properties (25 assertions)
+|   |-- ddr4_singleconfig.sby      # SymbiYosys config (4 tasks)
+|   |-- ddr4_multiconfig.sby       # Multi-config sweep (24 tasks)
+|   |-- fwb_slave.v                # ZipCPU Wishbone B4 protocol monitor
+|   |-- mini_fifo.v                # Pipeline oracle FIFO for formal
+|   +-- f_addr_decode.v            # Independent address decode checker
+|-- testbench/
+|   |-- ddr4_sim_top.sv            # Top-level simulation testbench
+|   |-- ddr4_model_wrapper.sv      # Micron model wrapper
+|   |-- run_xsim.sh               # Vivado xsim run script
+|   +-- regression_test.sh         # 8-config regression suite
++-- run_compile.sh                 # Build & verification sweep
 ```
 
 ***

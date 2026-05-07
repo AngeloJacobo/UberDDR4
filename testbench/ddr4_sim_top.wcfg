@@ -101,7 +101,7 @@
       </wvobject>
    </wvobject>
    <wvobject type="group" fp_name="group:DFI Control">
-      <obj_property name="label">DFI Control (Controller → PHY)</obj_property>
+      <obj_property name="label">DFI Control (Controller -> PHY)</obj_property>
       <obj_property name="DisplayName">label</obj_property>
       <obj_property name="isExpanded"></obj_property>
       <wvobject type="array" fp_name="/ddr4_sim_top/u_dut/u_controller/o_dfi_cs_n">
@@ -193,8 +193,8 @@
          <obj_property name="ObjectShortName">o_dfi_wrlvl_strobe</obj_property>
       </wvobject>
    </wvobject>
-   <wvobject type="group" fp_name="group:DDR4 Interface (PHY → SDRAM)">
-      <obj_property name="label">DDR4 Interface (PHY → SDRAM)</obj_property>
+   <wvobject type="group" fp_name="group:DDR4 Interface (PHY -> SDRAM)">
+      <obj_property name="label">DDR4 Interface (PHY -> SDRAM)</obj_property>
       <obj_property name="DisplayName">label</obj_property>
       <obj_property name="isExpanded"></obj_property>
       <wvobject type="array" fp_name="/ddr4_sim_top/dbg_rom_phase">
