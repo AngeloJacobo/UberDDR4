@@ -1069,14 +1069,14 @@ module ddr4_phy #(
 
                     PHY_EYE_CENTER: begin
                         idelay_cntvalue <=
-                            (first_pass_tap[train_lane] + last_pass_tap[train_lane]) >> 1;
+                            ({1'b0, first_pass_tap[train_lane]} + {1'b0, last_pass_tap[train_lane]}) >> 1;
                         phy_timer <= 3'd4;
                         phy_state <= PHY_EYE_VERIFY;
                         `ifndef YOSYS
                         $display("[%0t] PHY eye: lane %0d first=%0d last=%0d center=%0d",
                             $realtime, train_lane,
                             first_pass_tap[train_lane], last_pass_tap[train_lane],
-                            (first_pass_tap[train_lane] + last_pass_tap[train_lane]) >> 1);
+                            ({1'b0, first_pass_tap[train_lane]} + {1'b0, last_pass_tap[train_lane]}) >> 1);
                         `endif
                     end
 

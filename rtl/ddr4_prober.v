@@ -258,7 +258,7 @@ module ddr4_prober #(
                         $display("[%0t] BIST CHK: addr=%0d exp=%0h got=%0h state=%0d",
                             $realtime, check_addr, expected_data, i_wb_data, bist_state);
                     `endif
-                    if (i_wb_data === expected_data) begin
+                    if (i_wb_data == expected_data) begin
                         correct_count <= correct_count + 1'b1;
                     end else begin
                         error_count <= error_count + 1'b1;
