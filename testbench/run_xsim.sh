@@ -55,6 +55,8 @@ XELAB="$XILINX_VIVADO/bin/xelab"
 XSIM="$XILINX_VIVADO/bin/xsim"
 
 EXTRA_DEFS="${EXTRA_DEFINES:-}"
+MICRON_DENSITY="${MICRON_DENSITY:-DDR4_8G_X8}"
+MICRON_SPEED="${MICRON_SPEED:-FIXED_2400}"
 
 if [[ ! -L "$REPO_ROOT/UberDDR4/testbench/micron/ddr4_model.sv" ]]; then
     fail "Micron DDR4 model symlinks not found in UberDDR4/testbench/micron/"
@@ -83,7 +85,7 @@ step "Compiling RTL"
 #   ALLOW_JITTER - relax Micron model timing checks for sim clock jitter
 #   VCD_DUMP     - tell the TB to dump VCD (xsim can't do SHM)
 step "Compiling simulation sources"
-"$XVLOG" -sv -d DDR4_8G_X8 -d FIXED_2400 -d ALLOW_JITTER -d VCD_DUMP \
+"$XVLOG" -sv -d $MICRON_DENSITY -d $MICRON_SPEED -d ALLOW_JITTER -d VCD_DUMP \
   $EXTRA_DEFS \
   -i UberDDR4/testbench/micron \
   UberDDR4/testbench/micron/arch_package.sv \

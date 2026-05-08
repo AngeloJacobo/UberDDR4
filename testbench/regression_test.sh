@@ -26,24 +26,30 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LOG_DIR="$REPO_ROOT/UberDDR4/testbench/regression_logs"
 
-# Test definitions: "NAME|EXTRA_DEFINES"
-#
-# Each entry sweeps a different PHY calibration scenario. The fly-by delay
-# values (50-400ps) model real PCB CK daisy-chain routing skew for
-# DDR4-2400 (tCK=833ps). The two map0 tests verify sequential address
-# mapping (ADDR_MAPPING=0) as an alternative to the default BG-interleaved.
-#
-# Every test runs the full testbench (init, BIST, phases A-Q, CSR checks).
+# Each line: NAME  DDR4_CLK  DQ  FLYBY  MAP  BIST  DENSITY  MICRON_DEF     MICRON_SPEED  SPECIAL
+# To add a new test configuration, just add a new line to this array.
 ALL_TESTS=(
-    "calib_baseline|"                                                     # no fly-by, BG-interleaved
-    "calib_flyby_50|-d SIM_FLY_BY_DELAY=50"                              # 50ps skew
-    "calib_flyby_100|-d SIM_FLY_BY_DELAY=100"                            # 100ps skew
-    "calib_flyby_200|-d SIM_FLY_BY_DELAY=200"                            # 200ps skew
-    "calib_flyby_300|-d SIM_FLY_BY_DELAY=300"                            # 300ps skew
-    "calib_flyby_400|-d SIM_FLY_BY_DELAY=400"                            # 400ps skew (worst-case)
-    "calib_map0|-d SIM_ADDR_MAPPING=0"                                   # sequential mapping
-    "calib_map0_flyby_200|-d SIM_ADDR_MAPPING=0 -d SIM_FLY_BY_DELAY=200" # seq + 200ps
-    "calib_train_fail|-d SIM_FORCE_TRAIN_FAIL"                          # forced training failure (expects init_failed)
+    # Core x8 DDR4-2400 sweep
+    "baseline          834  8   0    1  1  8  DDR4_8G_X8   FIXED_2400  -"
+    "flyby_50          834  8   50   1  1  8  DDR4_8G_X8   FIXED_2400  -"
+    "flyby_100         834  8   100  1  1  8  DDR4_8G_X8   FIXED_2400  -"
+    "flyby_200         834  8   200  1  1  8  DDR4_8G_X8   FIXED_2400  -"
+    "flyby_300         834  8   300  1  1  8  DDR4_8G_X8   FIXED_2400  -"
+    "flyby_400         834  8   400  1  1  8  DDR4_8G_X8   FIXED_2400  -"
+    "map0              834  8   0    0  1  8  DDR4_8G_X8   FIXED_2400  -"
+    "map0_flyby_200    834  8   200  0  1  8  DDR4_8G_X8   FIXED_2400  -"
+    "bist_full         834  8   0    1  2  8  DDR4_8G_X8   FIXED_2400  -"
+    # x16 PHY support requires 2 DQS/DM per lane (V2 item).
+    # x16 controller logic is verified by formal multiconfig (DQ_BITS=16, BG_BITS=1).
+    # Speed grade sweep
+    "ddr4_1600         1250 8   0    1  1  8  DDR4_8G_X8   FIXED_1600  -"
+    "ddr4_1600_flyby   1250 8   200  1  1  8  DDR4_8G_X8   FIXED_1600  -"
+    "ddr4_2133         937  8   0    1  1  8  DDR4_8G_X8   FIXED_2133  -"
+    "ddr4_2133_flyby   937  8   200  1  1  8  DDR4_8G_X8   FIXED_2133  -"
+    # Density sweep
+    "density_4g        834  8   0    1  1  4  DDR4_4G_X8   FIXED_2400  -"
+    # Error path
+    "train_fail        834  8   0    1  1  8  DDR4_8G_X8   FIXED_2400  TRAIN_FAIL"
 )
 
 if [[ -z "${XILINX_VIVADO:-}" ]]; then
@@ -83,7 +89,20 @@ declare -a RESULTS
 declare -a TIMES
 
 for entry in "${TESTS[@]}"; do
-    IFS='|' read -r NAME DEFINES <<< "$entry"
+    read -r NAME DDR4_CLK DQ FLYBY MAP BIST DENS MICRON_DEF MICRON_SPD SPECIAL <<< "$entry"
+
+    DEFINES="-d SIM_DDR4_CLK_PERIOD=$DDR4_CLK"
+    [[ "$DQ" != "8" ]]      && DEFINES="$DEFINES -d SIM_DQ_BITS=$DQ"
+    [[ "$FLYBY" != "0" ]]   && DEFINES="$DEFINES -d SIM_FLY_BY_DELAY=$FLYBY"
+    [[ "$MAP" != "1" ]]     && DEFINES="$DEFINES -d SIM_ADDR_MAPPING=$MAP"
+    [[ "$BIST" != "1" ]]    && DEFINES="$DEFINES -d SIM_BIST_MODE=$BIST"
+    [[ "$DENS" == "4" ]]    && DEFINES="$DEFINES -d SIM_DENSITY_4G"
+    [[ "$SPECIAL" == "TRAIN_FAIL" ]] && DEFINES="$DEFINES -d SIM_FORCE_TRAIN_FAIL"
+
+    export EXTRA_DEFINES="$DEFINES"
+    export MICRON_DENSITY="$MICRON_DEF"
+    export MICRON_SPEED="$MICRON_SPD"
+
     ((index++))
 
     echo -e "${BOLD}[$index/$total] ${CYAN}$NAME${RESET}"
@@ -94,12 +113,10 @@ for entry in "${TESTS[@]}"; do
     cd "$REPO_ROOT"
     rm -rf xsim.dir
 
-    export EXTRA_DEFINES="$DEFINES"
-
     LOG="$LOG_DIR/${NAME}.log"
 
     start_time=$(date +%s)
-    if timeout 10m bash UberDDR4/testbench/run_xsim.sh > "$LOG" 2>&1; then
+    if timeout 30m bash UberDDR4/testbench/run_xsim.sh > "$LOG" 2>&1; then
         sim_ok=true
     else
         sim_ok=false
@@ -137,7 +154,7 @@ for entry in "${TESTS[@]}"; do
     mv "$LOG" "$LOG_DIR/${result_tag}_${NAME}.log"
 done
 
-unset EXTRA_DEFINES
+unset EXTRA_DEFINES MICRON_DENSITY MICRON_SPEED
 
 # Summary
 echo ""
@@ -148,7 +165,7 @@ printf "  %-30s %-6s %s\n" "----" "------" "----"
 
 index=0
 for entry in "${TESTS[@]}"; do
-    IFS='|' read -r NAME _ <<< "$entry"
+    read -r NAME _ <<< "$entry"
     result="${RESULTS[$index]}"
     elapsed="${TIMES[$index]}"
     if [[ "$result" == "PASS" ]]; then

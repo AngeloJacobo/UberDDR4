@@ -60,14 +60,29 @@ module ddr4_sim_top;
     // Parameters  -  match DUT defaults but use integer-exact clock periods
     // DDR4-2400: tCK=834ps (417ps half, exact integer), 4:1 ratio
     // ===================================================================
+`ifdef SIM_DDR4_CLK_PERIOD
+    localparam DDR4_CLK_PERIOD = `SIM_DDR4_CLK_PERIOD;
+`else
     localparam DDR4_CLK_PERIOD = 834;
+`endif
     localparam CTRL_CLK_PERIOD = DDR4_CLK_PERIOD * 4;
-    localparam DQ_BITS     = 8;
-    localparam BYTE_LANES  = 2;
+
+`ifdef SIM_DQ_BITS
+    localparam DQ_BITS = `SIM_DQ_BITS;
+`else
+    localparam DQ_BITS = 8;
+`endif
+    localparam BYTE_LANES = (DQ_BITS == 16) ? 1 : 2;
+    localparam BG_BITS    = (DQ_BITS == 16) ? 1 : 2;
     localparam ROW_BITS    = 16;
     localparam COL_BITS    = 10;
     localparam BA_BITS     = 2;
-    localparam BG_BITS     = 2;
+
+`ifdef SIM_BIST_MODE
+    localparam TB_BIST_MODE = `SIM_BIST_MODE;
+`else
+    localparam TB_BIST_MODE = 1;
+`endif
     localparam SERDES_RATIO   = 4;
     localparam WB_DATA_BITS   = DQ_BITS * BYTE_LANES * 2 * SERDES_RATIO;
     localparam WB_SEL_BITS    = WB_DATA_BITS / 8;
@@ -98,6 +113,16 @@ module ddr4_sim_top;
     localparam TB_ADDR_MAPPING = `SIM_ADDR_MAPPING;
 `else
     localparam TB_ADDR_MAPPING = 1;
+`endif
+
+    import arch_package::*;
+
+`ifdef SIM_DENSITY_4G
+    localparam TB_DENSITY = _4G;
+    localparam TB_DENSITY_GB = 4;
+`else
+    localparam TB_DENSITY = _8G;
+    localparam TB_DENSITY_GB = 8;
 `endif
 
     // ===================================================================
@@ -191,10 +216,10 @@ module ddr4_sim_top;
         .BG_BITS               (BG_BITS),
         .DQ_BITS               (DQ_BITS),
         .BYTE_LANES            (BYTE_LANES),
-        .DENSITY               (8),
+        .DENSITY               (TB_DENSITY_GB),
         .MICRON_SIM            (1),
         .ADDR_MAPPING          (TB_ADDR_MAPPING),
-        .BIST_MODE             (1),
+        .BIST_MODE             (TB_BIST_MODE),
         .DEBUG_CSR_ENABLE      (1)
     ) u_dut (
         .i_controller_clk (controller_clk),
@@ -242,123 +267,99 @@ module ddr4_sim_top;
     wire [31:0] bist_error_int   = u_dut.prober_error;
 
     // ===================================================================
-    // Micron DDR4 x8 Models  -  direct instantiation (no wrapper module)
+    // Micron DDR4 Models  -  direct instantiation (no wrapper module)
     //
-    // Two independent x8 devices, one per byte lane. The Micron model
-    // ships with Vivado and is not redistributable, so the user must run
-    // setup_micron_model.sh to create symlinks before compiling.
+    // BYTE_LANES independent devices (x8 or x16), one per byte lane.
+    // The Micron model ships with Vivado and is not redistributable,
+    // so the user must run setup_micron_model.sh to create symlinks
+    // before compiling.
     //
-    // iDDR4_0 = byte lane 0 (near end, zero fly-by)
-    // iDDR4_1 = byte lane 1 (far end, CK/CMD delayed by FLY_BY ps)
+    // iDDR4[0] = byte lane 0 (near end, zero fly-by)
+    // iDDR4[1] = byte lane 1 (far end, CK/CMD delayed by FLY_BY ps)
+    //            (only present when BYTE_LANES == 2)
     //
     // Bidirectional DQ/DQS/DM wiring uses the `short` module for xsim
     // (Xilinx's own workaround  -  see MIG sim_tb_top.sv) and `tran`
     // gate primitives for all other simulators. Both approaches create
     // a transparent bidirectional connection without drive-strength issues.
     // ===================================================================
-    import arch_package::*;
+    DDR4_if #(.CONFIGURED_DQ_BITS(DQ_BITS)) iDDR4[BYTE_LANES-1:0]();
 
-    DDR4_if #(.CONFIGURED_DQ_BITS(DQ_BITS)) iDDR4_0();
-    DDR4_if #(.CONFIGURED_DQ_BITS(DQ_BITS)) iDDR4_1();
+    // CK/CMD/ADDR fan-out per byte lane (generate loop)
+    genvar gl;
+    generate for (gl = 0; gl < BYTE_LANES; gl = gl + 1) begin : gen_cmd
+        if (gl == 0) begin : near
+            assign iDDR4[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
+            assign iDDR4[gl].RESET_n   = ddr4_reset_n;
+            assign iDDR4[gl].CKE       = ddr4_cke;
+            assign iDDR4[gl].CS_n      = ddr4_cs_n;
+            assign iDDR4[gl].ACT_n     = ddr4_act_n;
+            assign iDDR4[gl].RAS_n_A16 = ddr4_addr[16];
+            assign iDDR4[gl].CAS_n_A15 = ddr4_addr[15];
+            assign iDDR4[gl].WE_n_A14  = ddr4_addr[14];
+            assign iDDR4[gl].ADDR      = ddr4_addr[13:0];
+            assign iDDR4[gl].BA        = ddr4_ba;
+            assign iDDR4[gl].BG        = (BG_BITS == 1) ? {1'b0, ddr4_bg[0]} : ddr4_bg;
+            assign iDDR4[gl].ODT       = ddr4_odt;
+        end else begin : far
+            assign #(FLY_BY) iDDR4[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
+            assign #(FLY_BY) iDDR4[gl].RESET_n   = ddr4_reset_n;
+            assign #(FLY_BY) iDDR4[gl].CKE       = ddr4_cke;
+            assign #(FLY_BY) iDDR4[gl].CS_n      = ddr4_cs_n;
+            assign #(FLY_BY) iDDR4[gl].ACT_n     = ddr4_act_n;
+            assign #(FLY_BY) iDDR4[gl].RAS_n_A16 = ddr4_addr[16];
+            assign #(FLY_BY) iDDR4[gl].CAS_n_A15 = ddr4_addr[15];
+            assign #(FLY_BY) iDDR4[gl].WE_n_A14  = ddr4_addr[14];
+            assign #(FLY_BY) iDDR4[gl].ADDR      = ddr4_addr[13:0];
+            assign #(FLY_BY) iDDR4[gl].BA        = ddr4_ba;
+            assign #(FLY_BY) iDDR4[gl].BG        = (BG_BITS == 1) ? {1'b0, ddr4_bg[0]} : ddr4_bg;
+            assign #(FLY_BY) iDDR4[gl].ODT       = ddr4_odt;
+        end
+        assign iDDR4[gl].ADDR_17   = 1'b0;
+        assign iDDR4[gl].C         = '0;
+        assign iDDR4[gl].TEN       = 1'b0;
+        assign iDDR4[gl].PARITY    = 1'b0;
+        assign iDDR4[gl].ZQ        = 1'b1;
+        assign iDDR4[gl].PWR       = 1'b1;
+        assign iDDR4[gl].VREF_CA   = 1'b1;
+        assign iDDR4[gl].VREF_DQ   = 1'b1;
+    end endgenerate
 
-    // Command/address fan-out (shared across both devices)
-    assign iDDR4_0.CK        = {ddr4_ck_p, ddr4_ck_n};
-    assign iDDR4_0.RESET_n   = ddr4_reset_n;
-    assign iDDR4_0.CKE       = ddr4_cke;
-    assign iDDR4_0.CS_n      = ddr4_cs_n;
-    assign iDDR4_0.ACT_n     = ddr4_act_n;
-    assign iDDR4_0.RAS_n_A16 = ddr4_addr[16];
-    assign iDDR4_0.CAS_n_A15 = ddr4_addr[15];
-    assign iDDR4_0.WE_n_A14  = ddr4_addr[14];
-    assign iDDR4_0.ADDR      = ddr4_addr[13:0];
-    assign iDDR4_0.BA        = ddr4_ba;
-    assign iDDR4_0.BG        = ddr4_bg;
-    assign iDDR4_0.ODT       = ddr4_odt;
-    assign iDDR4_0.ADDR_17   = 1'b0;
-    assign iDDR4_0.C         = '0;
-    assign iDDR4_0.TEN       = 1'b0;
-    assign iDDR4_0.PARITY    = 1'b0;
-    assign iDDR4_0.ZQ        = 1'b1;
-    assign iDDR4_0.PWR       = 1'b1;
-    assign iDDR4_0.VREF_CA   = 1'b1;
-    assign iDDR4_0.VREF_DQ   = 1'b1;
-
-    // Lane 1 (far end of fly-by)  -  CK/CMD/ADDR delayed by FLY_BY ps.
-    // Models real PCB daisy-chain: FPGA -> chip0 (near) -> chip1 (far).
-    // DQ/DQS stay zero-delay (point-to-point, no fly-by).
-    assign #(FLY_BY) iDDR4_1.CK        = {ddr4_ck_p, ddr4_ck_n};
-    assign #(FLY_BY) iDDR4_1.RESET_n   = ddr4_reset_n;
-    assign #(FLY_BY) iDDR4_1.CKE       = ddr4_cke;
-    assign #(FLY_BY) iDDR4_1.CS_n      = ddr4_cs_n;
-    assign #(FLY_BY) iDDR4_1.ACT_n     = ddr4_act_n;
-    assign #(FLY_BY) iDDR4_1.RAS_n_A16 = ddr4_addr[16];
-    assign #(FLY_BY) iDDR4_1.CAS_n_A15 = ddr4_addr[15];
-    assign #(FLY_BY) iDDR4_1.WE_n_A14  = ddr4_addr[14];
-    assign #(FLY_BY) iDDR4_1.ADDR      = ddr4_addr[13:0];
-    assign #(FLY_BY) iDDR4_1.BA        = ddr4_ba;
-    assign #(FLY_BY) iDDR4_1.BG        = ddr4_bg;
-    assign #(FLY_BY) iDDR4_1.ODT       = ddr4_odt;
-    assign iDDR4_1.ADDR_17   = 1'b0;
-    assign iDDR4_1.C         = '0;
-    assign iDDR4_1.TEN       = 1'b0;
-    assign iDDR4_1.PARITY    = 1'b0;
-    assign iDDR4_1.ZQ        = 1'b1;
-    assign iDDR4_1.PWR       = 1'b1;
-    assign iDDR4_1.VREF_CA   = 1'b1;
-    assign iDDR4_1.VREF_DQ   = 1'b1;
-
-    // Bidirectional DQ wiring  -  short (xsim) / tran (others)
-    genvar gi;
-    generate
-        for (gi = 0; gi < DQ_BITS; gi = gi + 1) begin : bidi_dq
+    // Bidirectional DQ wiring (generate loop over lanes and bits)
+    genvar gi, gj;
+    generate for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_bidi
+        for (gj = 0; gj < DQ_BITS; gj = gj + 1) begin : gen_dq
             `ifdef XILINX_SIMULATOR
-            short bidiDQ0(iDDR4_0.DQ[gi], ddr4_dq[gi]);
-            short bidiDQ1(iDDR4_1.DQ[gi], ddr4_dq[DQ_BITS + gi]);
+            short bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[gi*DQ_BITS + gj]);
             `else
-            tran  bidiDQ0(iDDR4_0.DQ[gi], ddr4_dq[gi]);
-            tran  bidiDQ1(iDDR4_1.DQ[gi], ddr4_dq[DQ_BITS + gi]);
+            tran  bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[gi*DQ_BITS + gj]);
             `endif
         end
-    endgenerate
+        `ifdef XILINX_SIMULATOR
+        short bidiDQS_t(iDDR4[gi].DQS_t, ddr4_dqs_p[gi]);
+        short bidiDQS_c(iDDR4[gi].DQS_c, ddr4_dqs_n[gi]);
+        short bidiDM   (iDDR4[gi].DM_n,   ddr4_dm_n[gi]);
+        `else
+        tran  bidiDQS_t(iDDR4[gi].DQS_t, ddr4_dqs_p[gi]);
+        tran  bidiDQS_c(iDDR4[gi].DQS_c, ddr4_dqs_n[gi]);
+        tran  bidiDM   (iDDR4[gi].DM_n,   ddr4_dm_n[gi]);
+        `endif
+    end endgenerate
 
-    // Bidirectional DQS/DM wiring
-    `ifdef XILINX_SIMULATOR
-    short bidiDQS_t0(iDDR4_0.DQS_t, ddr4_dqs_p[0]);
-    short bidiDQS_c0(iDDR4_0.DQS_c, ddr4_dqs_n[0]);
-    short bidiDM0   (iDDR4_0.DM_n,   ddr4_dm_n[0]);
-    short bidiDQS_t1(iDDR4_1.DQS_t, ddr4_dqs_p[1]);
-    short bidiDQS_c1(iDDR4_1.DQS_c, ddr4_dqs_n[1]);
-    short bidiDM1   (iDDR4_1.DM_n,   ddr4_dm_n[1]);
-    `else
-    tran  bidiDQS_t0(iDDR4_0.DQS_t, ddr4_dqs_p[0]);
-    tran  bidiDQS_c0(iDDR4_0.DQS_c, ddr4_dqs_n[0]);
-    tran  bidiDM0   (iDDR4_0.DM_n,   ddr4_dm_n[0]);
-    tran  bidiDQS_t1(iDDR4_1.DQS_t, ddr4_dqs_p[1]);
-    tran  bidiDQS_c1(iDDR4_1.DQS_c, ddr4_dqs_n[1]);
-    tran  bidiDM1   (iDDR4_1.DM_n,   ddr4_dm_n[1]);
-    `endif
-
-    // Micron DDR4 x8 model instances
+    // Micron DDR4 model instances (one per byte lane)
     wire model_en;
     assign model_en = 1'b1;
 
-    ddr4_model #(
-        .CONFIGURED_DQ_BITS (DQ_BITS),
-        .CONFIGURED_DENSITY (_8G),
-        .CONFIGURED_RANKS   (1)
-    ) u_ddr4_0 (
-        .model_enable (model_en),
-        .iDDR4        (iDDR4_0)
-    );
-
-    ddr4_model #(
-        .CONFIGURED_DQ_BITS (DQ_BITS),
-        .CONFIGURED_DENSITY (_8G),
-        .CONFIGURED_RANKS   (1)
-    ) u_ddr4_1 (
-        .model_enable (model_en),
-        .iDDR4        (iDDR4_1)
-    );
+    generate for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_mem
+        ddr4_model #(
+            .CONFIGURED_DQ_BITS (DQ_BITS),
+            .CONFIGURED_DENSITY (TB_DENSITY),
+            .CONFIGURED_RANKS   (1)
+        ) u_ddr4_mem (
+            .model_enable (model_en),
+            .iDDR4        (iDDR4[gi])
+        );
+    end endgenerate
 
     // ===================================================================
     // Human-Readable Debug Signals
@@ -461,11 +462,11 @@ module ddr4_sim_top;
     // Micron-side command decode  -  reads the DDR4_if interface signals that
     // feed directly into the encrypted Micron model. Proves what the model
     // actually receives after the PHY's OSERDESE3 -> OBUF chain.
-    wire micron_cs_n  = iDDR4_0.CS_n;
-    wire micron_act_n = iDDR4_0.ACT_n;
-    wire micron_ras   = iDDR4_0.RAS_n_A16;
-    wire micron_cas   = iDDR4_0.CAS_n_A15;
-    wire micron_we    = iDDR4_0.WE_n_A14;
+    wire micron_cs_n  = iDDR4[0].CS_n;
+    wire micron_act_n = iDDR4[0].ACT_n;
+    wire micron_ras   = iDDR4[0].RAS_n_A16;
+    wire micron_cas   = iDDR4[0].CAS_n_A15;
+    wire micron_we    = iDDR4[0].WE_n_A14;
 
     always @* begin
         if (micron_cs_n)
@@ -495,8 +496,8 @@ module ddr4_sim_top;
     initial $timeformat(-9, 3, "ns", 0);
 
     initial begin
-        $display("[0ns] CONFIG: FLY_BY=%0dps ADDR_MAPPING=%0d",
-            FLY_BY, TB_ADDR_MAPPING);
+        $display("[0ns] CONFIG: DDR4_CLK=%0dps DQ_BITS=%0d BYTE_LANES=%0d BG_BITS=%0d FLY_BY=%0dps ADDR_MAPPING=%0d BIST_MODE=%0d DENSITY=%0dGb",
+            DDR4_CLK_PERIOD, DQ_BITS, BYTE_LANES, BG_BITS, FLY_BY, TB_ADDR_MAPPING, TB_BIST_MODE, TB_DENSITY_GB);
     end
 
     always @(posedge controller_clk) begin
@@ -534,30 +535,46 @@ module ddr4_sim_top;
             if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd1)
                 $display("[%0t] PHY gate training started", $realtime);
             if (u_dut.u_phy.phy_state == 4'd3 && prev_phy_state != 4'd3)
-                $display("[%0t] PHY gate training done (lane0 bs=%0d, lane1 bs=%0d)",
-                    $realtime,
-                    u_dut.u_phy.bitslip_count_q[0],
-                    u_dut.u_phy.bitslip_count_q[1]);
+                if (BYTE_LANES > 1)
+                    $display("[%0t] PHY gate training done (lane0 bs=%0d, lane1 bs=%0d)",
+                        $realtime,
+                        u_dut.u_phy.bitslip_count_q[0],
+                        u_dut.u_phy.bitslip_count_q[1]);
+                else
+                    $display("[%0t] PHY gate training done (lane0 bs=%0d)",
+                        $realtime,
+                        u_dut.u_phy.bitslip_count_q[0]);
 
             // Eye training
             if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd4)
                 $display("[%0t] PHY eye training started", $realtime);
             if (u_dut.u_phy.phy_state == 4'd7 && prev_phy_state != 4'd7)
-                $display("[%0t] PHY eye training done (lane0 tap=%0d [%0d-%0d], lane1 tap=%0d [%0d-%0d])",
-                    $realtime,
-                    (u_dut.u_phy.first_pass_tap[0] + u_dut.u_phy.last_pass_tap[0]) >> 1,
-                    u_dut.u_phy.first_pass_tap[0], u_dut.u_phy.last_pass_tap[0],
-                    (u_dut.u_phy.first_pass_tap[1] + u_dut.u_phy.last_pass_tap[1]) >> 1,
-                    u_dut.u_phy.first_pass_tap[1], u_dut.u_phy.last_pass_tap[1]);
+                if (BYTE_LANES > 1)
+                    $display("[%0t] PHY eye training done (lane0 tap=%0d [%0d-%0d], lane1 tap=%0d [%0d-%0d])",
+                        $realtime,
+                        (u_dut.u_phy.first_pass_tap[0] + u_dut.u_phy.last_pass_tap[0]) >> 1,
+                        u_dut.u_phy.first_pass_tap[0], u_dut.u_phy.last_pass_tap[0],
+                        (u_dut.u_phy.first_pass_tap[1] + u_dut.u_phy.last_pass_tap[1]) >> 1,
+                        u_dut.u_phy.first_pass_tap[1], u_dut.u_phy.last_pass_tap[1]);
+                else
+                    $display("[%0t] PHY eye training done (lane0 tap=%0d [%0d-%0d])",
+                        $realtime,
+                        (u_dut.u_phy.first_pass_tap[0] + u_dut.u_phy.last_pass_tap[0]) >> 1,
+                        u_dut.u_phy.first_pass_tap[0], u_dut.u_phy.last_pass_tap[0]);
 
             // Write leveling
             if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd8)
                 $display("[%0t] PHY write leveling started", $realtime);
             if (u_dut.u_phy.phy_state == 4'd11 && prev_phy_state != 4'd11)
-                $display("[%0t] PHY write leveling done (lane0 dqs_tap=%0d, lane1 dqs_tap=%0d)",
-                    $realtime,
-                    u_dut.u_phy.wl_tap[0],
-                    u_dut.u_phy.wl_tap[1]);
+                if (BYTE_LANES > 1)
+                    $display("[%0t] PHY write leveling done (lane0 dqs_tap=%0d, lane1 dqs_tap=%0d)",
+                        $realtime,
+                        u_dut.u_phy.wl_tap[0],
+                        u_dut.u_phy.wl_tap[1]);
+                else
+                    $display("[%0t] PHY write leveling done (lane0 dqs_tap=%0d)",
+                        $realtime,
+                        u_dut.u_phy.wl_tap[0]);
         end
     end
 
@@ -570,21 +587,37 @@ module ddr4_sim_top;
             calib_results_checked <= 1'b1;
             $display("[%0t] === CALIBRATION RESULTS ===", $realtime);
             $display("[%0t]   FLY_BY_DELAY = %0d ps", $realtime, FLY_BY);
-            $display("[%0t]   Gate: lane0 bs=%0d, lane1 bs=%0d",
-                $realtime,
-                u_dut.u_phy.bitslip_count_q[0],
-                u_dut.u_phy.bitslip_count_q[1]);
-            $display("[%0t]   Eye:  lane0 center=%0d [%0d-%0d], lane1 center=%0d [%0d-%0d]",
-                $realtime,
-                (u_dut.u_phy.first_pass_tap[0] + u_dut.u_phy.last_pass_tap[0]) >> 1,
-                u_dut.u_phy.first_pass_tap[0], u_dut.u_phy.last_pass_tap[0],
-                (u_dut.u_phy.first_pass_tap[1] + u_dut.u_phy.last_pass_tap[1]) >> 1,
-                u_dut.u_phy.first_pass_tap[1], u_dut.u_phy.last_pass_tap[1]);
-            $display("[%0t]   WL:   lane0 dqs_tap=%0d dq_tap=%0d, lane1 dqs_tap=%0d dq_tap=%0d",
-                $realtime,
-                u_dut.u_phy.wl_tap[0], u_dut.u_phy.wl_dq_tap[0],
-                u_dut.u_phy.wl_tap[1], u_dut.u_phy.wl_dq_tap[1]);
-            if (FLY_BY >= 100) begin
+            if (BYTE_LANES > 1)
+                $display("[%0t]   Gate: lane0 bs=%0d, lane1 bs=%0d",
+                    $realtime,
+                    u_dut.u_phy.bitslip_count_q[0],
+                    u_dut.u_phy.bitslip_count_q[1]);
+            else
+                $display("[%0t]   Gate: lane0 bs=%0d",
+                    $realtime,
+                    u_dut.u_phy.bitslip_count_q[0]);
+            if (BYTE_LANES > 1)
+                $display("[%0t]   Eye:  lane0 center=%0d [%0d-%0d], lane1 center=%0d [%0d-%0d]",
+                    $realtime,
+                    (u_dut.u_phy.first_pass_tap[0] + u_dut.u_phy.last_pass_tap[0]) >> 1,
+                    u_dut.u_phy.first_pass_tap[0], u_dut.u_phy.last_pass_tap[0],
+                    (u_dut.u_phy.first_pass_tap[1] + u_dut.u_phy.last_pass_tap[1]) >> 1,
+                    u_dut.u_phy.first_pass_tap[1], u_dut.u_phy.last_pass_tap[1]);
+            else
+                $display("[%0t]   Eye:  lane0 center=%0d [%0d-%0d]",
+                    $realtime,
+                    (u_dut.u_phy.first_pass_tap[0] + u_dut.u_phy.last_pass_tap[0]) >> 1,
+                    u_dut.u_phy.first_pass_tap[0], u_dut.u_phy.last_pass_tap[0]);
+            if (BYTE_LANES > 1)
+                $display("[%0t]   WL:   lane0 dqs_tap=%0d dq_tap=%0d, lane1 dqs_tap=%0d dq_tap=%0d",
+                    $realtime,
+                    u_dut.u_phy.wl_tap[0], u_dut.u_phy.wl_dq_tap[0],
+                    u_dut.u_phy.wl_tap[1], u_dut.u_phy.wl_dq_tap[1]);
+            else
+                $display("[%0t]   WL:   lane0 dqs_tap=%0d dq_tap=%0d",
+                    $realtime,
+                    u_dut.u_phy.wl_tap[0], u_dut.u_phy.wl_dq_tap[0]);
+            if (BYTE_LANES > 1 && FLY_BY >= 100) begin
                 if (u_dut.u_phy.wl_tap[0] == u_dut.u_phy.wl_tap[1])
                     $display("[%0t]   WARNING: WL taps identical despite FLY_BY=%0dps  -  expected asymmetry",
                         $realtime, FLY_BY);
