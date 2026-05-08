@@ -1175,15 +1175,30 @@ module ddr4_sim_top;
         // -- Phase C: Row miss  -  same bank, different row (PRE -> ACT -> WR) --
         test_phase = "PHASE_C";
         $display("[%0t] === Phase C: Row miss  -  different row (PRE->ACT->WR) ===", $realtime);
-        wb_write_one(ROW1_BG0, 128'h2A);
-        $display("[%0t]   write BG0/BA0/row1 (miss)", $realtime);
-        wb_write_one(ROW1_BG1, 128'h2B);
-        $display("[%0t]   write BG1/BA0/row1 (miss)", $realtime);
-        wb_write_one(ROW1_BG2, 128'h2C);
-        $display("[%0t]   write BG2/BA0/row1 (miss)", $realtime);
-        wb_write_one(ROW1_BG3, 128'h2D);
-        $display("[%0t]   write BG3/BA0/row1 (miss)", $realtime);
-        drain_pipeline;
+        if (TB_BIST_MODE == 2) begin
+            wb_write_one(ROW1_BG0, 128'h2A);
+            $display("[%0t]   write BG0/BA0/row1 (miss)", $realtime);
+            drain_pipeline;
+            wb_write_one(ROW1_BG1, 128'h2B);
+            $display("[%0t]   write BG1/BA0/row1 (miss)", $realtime);
+            drain_pipeline;
+            wb_write_one(ROW1_BG2, 128'h2C);
+            $display("[%0t]   write BG2/BA0/row1 (miss)", $realtime);
+            drain_pipeline;
+            wb_write_one(ROW1_BG3, 128'h2D);
+            $display("[%0t]   write BG3/BA0/row1 (miss)", $realtime);
+            drain_pipeline;
+        end else begin
+            wb_write_one(ROW1_BG0, 128'h2A);
+            $display("[%0t]   write BG0/BA0/row1 (miss)", $realtime);
+            wb_write_one(ROW1_BG1, 128'h2B);
+            $display("[%0t]   write BG1/BA0/row1 (miss)", $realtime);
+            wb_write_one(ROW1_BG2, 128'h2C);
+            $display("[%0t]   write BG2/BA0/row1 (miss)", $realtime);
+            wb_write_one(ROW1_BG3, 128'h2D);
+            $display("[%0t]   write BG3/BA0/row1 (miss)", $realtime);
+            drain_pipeline;
+        end
         $display("[%0t]   Readback Phase C:", $realtime);
         wb_read_check(ROW1_BG0, 128'h2A);
         wb_read_check(ROW1_BG1, 128'h2B);
@@ -1378,9 +1393,14 @@ module ddr4_sim_top;
         // via wb_sel. The controller maps wb_sel bits to DM_n to protect
         // the unselected bytes. We verify that masked bytes retain their
         // original value while unmasked bytes get the new data.
+        // Skipped for x4 devices which have no DM pin (JESD79-4D Table 28).
         test_phase = "PHASE_L";
-        $display("[%0t] === Phase L: Byte-lane masking (DM verification) ===", $realtime);
-        begin : phase_l_blk
+        if (DEVICE_WIDTH == 4) begin
+            $display("[%0t] === Phase L: SKIPPED (x4 has no DM pin) ===", $realtime);
+        end else begin
+            $display("[%0t] === Phase L: Byte-lane masking (DM verification) ===", $realtime);
+        end
+        if (DEVICE_WIDTH != 4) begin : phase_l_blk
             localparam [EXT_ADDR_BITS-1:0] PL_ADDR0 = (5 << 10) | 0;
             localparam [EXT_ADDR_BITS-1:0] PL_ADDR1 = (5 << 10) | 1;
 
@@ -1586,25 +1606,31 @@ module ddr4_sim_top;
                 repeat (2) @(posedge controller_clk);
             end
 
-            if (csr_vals[3] !== 32'd1024) begin
-                $display("[%0t]   CSR FAIL: CSR[3] correct_count=%0d, expected 1024",
-                         $realtime, csr_vals[3]);
-                rd_err_count = rd_err_count + 1;
-            end
-            if (csr_vals[4] !== 32'd0) begin
-                $display("[%0t]   CSR FAIL: CSR[4] error_count=%0d, expected 0",
-                         $realtime, csr_vals[4]);
-                rd_err_count = rd_err_count + 1;
-            end
-            if (csr_vals[5][4] !== 1'b1 || csr_vals[5][5] !== 1'b0 || csr_vals[5][3] !== 1'b0) begin
-                $display("[%0t]   CSR FAIL: CSR[5] status=0x%0h (expected pass=1, fail=0, busy=0)",
-                         $realtime, csr_vals[5]);
-                rd_err_count = rd_err_count + 1;
-            end
-            if (csr_vals[10] !== 32'h21) begin
-                $display("[%0t]   CSR FAIL: CSR[0xA] config=0x%0h, expected 0x21",
-                         $realtime, csr_vals[10]);
-                rd_err_count = rd_err_count + 1;
+            begin
+                integer exp_correct;
+                reg [31:0] exp_config;
+                exp_correct = (TB_BIST_MODE == 2) ? (3 * (1 << 10)) : (1 << 10);
+                exp_config  = {24'd0, BYTE_LANES[3:0], 2'd0, TB_BIST_MODE[1:0]};
+                if (csr_vals[3] !== exp_correct) begin
+                    $display("[%0t]   CSR FAIL: CSR[3] correct_count=%0d, expected %0d",
+                             $realtime, csr_vals[3], exp_correct);
+                    rd_err_count = rd_err_count + 1;
+                end
+                if (csr_vals[4] !== 32'd0) begin
+                    $display("[%0t]   CSR FAIL: CSR[4] error_count=%0d, expected 0",
+                             $realtime, csr_vals[4]);
+                    rd_err_count = rd_err_count + 1;
+                end
+                if (csr_vals[5][4] !== 1'b1 || csr_vals[5][5] !== 1'b0 || csr_vals[5][3] !== 1'b0) begin
+                    $display("[%0t]   CSR FAIL: CSR[5] status=0x%0h (expected pass=1, fail=0, busy=0)",
+                             $realtime, csr_vals[5]);
+                    rd_err_count = rd_err_count + 1;
+                end
+                if (csr_vals[10] !== exp_config) begin
+                    $display("[%0t]   CSR FAIL: CSR[0xA] config=0x%0h, expected 0x%0h",
+                             $realtime, csr_vals[10], exp_config);
+                    rd_err_count = rd_err_count + 1;
+                end
             end
             if (csr_vals[11] !== 32'h0001) begin
                 $display("[%0t]   CSR FAIL: CSR[0xB] version=0x%0h, expected 0x0001",
@@ -1679,9 +1705,13 @@ module ddr4_sim_top;
 
             $display("[%0t]   Post-retrig CSR[3]=%0d CSR[4]=%0d CSR[5]=0x%0h",
                      $realtime, cv3, cv4, cv5);
-            if (cv3 !== 32'd1024) begin
-                $display("[%0t]   CSR2 FAIL: correct_count=%0d, expected 1024", $realtime, cv3);
-                rd_err_count = rd_err_count + 1;
+            begin
+                integer exp_correct2;
+                exp_correct2 = (TB_BIST_MODE == 2) ? (3 * (1 << 10)) : (1 << 10);
+                if (cv3 !== exp_correct2) begin
+                    $display("[%0t]   CSR2 FAIL: correct_count=%0d, expected %0d", $realtime, cv3, exp_correct2);
+                    rd_err_count = rd_err_count + 1;
+                end
             end
             if (cv4 !== 32'd0) begin
                 $display("[%0t]   CSR2 FAIL: error_count=%0d, expected 0", $realtime, cv4);
