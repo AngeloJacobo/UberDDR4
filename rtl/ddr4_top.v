@@ -44,11 +44,9 @@
 module ddr4_top #(
     parameter CONTROLLER_CLK_PERIOD = 3_333,
               DDR4_CLK_PERIOD = 833,
+              DEVICE_WIDTH = 8, //DDR4 device data width (4, 8, or 16)
               ROW_BITS = 16,
               COL_BITS = 10,
-              BA_BITS = 2,
-              BG_BITS = 2,
-              DQ_BITS = 8,
               BYTE_LANES = 2,
               DENSITY = 8,
     parameter[0:0] MICRON_SIM = 0,
@@ -62,6 +60,10 @@ module ddr4_top #(
     // BIST / debug prober configuration
     parameter[1:0] BIST_MODE = 0,
     parameter DEBUG_CSR_ENABLE = 1,
+    // Derived from DEVICE_WIDTH -- do not override
+    parameter BA_BITS = 2,
+              BG_BITS = (DEVICE_WIDTH == 16) ? 1 : 2,
+              DQ_BITS = 8,
     // Derived (for port widths)
     parameter SERDES_RATIO = 4,
               NUM_BG = (1 << BG_BITS),
@@ -273,11 +275,9 @@ module ddr4_top #(
     ddr4_controller #(
         .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),
         .DDR4_CLK_PERIOD(DDR4_CLK_PERIOD),
+        .DEVICE_WIDTH(DEVICE_WIDTH),
         .ROW_BITS(ROW_BITS),
         .COL_BITS(COL_BITS),
-        .BA_BITS(BA_BITS),
-        .BG_BITS(BG_BITS),
-        .DQ_BITS(DQ_BITS),
         .BYTE_LANES(BYTE_LANES),
         .DENSITY(DENSITY),
         .MICRON_SIM(MICRON_SIM),
@@ -355,10 +355,8 @@ module ddr4_top #(
     ddr4_phy #(
         .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),
         .DDR4_CLK_PERIOD(DDR4_CLK_PERIOD),
+        .DEVICE_WIDTH(DEVICE_WIDTH),
         .ROW_BITS(ROW_BITS),
-        .BA_BITS(BA_BITS),
-        .BG_BITS(BG_BITS),
-        .DQ_BITS(DQ_BITS),
         .BYTE_LANES(BYTE_LANES)
     ) u_phy (
         .i_controller_clk(i_controller_clk),

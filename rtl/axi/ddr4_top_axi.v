@@ -38,11 +38,9 @@
 module ddr4_top_axi #(
     parameter      CONTROLLER_CLK_PERIOD = 3_336,
                    DDR4_CLK_PERIOD       = 834,
+                   DEVICE_WIDTH = 8, //DDR4 device data width (4, 8, or 16)
                    ROW_BITS    = 16,
                    COL_BITS    = 10,
-                   BA_BITS     = 2,
-                   BG_BITS     = 2,
-                   DQ_BITS     = 8,
                    BYTE_LANES  = 2,
                    DENSITY     = 8,
                    AXI_ID_WIDTH = 4,
@@ -50,6 +48,10 @@ module ddr4_top_axi #(
     parameter      ADDR_MAPPING = 1,
     parameter[1:0] BIST_MODE  = 1,
     parameter       DEBUG_CSR_ENABLE = 1,
+    // Derived from DEVICE_WIDTH -- do not override
+    parameter      BA_BITS     = 2,
+                   BG_BITS     = (DEVICE_WIDTH == 16) ? 1 : 2,
+                   DQ_BITS     = 8,
     // Derived parameters -- do not override
     parameter
                    SERDES_RATIO  = 4,
@@ -148,11 +150,9 @@ module ddr4_top_axi #(
     ddr4_top #(
         .CONTROLLER_CLK_PERIOD (CONTROLLER_CLK_PERIOD),
         .DDR4_CLK_PERIOD       (DDR4_CLK_PERIOD),
+        .DEVICE_WIDTH          (DEVICE_WIDTH),
         .ROW_BITS              (ROW_BITS),
         .COL_BITS              (COL_BITS),
-        .BA_BITS               (BA_BITS),
-        .BG_BITS               (BG_BITS),
-        .DQ_BITS               (DQ_BITS),
         .BYTE_LANES            (BYTE_LANES),
         .DENSITY               (DENSITY),
         .MICRON_SIM            (MICRON_SIM),

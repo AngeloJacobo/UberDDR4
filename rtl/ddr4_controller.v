@@ -34,11 +34,9 @@
 module ddr4_controller #(
     parameter CONTROLLER_CLK_PERIOD = 3_333, //ps, controller clock (300 MHz -> DDR4-2400)
               DDR4_CLK_PERIOD = 833,          //ps, DDR4 memory clock (1200 MHz -> DDR4-2400)
+              DEVICE_WIDTH = 8, //DDR4 device data width (4, 8, or 16)
               ROW_BITS = 16,    //row address width (14-17, density dependent)
               COL_BITS = 10,    //column address width (10 for x8/x16, 10-11 for x4)
-              BA_BITS = 2,      //bank address (always 2 for DDR4)
-              BG_BITS = 2,      //bank group (2 for x4/x8, 1 for x16)
-              DQ_BITS = 8,      //device data width
               BYTE_LANES = 2,   //number of byte lanes
               DENSITY = 8,      //device density in Gb (2, 4, 8, 16)
     parameter[0:0] MICRON_SIM = 0,   //shorten init delays for Micron model
@@ -50,6 +48,10 @@ module ddr4_controller #(
     // Override CL/CWL: set nonzero for manual, 0 = auto from clock period
     parameter[5:0] CL = 0,
     parameter[4:0] CWL_PARAM = 0,
+    // Derived from DEVICE_WIDTH -- do not override
+    parameter BA_BITS = 2,      //bank address (always 2 for DDR4)
+              BG_BITS = (DEVICE_WIDTH == 16) ? 1 : 2, //JESD79-4D Table 2
+              DQ_BITS = 8,      //always 8 (byte-lane granularity)
     // The next parameters act more like localparams but are here to simplify port declarations
     parameter SERDES_RATIO = 4,
               NUM_BG = (1 << BG_BITS),
@@ -263,7 +265,7 @@ module ddr4_controller #(
     localparam tWTR_S_ps = max_fn(DDR4_CLK_PERIOD * 2, 2_500);
 
     // Page size -> tRRD/tFAW category (JESD79-4D Table 167)
-    localparam PAGE_SIZE = (1 << COL_BITS) * DQ_BITS / 8; //bytes
+    localparam PAGE_SIZE = (1 << COL_BITS) * DEVICE_WIDTH / 8; //bytes (JESD79-4D Table 167)
 
     localparam tRRD_L_ps = max_fn(DDR4_CLK_PERIOD * 4,
         (PAGE_SIZE >= 2048) ?
@@ -459,7 +461,7 @@ module ddr4_controller #(
     localparam[13:0] MR4 = 14'b00_0_000_00_0_0_0_000;
 
     // MR5: DM, DBI, RTT_PARK (JESD79-4D Table 28)
-    localparam[0:0] DM_ENABLED = (DQ_BITS != 4); //x4 has no DM_n
+    localparam[0:0] DM_ENABLED = (DEVICE_WIDTH != 4); //x4 has no DM_n (JESD79-4D Table 28)
     localparam[13:0] MR5 = {
         1'b0,             //A13: reserved
         1'b0,             //A12: Read DBI = off
@@ -1585,6 +1587,7 @@ module ddr4_controller #(
         $display("==============================================================");
 
         $display("-- Device");
+        $display("  DEVICE_WIDTH          = x%0d", DEVICE_WIDTH);
         $display("  DDR4_CLK_PERIOD       = %0d ps", DDR4_CLK_PERIOD);
         $display("  CONTROLLER_CLK_PERIOD = %0d ps", CONTROLLER_CLK_PERIOD);
         $display("  SERDES_RATIO          = %0d", SERDES_RATIO);
@@ -1596,6 +1599,7 @@ module ddr4_controller #(
         $display("  BYTE_LANES            = %0d", BYTE_LANES);
         $display("  DENSITY               = %0d Gb", DENSITY);
         $display("  PAGE_SIZE             = %0d bytes", PAGE_SIZE);
+        $display("  DM_ENABLED            = %0d", DM_ENABLED);
         $display("  NUM_BANKS             = %0d", NUM_BANKS);
         $display("  NUM_BG                = %0d", NUM_BG);
 

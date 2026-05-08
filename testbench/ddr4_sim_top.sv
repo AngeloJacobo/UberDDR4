@@ -67,13 +67,20 @@ module ddr4_sim_top;
 `endif
     localparam CTRL_CLK_PERIOD = DDR4_CLK_PERIOD * 4;
 
-`ifdef SIM_DQ_BITS
-    localparam DQ_BITS = `SIM_DQ_BITS;
+`ifdef SIM_DEVICE_WIDTH
+    localparam DEVICE_WIDTH = `SIM_DEVICE_WIDTH;
 `else
-    localparam DQ_BITS = 8;
+    localparam DEVICE_WIDTH = 8;
 `endif
-    localparam BYTE_LANES = (DQ_BITS == 16) ? 1 : 2;
-    localparam BG_BITS    = (DQ_BITS == 16) ? 1 : 2;
+
+`ifdef SIM_BYTE_LANES
+    localparam BYTE_LANES = `SIM_BYTE_LANES;
+`else
+    localparam BYTE_LANES = 2;
+`endif
+
+    localparam DQ_BITS     = 8;
+    localparam BG_BITS     = (DEVICE_WIDTH == 16) ? 1 : 2;
     localparam ROW_BITS    = 16;
     localparam COL_BITS    = 10;
     localparam BA_BITS     = 2;
@@ -89,6 +96,9 @@ module ddr4_sim_top;
     localparam COL_LOW        = $clog2(SERDES_RATIO * 2 * DQ_BITS * BYTE_LANES / 8);
     localparam WB_ADDR_BITS   = ROW_BITS + BG_BITS + BA_BITS + COL_BITS - COL_LOW;
     localparam EXT_ADDR_BITS  = WB_ADDR_BITS + 1;
+    localparam NUM_DEVICES    = (DEVICE_WIDTH == 16) ? (BYTE_LANES / 2) :
+                                (DEVICE_WIDTH == 4)  ? (BYTE_LANES * 2) :
+                                                        BYTE_LANES;
 
     // ===================================================================
     // Regression-overridable parameters via +define+ (source stays untouched)
@@ -210,11 +220,9 @@ module ddr4_sim_top;
     ddr4_top #(
         .CONTROLLER_CLK_PERIOD (CTRL_CLK_PERIOD),
         .DDR4_CLK_PERIOD       (DDR4_CLK_PERIOD),
+        .DEVICE_WIDTH          (DEVICE_WIDTH),
         .ROW_BITS              (ROW_BITS),
         .COL_BITS              (COL_BITS),
-        .BA_BITS               (BA_BITS),
-        .BG_BITS               (BG_BITS),
-        .DQ_BITS               (DQ_BITS),
         .BYTE_LANES            (BYTE_LANES),
         .DENSITY               (TB_DENSITY_GB),
         .MICRON_SIM            (1),
@@ -283,82 +291,302 @@ module ddr4_sim_top;
     // gate primitives for all other simulators. Both approaches create
     // a transparent bidirectional connection without drive-strength issues.
     // ===================================================================
-    DDR4_if #(.CONFIGURED_DQ_BITS(DQ_BITS)) iDDR4[BYTE_LANES-1:0]();
-
-    // CK/CMD/ADDR fan-out per byte lane (generate loop)
-    genvar gl;
-    generate for (gl = 0; gl < BYTE_LANES; gl = gl + 1) begin : gen_cmd
-        if (gl == 0) begin : near
-            assign iDDR4[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
-            assign iDDR4[gl].RESET_n   = ddr4_reset_n;
-            assign iDDR4[gl].CKE       = ddr4_cke;
-            assign iDDR4[gl].CS_n      = ddr4_cs_n;
-            assign iDDR4[gl].ACT_n     = ddr4_act_n;
-            assign iDDR4[gl].RAS_n_A16 = ddr4_addr[16];
-            assign iDDR4[gl].CAS_n_A15 = ddr4_addr[15];
-            assign iDDR4[gl].WE_n_A14  = ddr4_addr[14];
-            assign iDDR4[gl].ADDR      = ddr4_addr[13:0];
-            assign iDDR4[gl].BA        = ddr4_ba;
-            assign iDDR4[gl].BG        = (BG_BITS == 1) ? {1'b0, ddr4_bg[0]} : ddr4_bg;
-            assign iDDR4[gl].ODT       = ddr4_odt;
-        end else begin : far
-            assign #(FLY_BY) iDDR4[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
-            assign #(FLY_BY) iDDR4[gl].RESET_n   = ddr4_reset_n;
-            assign #(FLY_BY) iDDR4[gl].CKE       = ddr4_cke;
-            assign #(FLY_BY) iDDR4[gl].CS_n      = ddr4_cs_n;
-            assign #(FLY_BY) iDDR4[gl].ACT_n     = ddr4_act_n;
-            assign #(FLY_BY) iDDR4[gl].RAS_n_A16 = ddr4_addr[16];
-            assign #(FLY_BY) iDDR4[gl].CAS_n_A15 = ddr4_addr[15];
-            assign #(FLY_BY) iDDR4[gl].WE_n_A14  = ddr4_addr[14];
-            assign #(FLY_BY) iDDR4[gl].ADDR      = ddr4_addr[13:0];
-            assign #(FLY_BY) iDDR4[gl].BA        = ddr4_ba;
-            assign #(FLY_BY) iDDR4[gl].BG        = (BG_BITS == 1) ? {1'b0, ddr4_bg[0]} : ddr4_bg;
-            assign #(FLY_BY) iDDR4[gl].ODT       = ddr4_odt;
-        end
-        assign iDDR4[gl].ADDR_17   = 1'b0;
-        assign iDDR4[gl].C         = '0;
-        assign iDDR4[gl].TEN       = 1'b0;
-        assign iDDR4[gl].PARITY    = 1'b0;
-        assign iDDR4[gl].ZQ        = 1'b1;
-        assign iDDR4[gl].PWR       = 1'b1;
-        assign iDDR4[gl].VREF_CA   = 1'b1;
-        assign iDDR4[gl].VREF_DQ   = 1'b1;
-    end endgenerate
-
-    // Bidirectional DQ wiring (generate loop over lanes and bits)
-    genvar gi, gj;
-    generate for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_bidi
-        for (gj = 0; gj < DQ_BITS; gj = gj + 1) begin : gen_dq
-            `ifdef XILINX_SIMULATOR
-            short bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[gi*DQ_BITS + gj]);
-            `else
-            tran  bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[gi*DQ_BITS + gj]);
-            `endif
-        end
-        `ifdef XILINX_SIMULATOR
-        short bidiDQS_t(iDDR4[gi].DQS_t, ddr4_dqs_p[gi]);
-        short bidiDQS_c(iDDR4[gi].DQS_c, ddr4_dqs_n[gi]);
-        short bidiDM   (iDDR4[gi].DM_n,   ddr4_dm_n[gi]);
-        `else
-        tran  bidiDQS_t(iDDR4[gi].DQS_t, ddr4_dqs_p[gi]);
-        tran  bidiDQS_c(iDDR4[gi].DQS_c, ddr4_dqs_n[gi]);
-        tran  bidiDM   (iDDR4[gi].DM_n,   ddr4_dm_n[gi]);
-        `endif
-    end endgenerate
-
-    // Micron DDR4 model instances (one per byte lane)
     wire model_en;
     assign model_en = 1'b1;
 
-    generate for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_mem
-        ddr4_model #(
-            .CONFIGURED_DQ_BITS (DQ_BITS),
-            .CONFIGURED_DENSITY (TB_DENSITY),
-            .CONFIGURED_RANKS   (1)
-        ) u_ddr4_mem (
-            .model_enable (model_en),
-            .iDDR4        (iDDR4[gi])
-        );
+    genvar gl, gi, gj;
+
+    // -----------------------------------------------------------------
+    // x8: 1 DDR4_if + 1 model per byte lane (current default)
+    // -----------------------------------------------------------------
+    generate if (DEVICE_WIDTH == 8) begin : gen_x8
+        DDR4_if #(.CONFIGURED_DQ_BITS(8)) iDDR4[BYTE_LANES-1:0]();
+
+        for (gl = 0; gl < BYTE_LANES; gl = gl + 1) begin : gen_cmd
+            if (gl == 0) begin : near
+                assign iDDR4[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
+                assign iDDR4[gl].RESET_n   = ddr4_reset_n;
+                assign iDDR4[gl].CKE       = ddr4_cke;
+                assign iDDR4[gl].CS_n      = ddr4_cs_n;
+                assign iDDR4[gl].ACT_n     = ddr4_act_n;
+                assign iDDR4[gl].RAS_n_A16 = ddr4_addr[16];
+                assign iDDR4[gl].CAS_n_A15 = ddr4_addr[15];
+                assign iDDR4[gl].WE_n_A14  = ddr4_addr[14];
+                assign iDDR4[gl].ADDR      = ddr4_addr[13:0];
+                assign iDDR4[gl].BA        = ddr4_ba;
+                assign iDDR4[gl].BG        = ddr4_bg;
+                assign iDDR4[gl].ODT       = ddr4_odt;
+            end else begin : far
+                assign #(FLY_BY) iDDR4[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
+                assign #(FLY_BY) iDDR4[gl].RESET_n   = ddr4_reset_n;
+                assign #(FLY_BY) iDDR4[gl].CKE       = ddr4_cke;
+                assign #(FLY_BY) iDDR4[gl].CS_n      = ddr4_cs_n;
+                assign #(FLY_BY) iDDR4[gl].ACT_n     = ddr4_act_n;
+                assign #(FLY_BY) iDDR4[gl].RAS_n_A16 = ddr4_addr[16];
+                assign #(FLY_BY) iDDR4[gl].CAS_n_A15 = ddr4_addr[15];
+                assign #(FLY_BY) iDDR4[gl].WE_n_A14  = ddr4_addr[14];
+                assign #(FLY_BY) iDDR4[gl].ADDR      = ddr4_addr[13:0];
+                assign #(FLY_BY) iDDR4[gl].BA        = ddr4_ba;
+                assign #(FLY_BY) iDDR4[gl].BG        = ddr4_bg;
+                assign #(FLY_BY) iDDR4[gl].ODT       = ddr4_odt;
+            end
+            assign iDDR4[gl].ADDR_17 = 1'b0;
+            assign iDDR4[gl].C       = '0;
+            assign iDDR4[gl].TEN     = 1'b0;
+            assign iDDR4[gl].PARITY  = 1'b0;
+            assign iDDR4[gl].ZQ      = 1'b1;
+            assign iDDR4[gl].PWR     = 1'b1;
+            assign iDDR4[gl].VREF_CA = 1'b1;
+            assign iDDR4[gl].VREF_DQ = 1'b1;
+        end
+
+        for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_bidi
+            for (gj = 0; gj < 8; gj = gj + 1) begin : gen_dq
+                `ifdef XILINX_SIMULATOR
+                short bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                `else
+                tran  bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                `endif
+            end
+            `ifdef XILINX_SIMULATOR
+            short bidiDQS_t(iDDR4[gi].DQS_t, ddr4_dqs_p[gi]);
+            short bidiDQS_c(iDDR4[gi].DQS_c, ddr4_dqs_n[gi]);
+            short bidiDM   (iDDR4[gi].DM_n,   ddr4_dm_n[gi]);
+            `else
+            tran  bidiDQS_t(iDDR4[gi].DQS_t, ddr4_dqs_p[gi]);
+            tran  bidiDQS_c(iDDR4[gi].DQS_c, ddr4_dqs_n[gi]);
+            tran  bidiDM   (iDDR4[gi].DM_n,   ddr4_dm_n[gi]);
+            `endif
+        end
+
+        for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_mem
+            ddr4_model #(
+                .CONFIGURED_DQ_BITS (8),
+                .CONFIGURED_DENSITY (TB_DENSITY),
+                .CONFIGURED_RANKS   (1)
+            ) u_ddr4_mem (
+                .model_enable (model_en),
+                .iDDR4        (iDDR4[gi])
+            );
+        end
+
+    // -----------------------------------------------------------------
+    // x16: 1 DDR4_if + 1 model per 2 byte lanes
+    //   DQ[7:0]  -> lower lane, DQ[15:8] -> upper lane
+    //   DQS_t/c[0] -> lower lane DQS, DQS_t/c[1] -> upper lane DQS
+    //   DM_n[0] -> lower lane DM, DM_n[1] -> upper lane DM
+    //   Fly-by applied per physical chip (not per byte lane)
+    // -----------------------------------------------------------------
+    end else if (DEVICE_WIDTH == 16) begin : gen_x16
+        DDR4_if #(.CONFIGURED_DQ_BITS(16)) iDDR4[NUM_DEVICES-1:0]();
+
+        for (gl = 0; gl < NUM_DEVICES; gl = gl + 1) begin : gen_cmd
+            if (gl == 0) begin : near
+                assign iDDR4[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
+                assign iDDR4[gl].RESET_n   = ddr4_reset_n;
+                assign iDDR4[gl].CKE       = ddr4_cke;
+                assign iDDR4[gl].CS_n      = ddr4_cs_n;
+                assign iDDR4[gl].ACT_n     = ddr4_act_n;
+                assign iDDR4[gl].RAS_n_A16 = ddr4_addr[16];
+                assign iDDR4[gl].CAS_n_A15 = ddr4_addr[15];
+                assign iDDR4[gl].WE_n_A14  = ddr4_addr[14];
+                assign iDDR4[gl].ADDR      = ddr4_addr[13:0];
+                assign iDDR4[gl].BA        = ddr4_ba;
+                assign iDDR4[gl].BG        = {1'b0, ddr4_bg[0]};
+                assign iDDR4[gl].ODT       = ddr4_odt;
+            end else begin : far
+                assign #(FLY_BY) iDDR4[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
+                assign #(FLY_BY) iDDR4[gl].RESET_n   = ddr4_reset_n;
+                assign #(FLY_BY) iDDR4[gl].CKE       = ddr4_cke;
+                assign #(FLY_BY) iDDR4[gl].CS_n      = ddr4_cs_n;
+                assign #(FLY_BY) iDDR4[gl].ACT_n     = ddr4_act_n;
+                assign #(FLY_BY) iDDR4[gl].RAS_n_A16 = ddr4_addr[16];
+                assign #(FLY_BY) iDDR4[gl].CAS_n_A15 = ddr4_addr[15];
+                assign #(FLY_BY) iDDR4[gl].WE_n_A14  = ddr4_addr[14];
+                assign #(FLY_BY) iDDR4[gl].ADDR      = ddr4_addr[13:0];
+                assign #(FLY_BY) iDDR4[gl].BA        = ddr4_ba;
+                assign #(FLY_BY) iDDR4[gl].BG        = {1'b0, ddr4_bg[0]};
+                assign #(FLY_BY) iDDR4[gl].ODT       = ddr4_odt;
+            end
+            assign iDDR4[gl].ADDR_17 = 1'b0;
+            assign iDDR4[gl].C       = '0;
+            assign iDDR4[gl].TEN     = 1'b0;
+            assign iDDR4[gl].PARITY  = 1'b0;
+            assign iDDR4[gl].ZQ      = 1'b1;
+            assign iDDR4[gl].PWR     = 1'b1;
+            assign iDDR4[gl].VREF_CA = 1'b1;
+            assign iDDR4[gl].VREF_DQ = 1'b1;
+        end
+
+        for (gi = 0; gi < NUM_DEVICES; gi = gi + 1) begin : gen_bidi
+            for (gj = 0; gj < 8; gj = gj + 1) begin : gen_dq_lo
+                `ifdef XILINX_SIMULATOR
+                short bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[(gi*2)*8 + gj]);
+                `else
+                tran  bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[(gi*2)*8 + gj]);
+                `endif
+            end
+            for (gj = 0; gj < 8; gj = gj + 1) begin : gen_dq_hi
+                `ifdef XILINX_SIMULATOR
+                short bidiDQ(iDDR4[gi].DQ[8 + gj], ddr4_dq[(gi*2+1)*8 + gj]);
+                `else
+                tran  bidiDQ(iDDR4[gi].DQ[8 + gj], ddr4_dq[(gi*2+1)*8 + gj]);
+                `endif
+            end
+            `ifdef XILINX_SIMULATOR
+            short bidiDQS_t0(iDDR4[gi].DQS_t[0], ddr4_dqs_p[gi*2]);
+            short bidiDQS_c0(iDDR4[gi].DQS_c[0], ddr4_dqs_n[gi*2]);
+            short bidiDQS_t1(iDDR4[gi].DQS_t[1], ddr4_dqs_p[gi*2+1]);
+            short bidiDQS_c1(iDDR4[gi].DQS_c[1], ddr4_dqs_n[gi*2+1]);
+            short bidiDM0   (iDDR4[gi].DM_n[0],   ddr4_dm_n[gi*2]);
+            short bidiDM1   (iDDR4[gi].DM_n[1],   ddr4_dm_n[gi*2+1]);
+            `else
+            tran  bidiDQS_t0(iDDR4[gi].DQS_t[0], ddr4_dqs_p[gi*2]);
+            tran  bidiDQS_c0(iDDR4[gi].DQS_c[0], ddr4_dqs_n[gi*2]);
+            tran  bidiDQS_t1(iDDR4[gi].DQS_t[1], ddr4_dqs_p[gi*2+1]);
+            tran  bidiDQS_c1(iDDR4[gi].DQS_c[1], ddr4_dqs_n[gi*2+1]);
+            tran  bidiDM0   (iDDR4[gi].DM_n[0],   ddr4_dm_n[gi*2]);
+            tran  bidiDM1   (iDDR4[gi].DM_n[1],   ddr4_dm_n[gi*2+1]);
+            `endif
+        end
+
+        for (gi = 0; gi < NUM_DEVICES; gi = gi + 1) begin : gen_mem
+            ddr4_model #(
+                .CONFIGURED_DQ_BITS (16),
+                .CONFIGURED_DENSITY (TB_DENSITY),
+                .CONFIGURED_RANKS   (1)
+            ) u_ddr4_mem (
+                .model_enable (model_en),
+                .iDDR4        (iDDR4[gi])
+            );
+        end
+
+    // -----------------------------------------------------------------
+    // x4: 2 DDR4_if + 2 models per byte lane (paired into 8-bit lane)
+    //   lo model DQ[3:0] -> lane bits [3:0], hi model DQ[3:0] -> bits [7:4]
+    //   Both share the lane's DQS pair; no DM pin on x4 devices
+    //   Fly-by applied per byte lane (both chips in a lane share CK/CMD)
+    // -----------------------------------------------------------------
+    end else begin : gen_x4
+        DDR4_if #(.CONFIGURED_DQ_BITS(4)) iDDR4_lo[BYTE_LANES-1:0]();
+        DDR4_if #(.CONFIGURED_DQ_BITS(4)) iDDR4_hi[BYTE_LANES-1:0]();
+
+        for (gl = 0; gl < BYTE_LANES; gl = gl + 1) begin : gen_cmd
+            if (gl == 0) begin : near
+                assign iDDR4_lo[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
+                assign iDDR4_lo[gl].RESET_n   = ddr4_reset_n;
+                assign iDDR4_lo[gl].CKE       = ddr4_cke;
+                assign iDDR4_lo[gl].CS_n      = ddr4_cs_n;
+                assign iDDR4_lo[gl].ACT_n     = ddr4_act_n;
+                assign iDDR4_lo[gl].RAS_n_A16 = ddr4_addr[16];
+                assign iDDR4_lo[gl].CAS_n_A15 = ddr4_addr[15];
+                assign iDDR4_lo[gl].WE_n_A14  = ddr4_addr[14];
+                assign iDDR4_lo[gl].ADDR      = ddr4_addr[13:0];
+                assign iDDR4_lo[gl].BA        = ddr4_ba;
+                assign iDDR4_lo[gl].BG        = ddr4_bg;
+                assign iDDR4_lo[gl].ODT       = ddr4_odt;
+                assign iDDR4_hi[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
+                assign iDDR4_hi[gl].RESET_n   = ddr4_reset_n;
+                assign iDDR4_hi[gl].CKE       = ddr4_cke;
+                assign iDDR4_hi[gl].CS_n      = ddr4_cs_n;
+                assign iDDR4_hi[gl].ACT_n     = ddr4_act_n;
+                assign iDDR4_hi[gl].RAS_n_A16 = ddr4_addr[16];
+                assign iDDR4_hi[gl].CAS_n_A15 = ddr4_addr[15];
+                assign iDDR4_hi[gl].WE_n_A14  = ddr4_addr[14];
+                assign iDDR4_hi[gl].ADDR      = ddr4_addr[13:0];
+                assign iDDR4_hi[gl].BA        = ddr4_ba;
+                assign iDDR4_hi[gl].BG        = ddr4_bg;
+                assign iDDR4_hi[gl].ODT       = ddr4_odt;
+            end else begin : far
+                assign #(FLY_BY) iDDR4_lo[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
+                assign #(FLY_BY) iDDR4_lo[gl].RESET_n   = ddr4_reset_n;
+                assign #(FLY_BY) iDDR4_lo[gl].CKE       = ddr4_cke;
+                assign #(FLY_BY) iDDR4_lo[gl].CS_n      = ddr4_cs_n;
+                assign #(FLY_BY) iDDR4_lo[gl].ACT_n     = ddr4_act_n;
+                assign #(FLY_BY) iDDR4_lo[gl].RAS_n_A16 = ddr4_addr[16];
+                assign #(FLY_BY) iDDR4_lo[gl].CAS_n_A15 = ddr4_addr[15];
+                assign #(FLY_BY) iDDR4_lo[gl].WE_n_A14  = ddr4_addr[14];
+                assign #(FLY_BY) iDDR4_lo[gl].ADDR      = ddr4_addr[13:0];
+                assign #(FLY_BY) iDDR4_lo[gl].BA        = ddr4_ba;
+                assign #(FLY_BY) iDDR4_lo[gl].BG        = ddr4_bg;
+                assign #(FLY_BY) iDDR4_lo[gl].ODT       = ddr4_odt;
+                assign #(FLY_BY) iDDR4_hi[gl].CK        = {ddr4_ck_p, ddr4_ck_n};
+                assign #(FLY_BY) iDDR4_hi[gl].RESET_n   = ddr4_reset_n;
+                assign #(FLY_BY) iDDR4_hi[gl].CKE       = ddr4_cke;
+                assign #(FLY_BY) iDDR4_hi[gl].CS_n      = ddr4_cs_n;
+                assign #(FLY_BY) iDDR4_hi[gl].ACT_n     = ddr4_act_n;
+                assign #(FLY_BY) iDDR4_hi[gl].RAS_n_A16 = ddr4_addr[16];
+                assign #(FLY_BY) iDDR4_hi[gl].CAS_n_A15 = ddr4_addr[15];
+                assign #(FLY_BY) iDDR4_hi[gl].WE_n_A14  = ddr4_addr[14];
+                assign #(FLY_BY) iDDR4_hi[gl].ADDR      = ddr4_addr[13:0];
+                assign #(FLY_BY) iDDR4_hi[gl].BA        = ddr4_ba;
+                assign #(FLY_BY) iDDR4_hi[gl].BG        = ddr4_bg;
+                assign #(FLY_BY) iDDR4_hi[gl].ODT       = ddr4_odt;
+            end
+            assign iDDR4_lo[gl].ADDR_17 = 1'b0;
+            assign iDDR4_lo[gl].C       = '0;
+            assign iDDR4_lo[gl].TEN     = 1'b0;
+            assign iDDR4_lo[gl].PARITY  = 1'b0;
+            assign iDDR4_lo[gl].ZQ      = 1'b1;
+            assign iDDR4_lo[gl].PWR     = 1'b1;
+            assign iDDR4_lo[gl].VREF_CA = 1'b1;
+            assign iDDR4_lo[gl].VREF_DQ = 1'b1;
+            assign iDDR4_hi[gl].ADDR_17 = 1'b0;
+            assign iDDR4_hi[gl].C       = '0;
+            assign iDDR4_hi[gl].TEN     = 1'b0;
+            assign iDDR4_hi[gl].PARITY  = 1'b0;
+            assign iDDR4_hi[gl].ZQ      = 1'b1;
+            assign iDDR4_hi[gl].PWR     = 1'b1;
+            assign iDDR4_hi[gl].VREF_CA = 1'b1;
+            assign iDDR4_hi[gl].VREF_DQ = 1'b1;
+        end
+
+        for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_bidi
+            for (gj = 0; gj < 4; gj = gj + 1) begin : gen_dq_lo
+                `ifdef XILINX_SIMULATOR
+                short bidiDQ(iDDR4_lo[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                `else
+                tran  bidiDQ(iDDR4_lo[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                `endif
+            end
+            for (gj = 0; gj < 4; gj = gj + 1) begin : gen_dq_hi
+                `ifdef XILINX_SIMULATOR
+                short bidiDQ(iDDR4_hi[gi].DQ[gj], ddr4_dq[gi*8 + 4 + gj]);
+                `else
+                tran  bidiDQ(iDDR4_hi[gi].DQ[gj], ddr4_dq[gi*8 + 4 + gj]);
+                `endif
+            end
+            `ifdef XILINX_SIMULATOR
+            short bidiDQS_tlo(iDDR4_lo[gi].DQS_t, ddr4_dqs_p[gi]);
+            short bidiDQS_clo(iDDR4_lo[gi].DQS_c, ddr4_dqs_n[gi]);
+            short bidiDQS_thi(iDDR4_hi[gi].DQS_t, ddr4_dqs_p[gi]);
+            short bidiDQS_chi(iDDR4_hi[gi].DQS_c, ddr4_dqs_n[gi]);
+            `else
+            tran  bidiDQS_tlo(iDDR4_lo[gi].DQS_t, ddr4_dqs_p[gi]);
+            tran  bidiDQS_clo(iDDR4_lo[gi].DQS_c, ddr4_dqs_n[gi]);
+            tran  bidiDQS_thi(iDDR4_hi[gi].DQS_t, ddr4_dqs_p[gi]);
+            tran  bidiDQS_chi(iDDR4_hi[gi].DQS_c, ddr4_dqs_n[gi]);
+            `endif
+        end
+
+        for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_mem
+            ddr4_model #(
+                .CONFIGURED_DQ_BITS (4),
+                .CONFIGURED_DENSITY (TB_DENSITY),
+                .CONFIGURED_RANKS   (1)
+            ) u_ddr4_lo (
+                .model_enable (model_en),
+                .iDDR4        (iDDR4_lo[gi])
+            );
+            ddr4_model #(
+                .CONFIGURED_DQ_BITS (4),
+                .CONFIGURED_DENSITY (TB_DENSITY),
+                .CONFIGURED_RANKS   (1)
+            ) u_ddr4_hi (
+                .model_enable (model_en),
+                .iDDR4        (iDDR4_hi[gi])
+            );
+        end
     end endgenerate
 
     // ===================================================================
@@ -459,14 +687,13 @@ module ddr4_sim_top;
         end
     end
 
-    // Micron-side command decode  -  reads the DDR4_if interface signals that
-    // feed directly into the encrypted Micron model. Proves what the model
-    // actually receives after the PHY's OSERDESE3 -> OBUF chain.
-    wire micron_cs_n  = iDDR4[0].CS_n;
-    wire micron_act_n = iDDR4[0].ACT_n;
-    wire micron_ras   = iDDR4[0].RAS_n_A16;
-    wire micron_cas   = iDDR4[0].CAS_n_A15;
-    wire micron_we    = iDDR4[0].WE_n_A14;
+    // Micron-side command decode  -  reads the DDR4 bus signals that
+    // feed directly into the Micron model (near-end chip, zero fly-by).
+    wire micron_cs_n  = ddr4_cs_n;
+    wire micron_act_n = ddr4_act_n;
+    wire micron_ras   = ddr4_addr[16];
+    wire micron_cas   = ddr4_addr[15];
+    wire micron_we    = ddr4_addr[14];
 
     always @* begin
         if (micron_cs_n)
@@ -496,8 +723,8 @@ module ddr4_sim_top;
     initial $timeformat(-9, 3, "ns", 0);
 
     initial begin
-        $display("[0ns] CONFIG: DDR4_CLK=%0dps DQ_BITS=%0d BYTE_LANES=%0d BG_BITS=%0d FLY_BY=%0dps ADDR_MAPPING=%0d BIST_MODE=%0d DENSITY=%0dGb",
-            DDR4_CLK_PERIOD, DQ_BITS, BYTE_LANES, BG_BITS, FLY_BY, TB_ADDR_MAPPING, TB_BIST_MODE, TB_DENSITY_GB);
+        $display("[0ns] CONFIG: DDR4_CLK=%0dps DEVICE_WIDTH=x%0d BYTE_LANES=%0d BG_BITS=%0d FLY_BY=%0dps ADDR_MAPPING=%0d BIST_MODE=%0d DENSITY=%0dGb NUM_DEVICES=%0d",
+            DDR4_CLK_PERIOD, DEVICE_WIDTH, BYTE_LANES, BG_BITS, FLY_BY, TB_ADDR_MAPPING, TB_BIST_MODE, TB_DENSITY_GB, NUM_DEVICES);
     end
 
     always @(posedge controller_clk) begin

@@ -57,11 +57,13 @@
 module ddr4_phy #(
     parameter CONTROLLER_CLK_PERIOD = 3_333, //ps, controller clock
               DDR4_CLK_PERIOD = 833,          //ps, DDR4 memory clock
+              DEVICE_WIDTH = 8, //DDR4 device data width (4, 8, or 16)
               ROW_BITS = 16,    //row address width
-              BA_BITS = 2,      //bank address (always 2 for DDR4)
-              BG_BITS = 2,      //bank group bits
-              DQ_BITS = 8,      //device data width
               BYTE_LANES = 2,   //number of byte lanes
+    // Derived from DEVICE_WIDTH -- do not override
+    parameter BA_BITS = 2,      //bank address (always 2 for DDR4)
+              BG_BITS = (DEVICE_WIDTH == 16) ? 1 : 2, //JESD79-4D Table 2
+              DQ_BITS = 8,      //always 8 (byte-lane granularity)
     parameter SERDES_RATIO = 4,
               DFI_DATA_WIDTH = 2 * DQ_BITS * BYTE_LANES, //per DFI phase
               NUM_BG = (1 << BG_BITS)
@@ -187,7 +189,7 @@ module ddr4_phy #(
     localparam TOTAL_DQ      = DQ_BITS * BYTE_LANES;
     localparam BEAT_WIDTH    = DQ_BITS * BYTE_LANES;         // bits per beat
     localparam MASK_PHASE_W  = 2 * BYTE_LANES;               // mask bits per phase
-    localparam DM_ENABLED    = (DQ_BITS != 4);                // x4 has no DM pin
+    localparam DM_ENABLED    = (DEVICE_WIDTH != 4);            // x4 has no DM pin (JESD79-4D Table 28)
 
     // -----------------------------------------------------------------
     // Synchronous Reset

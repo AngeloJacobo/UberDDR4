@@ -45,12 +45,10 @@ For **AXI4** integration, use [`rtl/axi/ddr4_top_axi.v`](rtl/axi/ddr4_top_axi.v)
 | :---: | :---: | :--- |
 | `CONTROLLER_CLK_PERIOD` | 3333 | Controller clock period in ps (e.g., 3333 ps = 300 MHz) |
 | `DDR4_CLK_PERIOD` | 833 | DDR4 memory clock period in ps (must be 1/4 of controller clock) |
+| `DEVICE_WIDTH` | 8 | DDR4 device data width (4, 8, or 16). Auto-derives BG_BITS and DM. |
 | `ROW_BITS` | 16 | Row address width (14-17) |
-| `COL_BITS` | 10 | Column address width (10-12) |
-| `BA_BITS` | 2 | Bank address width (always 2 for DDR4) |
-| `BG_BITS` | 2 | Bank group bits (2 for x4/x8, 1 for x16) |
-| `DQ_BITS` | 8 | Device data width per chip (4, 8, or 16) |
-| `BYTE_LANES` | 2 | Number of byte lanes |
+| `COL_BITS` | 10 | Column address width (10) |
+| `BYTE_LANES` | 2 | Number of 8-bit byte lanes (see device width table below) |
 | `DENSITY` | 8 | Device density in Gb (2, 4, 8, or 16) |
 | `MICRON_SIM` | 0 | Set to 1 to shorten init delays for Micron model simulation |
 | `ADDR_MAPPING` | 1 | 0 = `{row,bg,ba,col}`, 1 = `{row,ba,col,bg}` (BG-interleaved) |
@@ -63,6 +61,22 @@ For **AXI4** integration, use [`rtl/axi/ddr4_top_axi.v`](rtl/axi/ddr4_top_axi.v)
 | `BIST_MODE` | 0 | 0 = disabled, 1 = tiled test, 2 = full address space test |
 | `DEBUG_CSR_ENABLE` | 1 | Enable debug CSR registers (adds 1 address bit) |
 | `AXI_ID_WIDTH` | 4 | AXI transaction ID width (AXI wrapper only) |
+
+### Device Width Configuration
+
+The PHY always operates in 8-bit byte lanes. `DEVICE_WIDTH` controls DDR4 device-specific
+behavior (bank groups, data mask, page size) per JESD79-4D. `BYTE_LANES` sets the total
+number of 8-bit lanes across all devices.
+
+| Config | `DEVICE_WIDTH` | `BYTE_LANES` | BG_BITS | DM | Physical Topology |
+| :---: | :---: | :---: | :---: | :---: | :--- |
+| 2x x8 (default) | 8 | 2 | 2 | yes | 1 x8 chip per byte lane |
+| 1x x16 | 16 | 2 | 1 | yes | 1 x16 chip spanning 2 byte lanes |
+| 2x x16 | 16 | 4 | 1 | yes | 2 x16 chips (4 byte lanes) |
+| 4x x4 | 4 | 2 | 2 | no | 2 x4 chips paired per byte lane |
+
+**Note:** x4 devices have no DM pin (JESD79-4D Table 28), so byte-masked writes
+(`wb_sel != all-1s`) are not supported for x4 configurations.
 
 ### Clock and Reset Ports
 
