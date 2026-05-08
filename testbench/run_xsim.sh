@@ -112,6 +112,8 @@ echo ""
 if grep -q "TIMEOUT:" sim_result.log; then
     fail "Simulation TIMED OUT"
     exit 1
+elif grep -q "PASS: init_failed asserted as expected" sim_result.log; then
+    pass "Training failure test PASSED (init_failed correctly detected)"
 elif grep -q "FAIL:" sim_result.log; then
     fail "Simulation FAILED (data mismatch)"
     exit 1

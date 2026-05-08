@@ -43,6 +43,7 @@ ALL_TESTS=(
     "calib_flyby_400|-d SIM_FLY_BY_DELAY=400"                            # 400ps skew (worst-case)
     "calib_map0|-d SIM_ADDR_MAPPING=0"                                   # sequential mapping
     "calib_map0_flyby_200|-d SIM_ADDR_MAPPING=0 -d SIM_FLY_BY_DELAY=200" # seq + 200ps
+    "calib_train_fail|-d SIM_FORCE_TRAIN_FAIL"                          # forced training failure (expects init_failed)
 )
 
 if [[ -z "${XILINX_VIVADO:-}" ]]; then
@@ -107,7 +108,7 @@ for entry in "${TESTS[@]}"; do
     elapsed=$(( end_time - start_time ))
     TIMES+=("$elapsed")
 
-    if $sim_ok && grep -q "PASS: All.*test phases\|PASS: All 10 write" "$LOG"; then
+    if $sim_ok && grep -q "PASS: All.*test phases\|PASS: All 10 write\|PASS: init_failed asserted as expected" "$LOG"; then
         RESULTS+=("PASS")
         ((pass_count++))
         echo -e "  ${GREEN}PASS${RESET} (${elapsed}s)"

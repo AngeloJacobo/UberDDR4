@@ -859,10 +859,20 @@ module ddr4_sim_top;
 
     initial begin
         wait (init_done || init_failed);
+    `ifdef SIM_FORCE_TRAIN_FAIL
+        if (init_failed) begin
+            $display("[%0t] PASS: init_failed asserted as expected (forced training failure)", $realtime);
+            $finish;
+        end else begin
+            $display("[%0t] FAIL: expected init_failed but got init_done", $realtime);
+            $finish;
+        end
+    `else
         if (init_failed) begin
             $display("[%0t] FATAL: o_init_failed asserted!", $realtime);
             $finish;
         end
+    `endif
         repeat (10) @(posedge controller_clk);
         while (wb_stall) @(posedge controller_clk);
 
@@ -1550,6 +1560,22 @@ module ddr4_sim_top;
         $display("[%0t] TIMEOUT: simulation did not complete within 500 us", $realtime);
         $finish;
     end
+
+    // ===================================================================
+    // Training Failure Injection
+    // When SIM_FORCE_TRAIN_FAIL is defined, force DQ[0] to constant 0
+    // during gate training. The PHY expects the MPR pattern (01010101)
+    // on DQ[0] but sees all-zeros, so bitslip alignment never succeeds.
+    // After 3 retries the controller enters CALIB_ERROR and asserts
+    // init_failed.
+    // ===================================================================
+`ifdef SIM_FORCE_TRAIN_FAIL
+    initial begin
+        force ddr4_dq[0] = 1'b0;
+        wait (init_done || init_failed);
+        release ddr4_dq[0];
+    end
+`endif
 
     // ===================================================================
     // Wave Dump  -  VCD for xsim, SHM for Xcelium
