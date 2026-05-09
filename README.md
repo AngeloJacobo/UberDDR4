@@ -22,9 +22,7 @@ This project is funded through [NGI0 Entrust](https://nlnet.nl/entrust), a fund 
 - [Getting Started](#getting-started)
   - [Instantiate Design](#heavy_check_mark-instantiate-design)
   - [Create Constraint File](#heavy_check_mark-create-constraint-file)
-- [Running Lint](#running-lint)
-- [Running Formal Verification](#running-formal-verification)
-- [Running Simulation](#running-simulation)
+- [Build & Verification Suite](#build--verification-suite)
 - [Architecture](#architecture)
   - [CSR Register Map](#csr-register-map)
 - [File Structure](#file-structure)
@@ -116,128 +114,35 @@ DDR4 I/O pins must be placed in a single I/O bank with SSTL12 or POD12 I/O stand
 
 ***
 
-# Running Lint
+# Build & Verification Suite
 
-Yosys synthesis check catches width mismatches, unused signals, and inferred latches. Run from the repo root:
-
-```bash
-./run_compile.sh lint
-```
-
-This reads every RTL file through Yosys `synth_xilinx` and reports any warnings. No bitstream is produced -- it is a lint-only pass.
-
-***
-
-# Running Formal Verification
-
-The formal properties live in [`formal/ddr4_controller_formal.vh`](formal/ddr4_controller_formal.vh) and are included inside `ddr4_controller.v` under `` `ifdef FORMAL ``. The proofs use [SymbiYosys](https://github.com/YosysHQ/sby) with the smtbmc engine (Yices 2 / Boolector).
-
-### Quick start
+[`run_compile.sh`](run_compile.sh) is the unified entry point for lint, compile, formal, and simulation. By default it runs every stage.
 
 ```bash
-# Run via the top-level wrapper (runs all 4 single-config tasks):
-./run_compile.sh formal
-
-# Or run individual tasks directly:
-sby -f formal/ddr4_singleconfig.sby prove_map0
-sby -f formal/ddr4_singleconfig.sby prove_map1
-sby -f formal/ddr4_singleconfig.sby prove_map0_bounded
-sby -f formal/ddr4_singleconfig.sby prove_map1_bounded
+./run_compile.sh                     # all stages (lint + compile + formal + sim-regr)
+./run_compile.sh --lint              # verilator lint only
+./run_compile.sh --compile           # iverilog + yosys compile check
+./run_compile.sh --formal            # formal single config
+./run_compile.sh --formal-regr       # formal regression (all configs)
+./run_compile.sh --sim [TEST]        # single sim test (default: baseline)
+./run_compile.sh --sim-regr          # full sim regression
+./run_compile.sh --no-sim            # lint + compile + formal (skip sim)
+./run_compile.sh --help              # list all options and available test names
 ```
 
-### Multi-config parameter sweep
-
-A separate .sby file sweeps 24 configurations across different ROW_BITS, COL_BITS, BA_BITS, BG_BITS, and DQ_BITS values:
-
-```bash
-sby -f formal/ddr4_multiconfig.sby
-```
-
-### Formal verification tasks
-
-| Task | Depth | What it proves |
-| :---: | :---: | :--- |
-| `prove_map0` | 8 | All 22 properties with ADDR_MAPPING=0 (row-bg-ba-col), unbounded k-induction |
-| `prove_map1` | 8 | All 22 properties with ADDR_MAPPING=1 (row-ba-col-bg, BG-interleaved), unbounded |
-| `prove_map0_bounded` | 28 | ADDR_MAPPING=0 + bounded worst-case stall latency (Prop 19) |
-| `prove_map1_bounded` | 28 | ADDR_MAPPING=1 + bounded worst-case stall latency (Prop 19) |
-
-25 properties are proven covering Wishbone B4 protocol compliance, bank state consistency, JEDEC timing enforcement (tRCD/tRP/tRAS/tRC/tCCD/tRRD/tWTR/tFAW), command encoding, pipeline data integrity, and scheduler throughput. See the header of `ddr4_controller_formal.vh` for the full property list and verification strategy.
-
-***
-
-# Running Simulation
-
-The simulation uses the [Micron DDR4 SDRAM Verilog Model](https://www.micron.com) under Xilinx Vivado `xsim`.
+Multiple flags can be combined (e.g. `--lint --formal`). Logs are written to `build_logs/`.
 
 ### Prerequisites
 
-- Vivado (tested with 2023.1+). Set `XILINX_VIVADO` if not on `PATH`.
-- Micron DDR4 model files (`.sv` and `.sva`). Place them under `testbench/` alongside the provided `ddr4_model_wrapper.sv`.
+| Tool | Purpose | Install |
+| :--- | :--- | :--- |
+| [Verilator](https://verilator.org) | RTL lint | [OSS CAD Suite](https://github.com/YosysHQ/oss-cad-suite-build) |
+| [Icarus Verilog](http://iverilog.icarus.com) | Syntax/elaboration check | OSS CAD Suite |
+| [Yosys](https://yosyshq.net/yosys/) | Synthesis check | OSS CAD Suite |
+| [SymbiYosys](https://github.com/YosysHQ/sby) | Formal verification | OSS CAD Suite |
+| [Vivado xsim](https://www.xilinx.com/products/design-tools/vivado.html) | Simulation | Xilinx Vivado 2023.1+ |
 
-### Running the default simulation
-
-```bash
-bash testbench/run_xsim.sh
-```
-
-Or from the top-level wrapper:
-
-```bash
-./run_compile.sh sim
-```
-
-### Running with fly-by delay override
-
-The `SIM_FLY_BY_DELAY` parameter models PCB trace propagation delay. Override it to test timing margin sensitivity:
-
-```bash
-EXTRA_DEFINES="-d SIM_FLY_BY_DELAY=100" bash testbench/run_xsim.sh
-```
-
-### Running the full regression
-
-The regression script sweeps 8 configurations (DDR4-2400/1600, DQ 8/16, both address mappings):
-
-```bash
-bash testbench/regression_test.sh
-```
-
-### Expected output
-
-A passing run prints `PASS` for each test phase and ends with:
-
-```
-[SUMMARY] All tests PASSED
-$finish called
-```
-
-A failing test prints `FAIL` with the phase name and expected vs. actual data, then the simulation terminates.
-
-### Test phases
-
-The testbench (`ddr4_sim_top.sv`) executes 19 self-checking test phases:
-
-| Phase | Test Description |
-| :---: | :--- |
-| A | Sequential burst writes to BG0/BA0 |
-| B | Sequential burst writes to BG0/BA1 |
-| C | Cross-bank-group writes (BG0 -> BG1) |
-| D | Cross-row writes (page miss) |
-| E | Multi-bank-group sequential writes |
-| F | Sequential read-back with data verification |
-| G-H | Additional row/bank read-back |
-| I | Pipeline stress -- back-to-back writes |
-| J | Full pipeline read-back |
-| K | Read-to-write turnaround stress |
-| L | Data masking (byte-lane selective writes) |
-| M | tFAW sliding window stress (5 activates) |
-| N | Pipeline saturation (32 outstanding writes) |
-| O | Refresh-during-traffic |
-| P | Address boundary corners |
-| Q | Multi-bank-group interleaving (16 banks) |
-| CSR | Debug CSR register read/verify |
-| RETRIG | BIST re-trigger via CSR and post-check |
+Set `XILINX_VIVADO` to the Vivado install path (e.g. `/path/to/Vivado/2023.1`).
 
 ***
 

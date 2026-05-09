@@ -1,141 +1,494 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# run_compile.sh  -  UberDDR4 build & verification sweep
+# run_compile.sh — UberDDR4 Build & Verification Suite
 #
-# Three-stage verification pipeline:
-#   1. lint   - Yosys synthesis check (controller only, catches elaboration
-#               errors, undriven nets, width mismatches)
-#   2. formal - SymbiYosys bounded model checking (properties defined in
-#               formal/ddr4_singleconfig.sby)
-#   3. sim    - Vivado xsim full simulation (delegates to run_xsim.sh)
-#
-# Each stage records PASS/FAIL independently. The exit code equals the
-# number of failures (0 = all green).
+# Stages:
+#   lint      Verilator lint (controller, prober, phy, top)
+#   compile   Iverilog parse + Yosys synthesis check
+#   formal    SymbiYosys bounded model checking
+#   sim       Vivado xsim simulation (single test or regression)
 #
 # Usage:
-#   ./run_compile.sh              # full sweep (lint + formal + sim)
-#   ./run_compile.sh lint         # Yosys synthesis check only
-#   ./run_compile.sh formal       # formal proofs only
-#   ./run_compile.sh sim          # simulation only
+#   ./run_compile.sh                     All stages (lint+compile+formal+sim-regr)
+#   ./run_compile.sh --lint              Verilator lint only
+#   ./run_compile.sh --compile           Iverilog + Yosys only
+#   ./run_compile.sh --formal            Formal single config (4 tasks)
+#   ./run_compile.sh --formal-regr       Formal regression (28 tasks)
+#   ./run_compile.sh --sim [TEST]        Single sim test (default: baseline)
+#   ./run_compile.sh --sim-regr          Full sim regression (21 tests)
+#   ./run_compile.sh --no-sim            Lint + compile + formal (skip sim)
 #
+# Sim tests: baseline flyby_50 flyby_100 flyby_200 flyby_300 flyby_400
+#   map0 map0_flyby_200 bist_full x16 x16_map0 x16_bist_full x16_flyby_4lane
+#   x4 x4_map0 ddr4_1600 ddr4_1600_flyby ddr4_2133 ddr4_2133_flyby
+#   density_4g train_fail
+#
+# Engineer: Angelo C. Jacobo
+set -o pipefail
 
-set -e
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# ═══════════════════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+VIVADO="${XILINX_VIVADO:-/cad/adi/apps/xilinx/vivado/2023.1/Vivado/2023.1}"
+UNISIMS="$VIVADO/data/verilog/src/unisims"
 
-PASS_COUNT=0
-FAIL_COUNT=0
-RESULTS=()
+RTL_CORE=(rtl/ddr4_controller.v rtl/ddr4_phy.v rtl/ddr4_prober.v rtl/ddr4_top.v)
+RTL_AXI=(rtl/axi/ddr4_top_axi.v rtl/axi/axim2wbsp.v rtl/axi/aximrd2wbsp.v
+         rtl/axi/aximwr2wbsp.v rtl/axi/axi_addr.v rtl/axi/skidbuffer.v
+         rtl/axi/sfifo.v rtl/axi/wbarbiter.v)
+LOGDIR="build_logs"
 
-record() {
-    local name="$1" status="$2"
-    if [ "$status" = "PASS" ]; then
-        RESULTS+=("${GREEN}PASS${NC}  $name")
-        PASS_COUNT=$((PASS_COUNT + 1))
-    else
-        RESULTS+=("${RED}FAIL${NC}  $name")
-        FAIL_COUNT=$((FAIL_COUNT + 1))
+SIM_TESTS=(
+    baseline flyby_50 flyby_100 flyby_200 flyby_300 flyby_400
+    map0 map0_flyby_200 bist_full
+    x16 x16_map0 x16_bist_full x16_flyby_4lane
+    x4 x4_map0
+    ddr4_1600 ddr4_1600_flyby ddr4_2133 ddr4_2133_flyby
+    density_4g train_fail
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Colors & symbols (disabled when not a terminal)
+# ═══════════════════════════════════════════════════════════════════════════
+if [[ -t 1 ]]; then
+    RST='\033[0m'  BLD='\033[1m'  DIM='\033[2m'
+    RED='\033[1;31m' GRN='\033[1;32m' YLW='\033[1;33m'
+    BLU='\033[1;34m' CYN='\033[1;36m' WHT='\033[1;37m'
+else
+    RST='' BLD='' DIM='' RED='' GRN='' YLW='' BLU='' CYN='' WHT=''
+fi
+OK="✓"  XF="✗"  SK="○"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# State
+# ═══════════════════════════════════════════════════════════════════════════
+PASS_N=0  FAIL_N=0  SKIP_N=0
+SP=0 SF=0 SS=0
+declare -a SUMMARY=()
+T0=$(date +%s)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+elapsed() {
+    local s=$1
+    if   (( s >= 3600 )); then printf "%dh%02dm%02ds" $((s/3600)) $((s%3600/60)) $((s%60))
+    elif (( s >= 60   )); then printf "%dm%02ds" $((s/60)) $((s%60))
+    else                       printf "%ds" "$s"
     fi
 }
 
-run_yosys() {
-    echo -e "${CYAN}> Yosys synthesis check (controller)${NC}"
-    if yosys -q -p "
-        read_verilog -sv ./rtl/ddr4_controller.v;
-        synth -top ddr4_controller" 2>&1; then
-        record "yosys_synth" "PASS"
-    else
-        record "yosys_synth" "FAIL"
-    fi
+pass() { printf "  ${GRN}${OK}${RST} %-52s ${GRN}PASS${RST}  ${DIM}%s${RST}\n" "$1" "$2"; ((PASS_N++)); ((SP++)); }
+fail() { printf "  ${RED}${XF}${RST} %-52s ${RED}FAIL${RST}  ${DIM}%s${RST}\n" "$1" "$2"; ((FAIL_N++)); ((SF++)); }
+skip() { printf "  ${YLW}${SK}${RST} %-52s ${YLW}SKIP${RST}\n" "$1";                      ((SKIP_N++)); ((SS++)); }
+
+show_errors() {
+    local f="$1" n="${2:-6}"
+    [[ -s "$f" ]] || return 0
+    grep -iE "error|fail|warn" "$f" | head -n "$n" | while IFS= read -r l; do
+        printf "    ${DIM}%s${RST}\n" "$l"
+    done
 }
 
-run_formal() {
-    echo ""
-    echo -e "${CYAN}> SymbiYosys formal verification (single-config)${NC}"
-    rm -rf formal/ddr4_singleconfig_*
+stage_reset() { SP=0; SF=0; SS=0; }
 
-    if sby -f formal/ddr4_singleconfig.sby 2>&1; then
-        for task_dir in formal/ddr4_singleconfig_*/; do
-            task_name=$(basename "$task_dir")
-            if [ -e "${task_dir}PASS" ]; then
-                record "$task_name" "PASS"
-            else
-                record "$task_name" "FAIL"
-            fi
-        done
-    else
-        record "formal_singleconfig" "FAIL"
+stage_record() {
+    local name="$1"
+    local st
+    if   (( SF > 0 )); then st="${RED}FAIL${RST}"
+    elif (( SP > 0 )); then st="${GRN}PASS${RST}"
+    else                     st="${YLW}SKIP${RST}"
     fi
+    SUMMARY+=("$(printf "  %-14s %2d pass  %2d fail  %2d skip       %b" \
+                        "$name" "$SP" "$SF" "$SS" "$st")")
 }
 
-run_sim() {
-    echo ""
-    echo -e "${CYAN}> Vivado xsim simulation (default config)${NC}"
+banner() {
+    local w=66
+    local commit branch ts
+    commit=$(git rev-parse --short HEAD 2>/dev/null || echo "n/a")
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "n/a")
+    ts=$(date "+%Y-%m-%d %H:%M")
+    echo
+    printf "${CYN}╔"; printf '═%.0s' $(seq 1 $w); printf "╗${RST}\n"
+    printf "${CYN}║${BLD}${WHT}  %-$((w-2))s  ${CYN}║${RST}\n" "UberDDR4 Build & Verification Suite"
+    printf "${CYN}║${DIM}  %-$((w-2))s  ${CYN}║${RST}\n" "$ts  ·  $branch @ $commit"
+    printf "${CYN}╚"; printf '═%.0s' $(seq 1 $w); printf "╝${RST}\n"
+    echo
+}
 
-    if [ -z "$XILINX_VIVADO" ]; then
-        echo "ERROR: XILINX_VIVADO not set. Source Vivado settings64.sh first."
-        record "xsim_default" "FAIL"
-        return
-    fi
+header() {
+    printf "\n${BLU}┌──${BLD} Stage %s/%s: %s${RST}\n" "$1" "$2" "$3"
+    printf "${BLU}│${RST}\n"
+}
 
-    cd "$SCRIPT_DIR/.."
-    rm -rf xsim.dir
+# ═══════════════════════════════════════════════════════════════════════════
+# Parse arguments
+# ═══════════════════════════════════════════════════════════════════════════
+DO_LINT=false  DO_COMPILE=false  DO_FORMAL=false  DO_SIM=false
+FORMAL_REGR=false  SIM_REGR=false  SIM_TEST="baseline"
+EXPLICIT=false
 
-    if bash "$SCRIPT_DIR/testbench/run_xsim.sh" 2>&1 | tee /tmp/uberddr4_sim.log; then
-        if grep -q "Simulation PASSED\|Simulation finished successfully" /tmp/uberddr4_sim.log; then
-            record "xsim_default" "PASS"
+show_help() {
+    sed -n '3,/^set /{ /^set /d; s/^# \?//p; }' "$0"
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --lint)        DO_LINT=true;    EXPLICIT=true ;;
+        --compile)     DO_COMPILE=true; EXPLICIT=true ;;
+        --formal)      DO_FORMAL=true;  EXPLICIT=true ;;
+        --formal-regr) DO_FORMAL=true;  FORMAL_REGR=true; EXPLICIT=true ;;
+        --sim)         DO_SIM=true;     EXPLICIT=true
+                       if [[ -n "${2:-}" && "${2:0:2}" != "--" ]]; then
+                           SIM_TEST="$2"; shift
+                       fi ;;
+        --sim-regr)    DO_SIM=true;     SIM_REGR=true; EXPLICIT=true ;;
+        --no-sim)      DO_LINT=true; DO_COMPILE=true; DO_FORMAL=true; EXPLICIT=true ;;
+        --help|-h)     show_help ;;
+        *)             printf "${RED}Unknown: %s${RST}\n" "$1"; show_help ;;
+    esac
+    shift
+done
+
+if ! $EXPLICIT; then
+    DO_LINT=true; DO_COMPILE=true; DO_FORMAL=true; DO_SIM=true; SIM_REGR=true
+fi
+
+TOTAL=0
+$DO_LINT    && ((TOTAL++))
+$DO_COMPILE && ((TOTAL++))
+$DO_FORMAL  && ((TOTAL++))
+$DO_SIM     && ((TOTAL++))
+STAGE=0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool check
+# ═══════════════════════════════════════════════════════════════════════════
+check_tools() {
+    local ok=true
+    printf "${DIM}  Checking tools...${RST}\n"
+    for tool in verilator iverilog yosys sby; do
+        if command -v "$tool" &>/dev/null; then
+            printf "  ${GRN}${OK}${RST} %-14s ${DIM}%s${RST}\n" "$tool" "$(command -v "$tool")"
         else
-            record "xsim_default" "FAIL"
+            printf "  ${RED}${XF}${RST} %-14s ${RED}not found${RST}\n" "$tool"
+            ok=false
+        fi
+    done
+    if [[ -d "$VIVADO" ]]; then
+        printf "  ${GRN}${OK}${RST} %-14s ${DIM}%s${RST}\n" "vivado" "$VIVADO"
+    else
+        printf "  ${RED}${XF}${RST} %-14s ${RED}XILINX_VIVADO not set${RST}\n" "vivado"
+        if $DO_SIM; then ok=false; fi
+    fi
+    echo
+    local plan=""
+    $DO_LINT    && plan+="lint → "
+    $DO_COMPILE && plan+="compile → "
+    $DO_FORMAL  && { $FORMAL_REGR && plan+="formal-regr → " || plan+="formal → "; }
+    $DO_SIM     && { $SIM_REGR && plan+="sim-regr (${#SIM_TESTS[@]} tests)" || plan+="sim ($SIM_TEST)"; }
+    plan="${plan% → }"
+    printf "  ${BLD}Stages:${RST} %s\n\n" "$plan"
+    $ok || { printf "${RED}  Missing required tools. Aborting.${RST}\n"; exit 1; }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 1: Verilator Lint
+# ═══════════════════════════════════════════════════════════════════════════
+run_lint() {
+    ((STAGE++))
+    stage_reset
+    header "$STAGE" "$TOTAL" "Verilator Lint"
+
+    mkdir -p "$LOGDIR"
+    local stubs="$LOGDIR/.xilinx_stubs.v"
+    cat > "$stubs" << 'STUBS'
+module OSERDESE3 #(parameter DATA_WIDTH=8, INIT=0, IS_CLKDIV_INVERTED=0,
+    IS_CLK_INVERTED=0, IS_RST_INVERTED=0, ODDR_MODE="FALSE",
+    OSERDES_D_BYPASS="FALSE", OSERDES_T_BYPASS="FALSE", SIM_DEVICE="")
+    (input CLK, CLKDIV, RST, T1, T2, T3, T4,
+     input D1, D2, D3, D4, D5, D6, D7, D8,
+     output OQ, T_OUT);
+endmodule
+module ISERDESE3 #(parameter DATA_WIDTH=8, FIFO_ENABLE="FALSE",
+    FIFO_SYNC_MODE="FALSE", IS_CLK_B_INVERTED=1, IS_CLK_INVERTED=0,
+    IS_RST_INVERTED=0, SIM_DEVICE="")
+    (input CLK, CLK_B, CLKDIV, D, RST, FIFO_RD_CLK, FIFO_RD_EN,
+     output Q1, Q2, Q3, Q4, Q5, Q6, Q7, Q8, FIFO_EMPTY, INTERNAL_DIVCLK);
+endmodule
+module ODELAYE3 #(parameter CASCADE="NONE", DELAY_FORMAT="TIME",
+    DELAY_TYPE="FIXED", DELAY_VALUE=0, IS_CLK_INVERTED=0,
+    IS_RST_INVERTED=0, REFCLK_FREQUENCY=300.0, SIM_DEVICE="",
+    SIM_VERSION=1.0, UPDATE_MODE="ASYNC")
+    (input CLK, EN_VTC, INC, CE, LOAD, RST, ODATAIN, CASC_IN, CASC_RETURN,
+     input [8:0] CNTVALUEIN,
+     output DATAOUT, CASC_OUT,
+     output [8:0] CNTVALUEOUT);
+endmodule
+module IDELAYE3 #(parameter CASCADE="NONE", DELAY_FORMAT="TIME",
+    DELAY_TYPE="FIXED", DELAY_VALUE=0, IS_CLK_INVERTED=0,
+    IS_RST_INVERTED=0, REFCLK_FREQUENCY=300.0, SIM_DEVICE="",
+    SIM_VERSION=1.0, UPDATE_MODE="ASYNC")
+    (input CLK, EN_VTC, INC, CE, LOAD, RST, IDATAIN, DATAIN,
+     CASC_IN, CASC_RETURN,
+     input [8:0] CNTVALUEIN,
+     output DATAOUT, CASC_OUT,
+     output [8:0] CNTVALUEOUT);
+endmodule
+module OBUFDS (input I, output O, OB);
+endmodule
+module OBUF (input I, output O);
+endmodule
+module IOBUF (input I, T, output O, inout IO);
+endmodule
+STUBS
+
+    for f in "${RTL_CORE[@]}"; do
+        local mod log t0 t1
+        mod=$(basename "$f" .v)
+        log="$LOGDIR/lint_${mod}.log"
+        t0=$(date +%s)
+        if verilator --lint-only -Wall \
+               --top-module "$mod" "$stubs" "$f" > "$log" 2>&1; then
+            t1=$(date +%s)
+            local wc
+            wc=$(grep -c "Warning" "$log" 2>/dev/null || true)
+            if (( wc > 0 )); then
+                pass "$f (${wc} warnings)" "$(elapsed $((t1-t0)))"
+            else
+                pass "$f" "$(elapsed $((t1-t0)))"
+            fi
+        else
+            t1=$(date +%s)
+            fail "$f" "$(elapsed $((t1-t0)))"
+            show_errors "$log"
+        fi
+    done
+    rm -f "$stubs"
+
+    stage_record "Lint"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 2: Compile Checks
+# ═══════════════════════════════════════════════════════════════════════════
+run_compile() {
+    ((STAGE++))
+    stage_reset
+    header "$STAGE" "$TOTAL" "Compile Checks"
+
+    mkdir -p "$LOGDIR"
+    local log t0 t1
+
+    # ── Iverilog ──
+    log="$LOGDIR/compile_iverilog.log"
+    t0=$(date +%s)
+    if iverilog -g2012 -Wall -t null \
+           -y "$UNISIMS" \
+           "${RTL_CORE[@]}" > "$log" 2>&1; then
+        t1=$(date +%s)
+        pass "iverilog (core RTL)" "$(elapsed $((t1-t0)))"
+    else
+        t1=$(date +%s)
+        fail "iverilog (core RTL)" "$(elapsed $((t1-t0)))"
+        show_errors "$log"
+    fi
+
+    # ── Yosys ──
+    log="$LOGDIR/compile_yosys.log"
+    t0=$(date +%s)
+    local yosys_script="read_verilog -lib -specify +/xilinx/cells_sim.v; read_verilog -sv"
+    for f in "${RTL_CORE[@]}"; do yosys_script+=" $f"; done
+    yosys_script+="; hierarchy -top ddr4_top -check -purge_lib; proc; opt; check"
+    if yosys -q -p "$yosys_script" > "$log" 2>&1; then
+        t1=$(date +%s)
+        pass "yosys (synthesis check)" "$(elapsed $((t1-t0)))"
+    else
+        t1=$(date +%s)
+        fail "yosys (synthesis check)" "$(elapsed $((t1-t0)))"
+        show_errors "$log"
+    fi
+
+    stage_record "Compile"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 3: Formal Verification
+# ═══════════════════════════════════════════════════════════════════════════
+run_formal() {
+    ((STAGE++))
+    stage_reset
+    local sby_file label
+    if $FORMAL_REGR; then
+        sby_file="formal/ddr4_multiconfig.sby"
+        label="Formal Verification (regression — 28 tasks)"
+    else
+        sby_file="formal/ddr4_singleconfig.sby"
+        label="Formal Verification (single — 4 tasks)"
+    fi
+    header "$STAGE" "$TOTAL" "$label"
+
+    mkdir -p "$LOGDIR"
+    local log t0 t1
+    log="$LOGDIR/formal.log"
+    t0=$(date +%s)
+    sby -f "$sby_file" > "$log" 2>&1
+    local rc=$?
+    t1=$(date +%s)
+
+    local base
+    base=$(basename "$sby_file" .sby)
+    for d in ${base}_*/; do
+        [[ -d "$d" ]] || continue
+        local task
+        task=$(basename "$d")
+        task=${task#${base}_}
+        if [[ -e "${d}PASS" ]]; then
+            pass "$task" ""
+        else
+            fail "$task" ""
+        fi
+    done
+
+    if (( SF == 0 && SP == 0 )); then
+        if (( rc == 0 )); then
+            pass "sby $base" "$(elapsed $((t1-t0)))"
+        else
+            fail "sby $base" "$(elapsed $((t1-t0)))"
+            show_errors "$log"
         fi
     else
-        record "xsim_default" "FAIL"
+        printf "  ${DIM}  Total: %s${RST}\n" "$(elapsed $((t1-t0)))"
     fi
-    cd "$SCRIPT_DIR"
+
+    stage_record "Formal"
 }
 
-print_summary() {
-    echo ""
-    echo -e "${CYAN}===============================================${NC}"
-    echo -e "${CYAN}  UberDDR4 Verification Summary${NC}"
-    echo -e "${CYAN}===============================================${NC}"
-    for r in "${RESULTS[@]}"; do
-        echo -e "  $r"
-    done
-    echo ""
-    if [ "$FAIL_COUNT" -eq 0 ]; then
-        echo -e "  ${GREEN}ALL $PASS_COUNT CHECKS PASSED${NC}"
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 4: Simulation
+# ═══════════════════════════════════════════════════════════════════════════
+run_sim() {
+    ((STAGE++))
+    stage_reset
+
+    if [[ -z "${XILINX_VIVADO:-}" && ! -d "$VIVADO" ]]; then
+        header "$STAGE" "$TOTAL" "Simulation"
+        fail "XILINX_VIVADO not set" ""
+        stage_record "Sim"
+        return
+    fi
+    export XILINX_VIVADO="$VIVADO"
+
+    if $SIM_REGR; then
+        header "$STAGE" "$TOTAL" "Simulation Regression (${#SIM_TESTS[@]} tests)"
+        mkdir -p "$LOGDIR"
+        local log="$LOGDIR/sim_regression.log"
+        local st0
+        st0=$(date +%s)
+
+        local test_re='^\[([0-9]+)/([0-9]+)\] +([^ ]+) .*(PASS|FAIL) \(([0-9]+)s\)'
+
+        while IFS= read -r line; do
+            echo "$line" >> "$log"
+            if [[ $line =~ $test_re ]]; then
+                local name="${BASH_REMATCH[3]}"
+                local result="${BASH_REMATCH[4]}"
+                local secs="${BASH_REMATCH[5]}"
+                if [[ "$result" == "PASS" ]]; then
+                    pass "$name" "$(elapsed "$secs")"
+                else
+                    fail "$name" "$(elapsed "$secs")"
+                fi
+            fi
+        done < <(cd "$SCRIPT_DIR/.." && bash "$SCRIPT_DIR/testbench/regression_test.sh" 2>&1)
+
+        local st1
+        st1=$(date +%s)
+        printf "  ${DIM}  Total sim time: %s${RST}\n" "$(elapsed $((st1-st0)))"
+        printf "  ${DIM}  Logs: testbench/regression_logs/${RST}\n"
     else
-        echo -e "  ${RED}$FAIL_COUNT FAILED${NC}, $PASS_COUNT passed"
+        header "$STAGE" "$TOTAL" "Simulation ($SIM_TEST)"
+
+        local idx=-1
+        for i in "${!SIM_TESTS[@]}"; do
+            if [[ "${SIM_TESTS[$i]}" == "$SIM_TEST" ]]; then
+                idx=$((i+1)); break
+            fi
+        done
+        if (( idx < 0 )); then
+            fail "$SIM_TEST (unknown test — see --help)" ""
+            stage_record "Sim"
+            return
+        fi
+
+        mkdir -p "$LOGDIR"
+        local log="$LOGDIR/sim_${SIM_TEST}.log"
+        local st0 st1
+        st0=$(date +%s)
+        cd "$SCRIPT_DIR/.."
+        bash "$SCRIPT_DIR/testbench/regression_test.sh" "$idx" > "$log" 2>&1
+        local rc=$?
+        st1=$(date +%s)
+        cd "$SCRIPT_DIR"
+
+        if (( rc == 0 )); then
+            pass "$SIM_TEST" "$(elapsed $((st1-st0)))"
+        else
+            fail "$SIM_TEST" "$(elapsed $((st1-st0)))"
+            grep -iE "FAIL|error|mismatch" "$log" | grep -v "^#" | tail -5 | \
+                while IFS= read -r l; do printf "    ${DIM}%s${RST}\n" "$l"; done
+        fi
     fi
-    echo -e "${CYAN}===============================================${NC}"
+
+    stage_record "Sim"
 }
 
-case "${1:-all}" in
-    lint)
-        run_yosys
-        ;;
-    formal)
-        run_formal
-        ;;
-    sim)
-        run_sim
-        ;;
-    all)
-        run_yosys
-        run_formal
-        run_sim
-        ;;
-    *)
-        echo "Usage: $0 [lint|formal|sim|all]"
-        exit 1
-        ;;
-esac
+# ═══════════════════════════════════════════════════════════════════════════
+# Summary
+# ═══════════════════════════════════════════════════════════════════════════
+print_summary() {
+    local t1 total_time total overall w=66
+    t1=$(date +%s)
+    total_time=$((t1 - T0))
+    total=$((PASS_N + FAIL_N + SKIP_N))
+
+    echo
+    printf "${WHT}"; printf '═%.0s' $(seq 1 $w); printf "${RST}\n"
+    printf "${BLD}${WHT}  RESULTS SUMMARY${RST}\n"
+    printf "${WHT}"; printf '═%.0s' $(seq 1 $w); printf "${RST}\n"
+
+    for line in "${SUMMARY[@]}"; do
+        printf "%b\n" "$line"
+    done
+
+    printf "${DIM}"; printf '─%.0s' $(seq 1 $w); printf "${RST}\n"
+
+    if (( FAIL_N > 0 )); then overall="${RED}FAIL${RST}"
+    else                       overall="${GRN}PASS${RST}"
+    fi
+    printf "  ${BLD}%-14s %2d pass  %2d fail  %2d skip       %b${RST}  ${DIM}%s${RST}\n" \
+           "TOTAL" "$PASS_N" "$FAIL_N" "$SKIP_N" "$overall" "$(elapsed $total_time)"
+
+    printf "${WHT}"; printf '═%.0s' $(seq 1 $w); printf "${RST}\n"
+    printf "  ${DIM}Logs: %s/${RST}\n" "$LOGDIR"
+    echo
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════
+banner
+check_tools
+
+$DO_LINT    && run_lint
+$DO_COMPILE && run_compile
+$DO_FORMAL  && run_formal
+$DO_SIM     && run_sim
 
 print_summary
-exit $FAIL_COUNT
+exit $FAIL_N

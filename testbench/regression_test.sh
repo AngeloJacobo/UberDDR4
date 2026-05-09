@@ -120,7 +120,7 @@ for entry in "${TESTS[@]}"; do
     fi
 
     cd "$REPO_ROOT"
-    rm -rf xsim.dir
+    rm -rf xsim.dir 2>/dev/null; rm -rf xsim.dir 2>/dev/null
 
     LOG="$LOG_DIR/${NAME}.log"
 

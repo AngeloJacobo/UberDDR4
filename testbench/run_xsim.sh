@@ -66,7 +66,7 @@ fi
 
 if [[ "${1:-}" == "--clean" ]]; then
     step "Cleaning xsim.dir"
-    rm -rf xsim.dir
+    rm -rf xsim.dir 2>/dev/null; rm -rf xsim.dir 2>/dev/null
 fi
 
 echo ""
