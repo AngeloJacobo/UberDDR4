@@ -134,7 +134,10 @@ for entry in "${TESTS[@]}"; do
     elapsed=$(( end_time - start_time ))
     TIMES+=("$elapsed")
 
-    if $sim_ok && grep -q "PASS: All.*test phases\|PASS: All 10 write\|PASS: init_failed asserted as expected" "$LOG"; then
+    violation_count=$(grep -c "VIOLATION" "$LOG" 2>/dev/null || echo 0)
+
+    if $sim_ok && grep -q "PASS: All.*test phases\|PASS: All 10 write\|PASS: init_failed asserted as expected" "$LOG" \
+              && [[ "$violation_count" -eq 0 ]]; then
         RESULTS+=("PASS")
         ((pass_count++))
         echo -e "  ${GREEN}PASS${RESET} (${elapsed}s)"
@@ -142,7 +145,9 @@ for entry in "${TESTS[@]}"; do
         RESULTS+=("FAIL")
         ((fail_count++))
         echo -e "  ${RED}FAIL${RESET} (${elapsed}s)"
-        if grep -q "TIMEOUT:" "$LOG"; then
+        if [[ "$violation_count" -gt 0 ]]; then
+            echo -e "  ${RED}  Reason: ${violation_count} Micron model VIOLATION(s)${RESET}"
+        elif grep -q "TIMEOUT:" "$LOG"; then
             echo -e "  ${RED}  Reason: simulation timeout${RESET}"
         elif grep -q "CALIB_ERROR" "$LOG"; then
             echo -e "  ${RED}  Reason: calibration error${RESET}"

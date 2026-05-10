@@ -146,7 +146,7 @@ module ddr4_top #(
     wire                     prober_bist_fail;
     wire [31:0]              prober_correct;
     wire [31:0]              prober_error;
-    wire                     prober_reset_req;
+    wire                     prober_reset_req; // V2: connect to reset path for auto-recovery
     wire                     prober_wb_cyc;
     wire                     prober_wb_stb;
     wire                     prober_wb_we;
@@ -350,7 +350,7 @@ module ddr4_top #(
     // -----------------------------------------------------------------
     // PHY Instantiation
     // -----------------------------------------------------------------
-    // Xilinx 7-series PHY: ISERDES/OSERDES, IDELAY calibration,
+    // Xilinx UltraScale+ PHY: ISERDESE3/OSERDESE3, IDELAYE3/ODELAYE3,
     // write-leveling, read gate training.  Directly drives DDR4 I/O.
     ddr4_phy #(
         .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),

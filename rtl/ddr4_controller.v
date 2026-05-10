@@ -668,12 +668,29 @@ module ddr4_controller #(
                         && !delay_counter_is_zero;
     wire refresh_active = reset_done && !refresh_idle;
 
+    // Is the current ROM instruction a PRECHARGE ALL?
+    wire rom_is_prea = !rom_cmd_is_mrs
+                       && (rom_instruction[26:23] == CMD_PRE)
+                       && rom_instruction[ROM_A10];
+
+    // Any bank still has a pending write/read that hasn't completed tWR/tRTP?
+    // If so, PRE ALL must wait to avoid JEDEC timing violations.
+    wire [NUM_BANKS-1:0] precharge_pending_vec;
+    genvar gpk;
+    generate
+        for (gpk = 0; gpk < NUM_BANKS; gpk = gpk + 1) begin : gen_pre_pending
+            assign precharge_pending_vec[gpk] = |delay_before_precharge_counter_q[gpk];
+        end
+    endgenerate
+    wire any_precharge_pending = |precharge_pending_vec;
+
     // Detect ROM PRE ALL -- clears all bank status (ROM addrs 19, 30, 33)
+    // Gate: after init, PRE ALL waits until all banks' precharge timers expire.
+    wire rom_prea_hold = rom_is_prea && any_precharge_pending && reset_done;
     wire rom_firing = delay_counter_is_zero && !pause_counter
-                      && (!reset_done || instruction_address >= ROM_ADDR_REF_START);
-    wire rom_precharge_all = rom_firing && !rom_cmd_is_mrs
-                             && (rom_instruction[26:23] == CMD_PRE)
-                             && rom_instruction[ROM_A10];
+                      && (!reset_done || instruction_address >= ROM_ADDR_REF_START)
+                      && !rom_prea_hold;
+    wire rom_precharge_all = rom_firing && rom_is_prea;
 
     wire wb_accept = i_wb_cyc && i_wb_stb && !o_wb_stall;
 
@@ -1045,7 +1062,7 @@ module ddr4_controller #(
                 if (!delay_counter_is_zero) begin
                     delay_counter <= delay_counter - 1'b1;
                     delay_counter_is_zero <= (delay_counter == {{(DELAY_COUNTER_WIDTH-1){1'b0}}, 1'b1});
-                end else if (!pause_counter) begin
+                end else if (!pause_counter && !rom_prea_hold) begin
                     // Issue the command from ROM on slot 0
                     if (rom_cmd_is_mrs) begin
                         // MRS: cs_n=0, CMD_MRS, bg/ba from MRS_SELECT, addr from instruction
