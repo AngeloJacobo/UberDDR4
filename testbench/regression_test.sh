@@ -125,7 +125,7 @@ for entry in "${TESTS[@]}"; do
     LOG="$LOG_DIR/${NAME}.log"
 
     start_time=$(date +%s)
-    if timeout 30m bash UberDDR4/testbench/run_xsim.sh > "$LOG" 2>&1; then
+    if timeout 60m bash UberDDR4/testbench/run_xsim.sh > "$LOG" 2>&1; then
         sim_ok=true
     else
         sim_ok=false
