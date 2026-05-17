@@ -9,13 +9,14 @@
 #   sim       Vivado xsim simulation (single test or regression)
 #
 # Usage:
-#   ./run_compile.sh                     All stages (lint+compile+formal+sim-regr)
+#   ./run_compile.sh                     Default (lint+compile+formal+sim baseline)
+#   ./run_compile.sh --all               Everything (lint+compile+formal+formal-regr+sim+sim-regr)
 #   ./run_compile.sh --lint              Verilator lint only
 #   ./run_compile.sh --compile           Iverilog + Yosys only
 #   ./run_compile.sh --formal            Formal single config (4 tasks)
 #   ./run_compile.sh --formal-regr       Formal regression (28 tasks)
 #   ./run_compile.sh --sim [TEST]        Single sim test (default: baseline)
-#   ./run_compile.sh --sim-regr          Full sim regression (21 tests)
+#   ./run_compile.sh --sim-regr          Full sim regression (22 tests)
 #   ./run_compile.sh --no-sim            Lint + compile + formal (skip sim)
 #
 # Sim tests: baseline flyby_50 flyby_100 flyby_200 flyby_300 flyby_400
@@ -25,6 +26,15 @@
 #
 # Engineer: Angelo C. Jacobo
 set -o pipefail
+
+CHILD_PID=""
+cleanup() {
+    printf "\n\033[31mInterrupted — killing child processes...\033[0m\n"
+    [[ -n "$CHILD_PID" ]] && kill -- -$CHILD_PID 2>/dev/null
+    wait 2>/dev/null
+    exit 130
+}
+trap cleanup INT TERM HUP
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -142,6 +152,8 @@ while [[ $# -gt 0 ]]; do
         --lint)        DO_LINT=true;    EXPLICIT=true ;;
         --compile)     DO_COMPILE=true; EXPLICIT=true ;;
         --formal)      DO_FORMAL=true;  EXPLICIT=true ;;
+        --all)         DO_LINT=true; DO_COMPILE=true; DO_FORMAL=true; FORMAL_REGR=true
+                       DO_SIM=true; SIM_REGR=true; EXPLICIT=true ;;
         --formal-regr) DO_FORMAL=true;  FORMAL_REGR=true; EXPLICIT=true ;;
         --sim)         DO_SIM=true;     EXPLICIT=true
                        if [[ -n "${2:-}" && "${2:0:2}" != "--" ]]; then
@@ -156,7 +168,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if ! $EXPLICIT; then
-    DO_LINT=true; DO_COMPILE=true; DO_FORMAL=true; DO_SIM=true; SIM_REGR=true
+    DO_LINT=true; DO_COMPILE=true; DO_FORMAL=true; DO_SIM=true
 fi
 
 TOTAL=0
@@ -337,8 +349,11 @@ run_formal() {
     local log t0 t1
     log="$LOGDIR/formal.log"
     t0=$(date +%s)
-    sby -f "$sby_file" > "$log" 2>&1
+    setsid sby -f "$sby_file" > "$log" 2>&1 &
+    CHILD_PID=$!
+    wait $CHILD_PID
     local rc=$?
+    CHILD_PID=""
     t1=$(date +%s)
 
     local base
@@ -405,7 +420,7 @@ run_sim() {
                     fail "$name" "$(elapsed "$secs")"
                 fi
             fi
-        done < <(cd "$SCRIPT_DIR/.." && bash "$SCRIPT_DIR/testbench/regression_test.sh" 2>&1)
+        done < <(cd "$SCRIPT_DIR/.." && setsid bash "$SCRIPT_DIR/testbench/regression_test.sh" 2>&1)
 
         local st1
         st1=$(date +%s)
@@ -431,8 +446,11 @@ run_sim() {
         local st0 st1
         st0=$(date +%s)
         cd "$SCRIPT_DIR/.."
-        bash "$SCRIPT_DIR/testbench/regression_test.sh" "$idx" > "$log" 2>&1
+        setsid bash "$SCRIPT_DIR/testbench/regression_test.sh" "$idx" > "$log" 2>&1 &
+        CHILD_PID=$!
+        wait $CHILD_PID
         local rc=$?
+        CHILD_PID=""
         st1=$(date +%s)
         cd "$SCRIPT_DIR"
 

@@ -22,6 +22,14 @@ CYAN="\033[36m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
+cleanup() {
+    echo -e "\n${RED}Interrupted — killing child processes...${RESET}"
+    [[ -n "${SIM_PID:-}" ]] && kill -- -$SIM_PID 2>/dev/null
+    wait 2>/dev/null
+    exit 130
+}
+trap cleanup INT TERM HUP
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LOG_DIR="$REPO_ROOT/UberDDR4/testbench/regression_logs"
@@ -125,7 +133,10 @@ for entry in "${TESTS[@]}"; do
     LOG="$LOG_DIR/${NAME}.log"
 
     start_time=$(date +%s)
-    if timeout 60m bash UberDDR4/testbench/run_xsim.sh > "$LOG" 2>&1; then
+    setsid bash -c 'timeout 60m bash UberDDR4/testbench/run_xsim.sh 2>&1 | sed "s/\x1b\[[0-9;]*m//g"' > "$LOG" &
+    SIM_PID=$!
+    wait $SIM_PID
+    if [[ $? -eq 0 ]]; then
         sim_ok=true
     else
         sim_ok=false
@@ -134,7 +145,8 @@ for entry in "${TESTS[@]}"; do
     elapsed=$(( end_time - start_time ))
     TIMES+=("$elapsed")
 
-    violation_count=$(grep -c "VIOLATION" "$LOG" 2>/dev/null || echo 0)
+    violation_count=$(grep -c "VIOLATION" "$LOG" 2>/dev/null)
+    violation_count=${violation_count:-0}
 
     if $sim_ok && grep -q "PASS: All.*test phases\|PASS: All 10 write\|PASS: init_failed asserted as expected" "$LOG" \
               && [[ "$violation_count" -eq 0 ]]; then

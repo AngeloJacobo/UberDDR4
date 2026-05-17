@@ -116,16 +116,17 @@ DDR4 I/O pins must be placed in a single I/O bank with SSTL12 or POD12 I/O stand
 
 # Build & Verification Suite
 
-[`run_compile.sh`](run_compile.sh) is the unified entry point for lint, compile, formal, and simulation. By default it runs every stage.
+[`run_compile.sh`](run_compile.sh) is the unified entry point for lint, compile, formal, and simulation.
 
 ```bash
-./run_compile.sh                     # all stages (lint + compile + formal + sim-regr)
+./run_compile.sh                     # default (lint + compile + formal + sim baseline)
+./run_compile.sh --all               # everything (lint + compile + formal-regr + sim-regr)
 ./run_compile.sh --lint              # verilator lint only
 ./run_compile.sh --compile           # iverilog + yosys compile check
-./run_compile.sh --formal            # formal single config
-./run_compile.sh --formal-regr       # formal regression (all configs)
+./run_compile.sh --formal            # formal single config (4 tasks)
+./run_compile.sh --formal-regr       # formal regression (all configs, 32 tasks)
 ./run_compile.sh --sim [TEST]        # single sim test (default: baseline)
-./run_compile.sh --sim-regr          # full sim regression
+./run_compile.sh --sim-regr          # full sim regression (22 tests, ~4 hours)
 ./run_compile.sh --no-sim            # lint + compile + formal (skip sim)
 ./run_compile.sh --help              # list all options and available test names
 ```
