@@ -42,23 +42,50 @@
 `timescale 1ps / 1ps
 
 module ddr4_top #(
+    // Clock periods in ps
+    //   CONTROLLER_CLK_PERIOD = DDR4_CLK_PERIOD * 4 (1/4 rate controller)
+    //   DDR4_CLK_PERIOD: 1250=DDR4-1600, 1071=DDR4-1866, 937=DDR4-2133, 833=DDR4-2400
     parameter CONTROLLER_CLK_PERIOD = 3_333,
               DDR4_CLK_PERIOD = 833,
-              DEVICE_WIDTH = 8, //DDR4 device data width (4, 8, or 16)
+    // DDR4 device data width: 4, 8, or 16
+    //   4  = x4  (2 chips per byte lane, no DM, BG_BITS=2)
+    //   8  = x8  (1 chip per byte lane, DM enabled, BG_BITS=2)
+    //   16 = x16 (1 chip = 2 byte lanes, DM enabled, BG_BITS=1)
+              DEVICE_WIDTH = 8,
               ROW_BITS = 16,
               COL_BITS = 10,
+    // Number of 8-bit byte lanes (typically 2 for x8, 2 for x16, 2+ for x4)
               BYTE_LANES = 2,
+    // Device density in Gb: 2, 4, 8, or 16
               DENSITY = 8,
+    // Set to 1 when simulating with Micron DDR4 model (adjusts timing checks)
     parameter[0:0] MICRON_SIM = 0,
+    // Address mapping:
+    //   0 = sequential {row, bg, ba, col}
+    //   1 = BG-interleaved {row, ba, col_hi, bg, col_lo} (recommended)
     parameter[1:0] ADDR_MAPPING = 1,
+    // On-die termination (JESD79-4D MR1/MR2/MR5)
+    //   RTT_NOM  (MR1 A10:A8): 000=off, 001=RZQ/4, 010=RZQ/2, 011=RZQ/6,
+    //                           100=RZQ/1, 101=RZQ/5, 110=RZQ/3, 111=RZQ/7
+    //   RTT_WR   (MR2 A11:A9): 000=off, 001=RZQ/2, 010=RZQ/1, 011=Hi-Z,
+    //                           100=RZQ/3
+    //   RTT_PARK (MR5 A8:A6):  000=off, 001=RZQ/4, 010=RZQ/2, 011=RZQ/6,
+    //                           100=RZQ/1, 101=RZQ/5, 110=RZQ/3, 111=RZQ/7
     parameter[2:0] RTT_NOM = 3'b001,
                    RTT_WR = 3'b000,
                    RTT_PARK = 3'b000,
+    // Output driver impedance (MR1 A2:A1): 0=RZQ/7 (34ohm), 1=RZQ/5 (48ohm)
     parameter[0:0] DRIVE_IMP = 0,
+    // CAS Latency override (0=auto from DDR4_CLK_PERIOD)
+    //   Auto values: DDR4-1600=10, DDR4-1866=13, DDR4-2133=15, DDR4-2400=16
     parameter[5:0] CL = 0,
+    // CAS Write Latency override (0=auto from DDR4_CLK_PERIOD)
+    //   Auto values: DDR4-1600=9, DDR4-1866=10, DDR4-2133=11, DDR4-2400=12
     parameter[4:0] CWL_PARAM = 0,
     // BIST / debug prober configuration
+    //   BIST_MODE: 0=disabled, 1=burst sequential only, 2=full (burst+random+alternating)
     parameter[1:0] BIST_MODE = 0,
+    // Debug CSR register file: 0=disabled (saves area), 1=enabled
     parameter DEBUG_CSR_ENABLE = 1,
     // Derived from DEVICE_WIDTH -- do not override
     parameter BA_BITS = 2,

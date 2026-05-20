@@ -55,11 +55,19 @@
 `timescale 1ps / 1ps
 
 module ddr4_phy #(
-    parameter CONTROLLER_CLK_PERIOD = 3_333, //ps, controller clock
-              DDR4_CLK_PERIOD = 833,          //ps, DDR4 memory clock
-              DEVICE_WIDTH = 8, //DDR4 device data width (4, 8, or 16)
-              ROW_BITS = 16,    //row address width
-              BYTE_LANES = 2,   //number of byte lanes
+    // Clock periods in ps
+    //   CONTROLLER_CLK_PERIOD = DDR4_CLK_PERIOD * 4 (1/4 rate controller)
+    //   DDR4_CLK_PERIOD: 1250=DDR4-1600, 1071=DDR4-1866, 937=DDR4-2133, 833=DDR4-2400
+    parameter CONTROLLER_CLK_PERIOD = 3_333,
+              DDR4_CLK_PERIOD = 833,
+    // DDR4 device data width: 4, 8, or 16
+    //   4  = x4  (2 chips per byte lane, no DM, BG_BITS=2)
+    //   8  = x8  (1 chip per byte lane, DM enabled, BG_BITS=2)
+    //   16 = x16 (1 chip = 2 byte lanes, DM enabled, BG_BITS=1)
+              DEVICE_WIDTH = 8,
+              ROW_BITS = 16,
+    // Number of 8-bit byte lanes (typically 2 for x8, 2 for x16, 2+ for x4)
+              BYTE_LANES = 2,
     // Derived from DEVICE_WIDTH -- do not override
     parameter BA_BITS = 2,      //bank address (always 2 for DDR4)
               BG_BITS = (DEVICE_WIDTH == 16) ? 1 : 2, //JESD79-4D Table 2

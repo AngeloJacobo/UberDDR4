@@ -36,11 +36,15 @@ module ddr4_prober #(
     parameter WB_ADDR_BITS       = 27,
               WB_DATA_BITS       = 128,
               WB_SEL_BITS        = WB_DATA_BITS / 8,
+    // Number of 8-bit byte lanes (typically 2 for x8, 2 for x16, 2+ for x4)
               BYTE_LANES         = 2,
               NUM_BANKS          = 16,
               ROW_BITS           = 16,
+    // Set to 1 when simulating with Micron DDR4 model (adjusts timing checks)
     parameter[0:0] MICRON_SIM    = 0,
+    // BIST_MODE: 0=disabled, 1=burst sequential only, 2=full (burst+random+alternating)
     parameter[1:0] BIST_MODE     = 2,
+    // Debug CSR register file: 0=disabled (saves area), 1=enabled
     parameter      DEBUG_CSR_ENABLE = 1
 ) (
     input  wire                     i_clk,
