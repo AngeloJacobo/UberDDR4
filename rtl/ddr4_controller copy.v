@@ -418,10 +418,10 @@ module ddr4_controller #(
         find_delay(ps_to_nCK(tRAS_ps), ACTIVATE_SLOT, PRECHARGE_SLOT);
     // read-to-write turnaround -- JESD79-4D: CL + BL/2 + tRPST - CWL
     localparam READ_TO_WRITE_DELAY =
-        find_delay(CL_nCK + 4 + 2 - CWL_nCK, READ_SLOT, WRITE_SLOT);
+        find_delay(CL_nCK + 4 + 2 - CWL_nCK, READ_SLOT, WRITE_SLOT); //  reference where in jedec ddr4 this comes from
 
     // Bank-group-dependent delays (new for DDR4)
-    localparam CAS_TO_CAS_DELAY_SAME_BG =
+    localparam CAS_TO_CAS_DELAY_SAME_BG = // why does this CAS to CAS delay only consider 
         find_delay(ps_to_nCK(tCCD_L_ps), READ_SLOT, READ_SLOT);
     localparam CAS_TO_CAS_DELAY_DIFF_BG =
         find_delay(tCCD_S_nCK, READ_SLOT, READ_SLOT);

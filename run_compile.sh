@@ -406,19 +406,27 @@ run_sim() {
         local st0
         st0=$(date +%s)
 
-        local test_re='^\[([0-9]+)/([0-9]+)\] +([^ ]+) .*(PASS|FAIL) \(([0-9]+)s\)'
+        local strip_ansi='s/\x1b\[[0-9;]*m//g'
+        local name_re='^\[([0-9]+)/([0-9]+)\] +([^ ]+)'
+        local result_re='(PASS|FAIL) +\(([0-9]+)s\)'
+        local cur_name=""
 
         while IFS= read -r line; do
             echo "$line" >> "$log"
-            if [[ $line =~ $test_re ]]; then
-                local name="${BASH_REMATCH[3]}"
-                local result="${BASH_REMATCH[4]}"
-                local secs="${BASH_REMATCH[5]}"
+            local clean
+            clean=$(printf '%s' "$line" | sed "$strip_ansi")
+            if [[ $clean =~ $name_re ]]; then
+                cur_name="${BASH_REMATCH[3]}"
+            fi
+            if [[ -n "$cur_name" && $clean =~ $result_re ]]; then
+                local result="${BASH_REMATCH[1]}"
+                local secs="${BASH_REMATCH[2]}"
                 if [[ "$result" == "PASS" ]]; then
-                    pass "$name" "$(elapsed "$secs")"
+                    pass "$cur_name" "$(elapsed "$secs")"
                 else
-                    fail "$name" "$(elapsed "$secs")"
+                    fail "$cur_name" "$(elapsed "$secs")"
                 fi
+                cur_name=""
             fi
         done < <(cd "$SCRIPT_DIR/.." && setsid bash "$SCRIPT_DIR/testbench/regression_test.sh" 2>&1)
 

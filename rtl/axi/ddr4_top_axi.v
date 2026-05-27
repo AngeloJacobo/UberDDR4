@@ -57,7 +57,7 @@ module ddr4_top_axi #(
                    SERDES_RATIO  = 4,
                    WB_DATA_BITS  = DQ_BITS * BYTE_LANES * 2 * SERDES_RATIO,
                    WB_SEL_BITS   = WB_DATA_BITS / 8,
-                   COL_LOW       = $clog2(SERDES_RATIO * 2 * DQ_BITS * BYTE_LANES / 8),
+                   COL_LOW       = $clog2(SERDES_RATIO * 2),
                    WB_ADDR_BITS  = ROW_BITS + BG_BITS + BA_BITS + COL_BITS - COL_LOW,
                    EXT_ADDR_BITS = WB_ADDR_BITS + DEBUG_CSR_ENABLE,
                    // AXI_LSBS: number of byte-offset bits stripped by the

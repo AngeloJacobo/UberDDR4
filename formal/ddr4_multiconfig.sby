@@ -27,6 +27,8 @@ ddr4_1600_x8_map1_bounded
 ddr4_2400_x8_map1_bounded
 ddr4_2400_x16_map1_bounded
 ddr4_1600_x16_map0_bounded
+ddr4_2400_x8_row14_map1
+ddr4_2400_x8_row17_map1
 
 [options]
 mode prove
@@ -72,6 +74,8 @@ ddr4_1600_x8_map1_bounded:  read -formal -DDDR4_CLK_PERIOD=1250 -DDEVICE_WIDTH=8
 ddr4_2400_x8_map1_bounded:  read -formal -DDDR4_CLK_PERIOD=833  -DDEVICE_WIDTH=8  -DADDR_MAPPING=1 -DFORMAL_BOUNDED_STALL ddr4_controller.v
 ddr4_2400_x16_map1_bounded: read -formal -DDDR4_CLK_PERIOD=833  -DDEVICE_WIDTH=16 -DADDR_MAPPING=1 -DFORMAL_BOUNDED_STALL ddr4_controller.v
 ddr4_1600_x16_map0_bounded: read -formal -DDDR4_CLK_PERIOD=1250 -DDEVICE_WIDTH=16 -DADDR_MAPPING=0 -DFORMAL_BOUNDED_STALL ddr4_controller.v
+ddr4_2400_x8_row14_map1:    read -formal -DDDR4_CLK_PERIOD=833  -DDEVICE_WIDTH=8  -DADDR_MAPPING=1 -DROW_BITS=14 ddr4_controller.v
+ddr4_2400_x8_row17_map1:    read -formal -DDDR4_CLK_PERIOD=833  -DDEVICE_WIDTH=8  -DADDR_MAPPING=1 -DROW_BITS=17 ddr4_controller.v
 read -formal fwb_slave.v
 read -formal mini_fifo.v
 read -formal f_addr_decode.v

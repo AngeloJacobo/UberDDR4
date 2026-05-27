@@ -34,38 +34,42 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LOG_DIR="$REPO_ROOT/UberDDR4/testbench/regression_logs"
 
-# Each line: NAME  DDR4_CLK  DW  LANES  FLYBY  MAP  BIST  DENSITY  MICRON_DEF     MICRON_SPEED  SPECIAL
+# Each line: NAME  DDR4_CLK  DW  LANES  FLYBY  MAP  BIST  DENS  ROWS  MICRON_DEF     MICRON_SPEED  SPECIAL
 #   DW = DEVICE_WIDTH (4, 8, or 16)
 #   LANES = BYTE_LANES (number of 8-bit byte lanes)
+#   ROWS = ROW_BITS (14-17, default 16)
 # To add a new test configuration, just add a new line to this array.
 ALL_TESTS=(
     # Core x8 DDR4-2400 sweep
-    "baseline          834  8   2  0    1  1  8  DDR4_8G_X8   FIXED_2400  -"
-    "flyby_50          834  8   2  50   1  1  8  DDR4_8G_X8   FIXED_2400  -"
-    "flyby_100         834  8   2  100  1  1  8  DDR4_8G_X8   FIXED_2400  -"
-    "flyby_200         834  8   2  200  1  1  8  DDR4_8G_X8   FIXED_2400  -"
-    "flyby_300         834  8   2  300  1  1  8  DDR4_8G_X8   FIXED_2400  -"
-    "flyby_400         834  8   2  400  1  1  8  DDR4_8G_X8   FIXED_2400  -"
-    "map0              834  8   2  0    0  1  8  DDR4_8G_X8   FIXED_2400  -"
-    "map0_flyby_200    834  8   2  200  0  1  8  DDR4_8G_X8   FIXED_2400  -"
-    "bist_full         834  8   2  0    1  2  8  DDR4_8G_X8   FIXED_2400  -"
+    "baseline          834  8   2  0    1  1  8  16  DDR4_8G_X8   FIXED_2400  -"
+    "flyby_50          834  8   2  50   1  1  8  16  DDR4_8G_X8   FIXED_2400  -"
+    "flyby_100         834  8   2  100  1  1  8  16  DDR4_8G_X8   FIXED_2400  -"
+    "flyby_200         834  8   2  200  1  1  8  16  DDR4_8G_X8   FIXED_2400  -"
+    "flyby_300         834  8   2  300  1  1  8  16  DDR4_8G_X8   FIXED_2400  -"
+    "flyby_400         834  8   2  400  1  1  8  16  DDR4_8G_X8   FIXED_2400  -"
+    "map0              834  8   2  0    0  1  8  16  DDR4_8G_X8   FIXED_2400  -"
+    "map0_flyby_200    834  8   2  200  0  1  8  16  DDR4_8G_X8   FIXED_2400  -"
+    "bist_full         834  8   2  0    1  2  8  16  DDR4_8G_X8   FIXED_2400  -"
     # x16: 1 chip = 2 byte lanes (BG_BITS=1, DM enabled)
-    "x16               834  16  2  0    1  1  8  DDR4_8G_X16  FIXED_2400  -"
-    "x16_map0          834  16  2  0    0  1  8  DDR4_8G_X16  FIXED_2400  -"
-    "x16_bist_full     834  16  2  0    1  2  8  DDR4_8G_X16  FIXED_2400  -"
-    "x16_flyby_4lane   834  16  4  200  1  1  8  DDR4_8G_X16  FIXED_2400  -"
+    "x16               834  16  2  0    1  1  8  16  DDR4_8G_X16  FIXED_2400  -"
+    "x16_map0          834  16  2  0    0  1  8  16  DDR4_8G_X16  FIXED_2400  -"
+    "x16_bist_full     834  16  2  0    1  2  8  16  DDR4_8G_X16  FIXED_2400  -"
+    "x16_flyby_4lane   834  16  4  200  1  1  8  16  DDR4_8G_X16  FIXED_2400  -"
     # x4: 2 chips paired per byte lane (BG_BITS=2, no DM)
-    "x4                834  4   2  0    1  1  8  DDR4_8G_X4   FIXED_2400  -"
-    "x4_map0           834  4   2  0    0  1  8  DDR4_8G_X4   FIXED_2400  -"
+    "x4                834  4   2  0    1  1  8  16  DDR4_8G_X4   FIXED_2400  -"
+    "x4_map0           834  4   2  0    0  1  8  16  DDR4_8G_X4   FIXED_2400  -"
     # Speed grade sweep
-    "ddr4_1600         1250 8   2  0    1  1  8  DDR4_8G_X8   FIXED_1600  -"
-    "ddr4_1600_flyby   1250 8   2  200  1  1  8  DDR4_8G_X8   FIXED_1600  -"
-    "ddr4_2133         937  8   2  0    1  1  8  DDR4_8G_X8   FIXED_2133  -"
-    "ddr4_2133_flyby   937  8   2  200  1  1  8  DDR4_8G_X8   FIXED_2133  -"
+    "ddr4_1600         1250 8   2  0    1  1  8  16  DDR4_8G_X8   FIXED_1600  -"
+    "ddr4_1600_flyby   1250 8   2  200  1  1  8  16  DDR4_8G_X8   FIXED_1600  -"
+    "ddr4_2133         937  8   2  0    1  1  8  16  DDR4_8G_X8   FIXED_2133  -"
+    "ddr4_2133_flyby   937  8   2  200  1  1  8  16  DDR4_8G_X8   FIXED_2133  -"
     # Density sweep
-    "density_4g        834  8   2  0    1  1  4  DDR4_4G_X8   FIXED_2400  -"
+    "density_4g        834  8   2  0    1  1  4  15  DDR4_4G_X8   FIXED_2400  -"
+    # ROW_BITS sweep (min/max supported width)
+    "row_bits_14       834  8   2  0    1  1  8  14  DDR4_8G_X8   FIXED_2400  -"
+    "row_bits_17       834  8   2  0    1  1  8  17  DDR4_8G_X8   FIXED_2400  -"
     # Error path
-    "train_fail        834  8   2  0    1  1  8  DDR4_8G_X8   FIXED_2400  TRAIN_FAIL"
+    "train_fail        834  8   2  0    1  1  8  16  DDR4_8G_X8   FIXED_2400  TRAIN_FAIL"
 )
 
 if [[ -z "${XILINX_VIVADO:-}" ]]; then
@@ -105,7 +109,7 @@ declare -a RESULTS
 declare -a TIMES
 
 for entry in "${TESTS[@]}"; do
-    read -r NAME DDR4_CLK DW LANES FLYBY MAP BIST DENS MICRON_DEF MICRON_SPD SPECIAL <<< "$entry"
+    read -r NAME DDR4_CLK DW LANES FLYBY MAP BIST DENS ROWS MICRON_DEF MICRON_SPD SPECIAL <<< "$entry"
 
     DEFINES="-d SIM_DDR4_CLK_PERIOD=$DDR4_CLK"
     [[ "$DW" != "8" ]]      && DEFINES="$DEFINES -d SIM_DEVICE_WIDTH=$DW"
@@ -114,6 +118,7 @@ for entry in "${TESTS[@]}"; do
     [[ "$MAP" != "1" ]]     && DEFINES="$DEFINES -d SIM_ADDR_MAPPING=$MAP"
     [[ "$BIST" != "1" ]]    && DEFINES="$DEFINES -d SIM_BIST_MODE=$BIST"
     [[ "$DENS" == "4" ]]    && DEFINES="$DEFINES -d SIM_DENSITY_4G"
+    [[ "$ROWS" != "16" ]]   && DEFINES="$DEFINES -d SIM_ROW_BITS=$ROWS"
     [[ "$SPECIAL" == "TRAIN_FAIL" ]] && DEFINES="$DEFINES -d SIM_FORCE_TRAIN_FAIL"
 
     export EXTRA_DEFINES="$DEFINES"

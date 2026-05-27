@@ -81,26 +81,26 @@ module ddr4_phy #(
     input wire                              i_ddr4_clk,
     input wire                              i_ref_clk,
     input wire                              i_rst_n,
-    // DFI 3.1 Control (4 phases, packed flat)
-    input wire [4*17-1:0]                   i_dfi_address,
-    input wire [4*BA_BITS-1:0]              i_dfi_bank,
-    input wire [4*BG_BITS-1:0]              i_dfi_bg,
-    input wire [3:0]                        i_dfi_cs_n,
-    input wire [3:0]                        i_dfi_act_n,
-    input wire [3:0]                        i_dfi_ras_n,
-    input wire [3:0]                        i_dfi_cas_n,
-    input wire [3:0]                        i_dfi_we_n,
-    input wire [3:0]                        i_dfi_cke,
-    input wire [3:0]                        i_dfi_odt,
-    input wire [3:0]                        i_dfi_reset_n,
+    // DFI 3.1 Control (SERDES_RATIO phases, packed flat)
+    input wire [SERDES_RATIO*17-1:0]        i_dfi_address,
+    input wire [SERDES_RATIO*BA_BITS-1:0]   i_dfi_bank,
+    input wire [SERDES_RATIO*BG_BITS-1:0]   i_dfi_bg,
+    input wire [SERDES_RATIO-1:0]           i_dfi_cs_n,
+    input wire [SERDES_RATIO-1:0]           i_dfi_act_n,
+    input wire [SERDES_RATIO-1:0]           i_dfi_ras_n,
+    input wire [SERDES_RATIO-1:0]           i_dfi_cas_n,
+    input wire [SERDES_RATIO-1:0]           i_dfi_we_n,
+    input wire [SERDES_RATIO-1:0]           i_dfi_cke,
+    input wire [SERDES_RATIO-1:0]           i_dfi_odt,
+    input wire [SERDES_RATIO-1:0]           i_dfi_reset_n,
     // DFI Write Data
-    input wire [4*DFI_DATA_WIDTH-1:0]       i_dfi_wrdata,
-    input wire [3:0]                        i_dfi_wrdata_en,
-    input wire [4*(2*BYTE_LANES)-1:0]       i_dfi_wrdata_mask,
+    input wire [SERDES_RATIO*DFI_DATA_WIDTH-1:0] i_dfi_wrdata,
+    input wire [SERDES_RATIO-1:0]           i_dfi_wrdata_en,
+    input wire [SERDES_RATIO*(2*BYTE_LANES)-1:0] i_dfi_wrdata_mask,
     // DFI Read Data
-    output reg [4*DFI_DATA_WIDTH-1:0]       o_dfi_rddata,
-    output reg [3:0]                        o_dfi_rddata_valid,
-    input wire [3:0]                        i_dfi_rddata_en,
+    output reg [SERDES_RATIO*DFI_DATA_WIDTH-1:0] o_dfi_rddata,
+    output reg [SERDES_RATIO-1:0]           o_dfi_rddata_valid,
+    input wire [SERDES_RATIO-1:0]           i_dfi_rddata_en,
     // DFI Status
     input wire                              i_dfi_init_start,
     output wire                             o_dfi_init_complete,
@@ -109,7 +109,7 @@ module ddr4_phy #(
     input wire                              i_dfi_rdlvl_gate_en,
     input wire                              i_dfi_wrlvl_en,
     input wire                              i_dfi_wrlvl_strobe,
-    input wire [3:0]                        i_dfi_lvl_pattern,
+    input wire [SERDES_RATIO-1:0]           i_dfi_lvl_pattern,
     input wire                              i_dfi_lvl_periodic,
     // DFI Training (PHY -> MC)
     output reg [BYTE_LANES-1:0]             o_dfi_rdlvl_resp,
@@ -310,18 +310,21 @@ module ddr4_phy #(
     // Pack DFI command inputs into per-slot command words for easy bit extraction
     // DDR4 pin mux (JESD79-4D Table 35): physical pins A16/A15/A14 carry
     // {RAS_n, CAS_n, WE_n} when ACT_n=1, or row address bits when ACT_n=0.
-    // The DFI interface keeps these as separate signals; the PHY muxes them
-    // onto the address bus here.
-    wire [CMD_LEN-1:0] dfi_cmd [3:0];
+    // Per DFI 3.1 §3.1 Table 4 footnote (d), dfi_ras_n/cas_n/we_n always
+    // carry the correct value for these pins regardless of ACT_n:
+    //   ACT_n=H → command encoding (RAS_n/CAS_n/WE_n)
+    //   ACT_n=L → row address (A16/A15/A14)
+    // dfi_address[16:14] is unused for DDR4 per DFI spec.
+    wire [CMD_LEN-1:0] dfi_cmd [SERDES_RATIO-1:0];
 
     generate
         genvar slot;
-        for (slot = 0; slot < 4; slot = slot + 1) begin : pack_cmd
+        for (slot = 0; slot < SERDES_RATIO; slot = slot + 1) begin : pack_cmd
             wire [16:0] muxed_addr;
             assign muxed_addr = {
-                i_dfi_act_n[slot] ? i_dfi_ras_n[slot] : i_dfi_address[17*slot + 16],
-                i_dfi_act_n[slot] ? i_dfi_cas_n[slot] : i_dfi_address[17*slot + 15],
-                i_dfi_act_n[slot] ? i_dfi_we_n[slot]  : i_dfi_address[17*slot + 14],
+                i_dfi_ras_n[slot],
+                i_dfi_cas_n[slot],
+                i_dfi_we_n[slot],
                 i_dfi_address[17*slot +: 14]
             };
 
@@ -864,8 +867,8 @@ module ddr4_phy #(
 
     always @(posedge i_controller_clk) begin
         if (!ctrl_rst_n) begin
-            o_dfi_rddata       <= {(4*DFI_DATA_WIDTH){1'b0}};
-            o_dfi_rddata_valid <= 4'b0;
+            o_dfi_rddata       <= {(SERDES_RATIO*DFI_DATA_WIDTH){1'b0}};
+            o_dfi_rddata_valid <= {SERDES_RATIO{1'b0}};
             o_dfi_rdlvl_resp   <= {BYTE_LANES{1'b0}};
             o_dfi_wrlvl_resp   <= {BYTE_LANES{1'b0}};
             for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
@@ -918,7 +921,7 @@ module ddr4_phy #(
                 for (dfi_pack_lane = 0; dfi_pack_lane < BYTE_LANES; dfi_pack_lane = dfi_pack_lane + 1) begin
                     for (dfi_pack_bit = 0; dfi_pack_bit < DQ_BITS; dfi_pack_bit = dfi_pack_bit + 1) begin
                         dfi_pack_idx = dfi_pack_lane * DQ_BITS + dfi_pack_bit;
-                        for (dfi_pack_phase = 0; dfi_pack_phase < 4; dfi_pack_phase = dfi_pack_phase + 1) begin
+                        for (dfi_pack_phase = 0; dfi_pack_phase < SERDES_RATIO; dfi_pack_phase = dfi_pack_phase + 1) begin
                             o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
                                 <= aligned_dq[dfi_pack_idx][2*dfi_pack_phase];
                             o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + BEAT_WIDTH + dfi_pack_lane*DQ_BITS + dfi_pack_bit]

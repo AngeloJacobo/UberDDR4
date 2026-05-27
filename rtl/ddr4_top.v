@@ -81,7 +81,7 @@ module ddr4_top #(
     parameter[5:0] CL = 0,
     // CAS Write Latency override (0=auto from DDR4_CLK_PERIOD)
     //   Auto values: DDR4-1600=9, DDR4-1866=10, DDR4-2133=11, DDR4-2400=12
-    parameter[4:0] CWL_PARAM = 0,
+    parameter[4:0] CWL = 0,
     // BIST / debug prober configuration
     //   BIST_MODE: 0=disabled, 1=burst sequential only, 2=full (burst+random+alternating)
     parameter[1:0] BIST_MODE = 0,
@@ -98,7 +98,7 @@ module ddr4_top #(
               DFI_DATA_WIDTH = 2 * DQ_BITS * BYTE_LANES,
               WB_DATA_BITS = DQ_BITS * BYTE_LANES * 2 * SERDES_RATIO,
               WB_SEL_BITS = WB_DATA_BITS / 8,
-              COL_LOW = $clog2(SERDES_RATIO * 2 * DQ_BITS * BYTE_LANES / 8),
+              COL_LOW = $clog2(SERDES_RATIO * 2),
               WB_ADDR_BITS = ROW_BITS + BG_BITS + BA_BITS + COL_BITS - COL_LOW,
               EXT_ADDR_BITS = WB_ADDR_BITS + DEBUG_CSR_ENABLE
 ) (
@@ -129,23 +129,23 @@ module ddr4_top #(
     // DFI 3.1 Internal Bus
     // -----------------------------------------------------------------
     // These wires carry the full DFI 3.1 interface between the
-    // controller and PHY.  4-phase command/data (SERDES_RATIO=4).
-    wire [4*17-1:0]             dfi_address;
-    wire [4*BA_BITS-1:0]        dfi_bank;
-    wire [4*BG_BITS-1:0]        dfi_bg;
-    wire [3:0]                  dfi_cs_n, dfi_act_n, dfi_ras_n, dfi_cas_n, dfi_we_n;
-    wire [3:0]                  dfi_cke, dfi_odt, dfi_reset_n;
-    wire [4*DFI_DATA_WIDTH-1:0] dfi_wrdata;
-    wire [3:0]                  dfi_wrdata_en;
-    wire [4*(2*BYTE_LANES)-1:0] dfi_wrdata_mask;
-    wire [4*DFI_DATA_WIDTH-1:0] dfi_rddata;
-    wire [3:0]                  dfi_rddata_valid;
-    wire [3:0]                  dfi_rddata_en;
-    wire                        dfi_init_start, dfi_init_complete;
-    wire                        dfi_rdlvl_en, dfi_rdlvl_gate_en;
-    wire                        dfi_wrlvl_en, dfi_wrlvl_strobe;
-    wire [3:0]                  dfi_lvl_pattern;
-    wire                        dfi_lvl_periodic;
+    // controller and PHY.  SERDES_RATIO-phase command/data.
+    wire [SERDES_RATIO*17-1:0]             dfi_address;
+    wire [SERDES_RATIO*BA_BITS-1:0]        dfi_bank;
+    wire [SERDES_RATIO*BG_BITS-1:0]        dfi_bg;
+    wire [SERDES_RATIO-1:0]                dfi_cs_n, dfi_act_n, dfi_ras_n, dfi_cas_n, dfi_we_n;
+    wire [SERDES_RATIO-1:0]                dfi_cke, dfi_odt, dfi_reset_n;
+    wire [SERDES_RATIO*DFI_DATA_WIDTH-1:0] dfi_wrdata;
+    wire [SERDES_RATIO-1:0]                dfi_wrdata_en;
+    wire [SERDES_RATIO*(2*BYTE_LANES)-1:0] dfi_wrdata_mask;
+    wire [SERDES_RATIO*DFI_DATA_WIDTH-1:0] dfi_rddata;
+    wire [SERDES_RATIO-1:0]                dfi_rddata_valid;
+    wire [SERDES_RATIO-1:0]                dfi_rddata_en;
+    wire                                   dfi_init_start, dfi_init_complete;
+    wire                                   dfi_rdlvl_en, dfi_rdlvl_gate_en;
+    wire                                   dfi_wrlvl_en, dfi_wrlvl_strobe;
+    wire [SERDES_RATIO-1:0]                dfi_lvl_pattern;
+    wire                                   dfi_lvl_periodic;
     wire [BYTE_LANES-1:0]       dfi_rdlvl_resp, dfi_wrlvl_resp;
     wire                        dfi_rdlvl_req, dfi_rdlvl_gate_req, dfi_wrlvl_req;
 
@@ -314,7 +314,7 @@ module ddr4_top #(
         .RTT_PARK(RTT_PARK),
         .DRIVE_IMP(DRIVE_IMP),
         .CL(CL),
-        .CWL_PARAM(CWL_PARAM)
+        .CWL(CWL)
     ) u_controller (
         .i_controller_clk(i_controller_clk),
         .i_rst_n(i_rst_n),

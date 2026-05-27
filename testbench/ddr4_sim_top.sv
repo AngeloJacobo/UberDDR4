@@ -81,7 +81,11 @@ module ddr4_sim_top;
 
     localparam DQ_BITS     = 8;
     localparam BG_BITS     = (DEVICE_WIDTH == 16) ? 1 : 2;
+`ifdef SIM_ROW_BITS
+    localparam ROW_BITS    = `SIM_ROW_BITS;
+`else
     localparam ROW_BITS    = 16;
+`endif
     localparam COL_BITS    = 10;
     localparam BA_BITS     = 2;
 
@@ -93,7 +97,7 @@ module ddr4_sim_top;
     localparam SERDES_RATIO   = 4;
     localparam WB_DATA_BITS   = DQ_BITS * BYTE_LANES * 2 * SERDES_RATIO;
     localparam WB_SEL_BITS    = WB_DATA_BITS / 8;
-    localparam COL_LOW        = $clog2(SERDES_RATIO * 2 * DQ_BITS * BYTE_LANES / 8);
+    localparam COL_LOW        = $clog2(SERDES_RATIO * 2);
     localparam WB_ADDR_BITS   = ROW_BITS + BG_BITS + BA_BITS + COL_BITS - COL_LOW;
     localparam EXT_ADDR_BITS  = WB_ADDR_BITS + 1;
     localparam NUM_DEVICES    = (DEVICE_WIDTH == 16) ? (BYTE_LANES / 2) :

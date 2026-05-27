@@ -24,7 +24,7 @@ module f_addr_decode #(
     parameter BG_BITS   = 2,
     parameter BA_BITS   = 2,
     parameter COL_BITS  = 10,
-    parameter COL_LOW   = 4
+    parameter COL_LOW   = 3
 )(
     input  wire [ROW_BITS+BG_BITS+BA_BITS+COL_BITS-COL_LOW-1:0] wb_addr,
     output wire [BG_BITS+BA_BITS-1:0] bank,
