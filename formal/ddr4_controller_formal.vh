@@ -85,10 +85,10 @@ end
 // -- Prop 19 bounded-stall localparams (must precede fwb_slave) --
 `ifdef FORMAL_BOUNDED_STALL
 localparam F_MAX_STALL =
-    max_fn(WRITE_TO_PRECHARGE_DELAY, READ_TO_PRECHARGE_DELAY) + 1
+    MAX_PRECHARGE_DELAY + 1
     + max_fn(max_fn(PRECHARGE_TO_ACTIVATE_DELAY, MAX_RRD_DELAY),
              TFAW_CYCLES) + 1
-    + max_fn(ACTIVATE_TO_READWRITE_DELAY,
+    + max_fn(max_fn(ACTIVATE_TO_WRITE_DELAY, ACTIVATE_TO_READ_DELAY),
              max_fn(CAS_TO_CAS_DELAY_SAME_BG, WRITE_TO_READ_DELAY_SAME_BG)) + 1;
 localparam F_MAX_ACK_DELAY = 0;
 localparam F_DLYBITS = $clog2(F_MAX_STALL + 1);
@@ -591,18 +591,18 @@ always @(posedge i_controller_clk) begin
             assert(delay_before_precharge_counter_q[f_bank_const]
                    >= ACTIVATE_TO_PRECHARGE_DELAY);
             assert(delay_before_write_counter_q[f_bank_const]
-                   >= ACTIVATE_TO_READWRITE_DELAY);
+                   >= ACTIVATE_TO_WRITE_DELAY);
             assert(delay_before_read_counter_q[f_bank_const]
-                   >= ACTIVATE_TO_READWRITE_DELAY);
+                   >= ACTIVATE_TO_READ_DELAY);
             assert(bank_status_q[f_bank_const]);
         end
         if ($past(sched_anticipate) && $past(stage1_next_bank) == f_bank_const) begin
             assert(delay_before_precharge_counter_q[f_bank_const]
                    >= ACTIVATE_TO_PRECHARGE_DELAY);
             assert(delay_before_write_counter_q[f_bank_const]
-                   >= ACTIVATE_TO_READWRITE_DELAY);
+                   >= ACTIVATE_TO_WRITE_DELAY);
             assert(delay_before_read_counter_q[f_bank_const]
-                   >= ACTIVATE_TO_READWRITE_DELAY);
+                   >= ACTIVATE_TO_READ_DELAY);
             assert(bank_status_q[f_bank_const]);
         end
     end

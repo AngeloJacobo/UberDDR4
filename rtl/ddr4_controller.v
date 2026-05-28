@@ -101,57 +101,66 @@ module ddr4_controller #(
               T_WRLVL_MAX     = 4096, // timeout (DFI clks) for wrlvl_resp
               CALIB_RETRY_MAX = 3     // retries per training phase before failure
 ) (
-    input wire i_controller_clk,
-    input wire i_rst_n,
+    input wire i_controller_clk, // Controller clock with CONTROLLER_CLK_PERIOD
+    input wire i_rst_n, // Active-low reset
+
     // Wishbone B4 Pipelined Interface
-    input wire                       i_wb_cyc,
-    input wire                       i_wb_stb,
-    input wire                       i_wb_we,
-    input wire[WB_ADDR_BITS-1:0]     i_wb_addr,
-    input wire[WB_DATA_BITS-1:0]     i_wb_data,
-    input wire[WB_SEL_BITS-1:0]      i_wb_sel,
-    output reg                       o_wb_stall,
-    output wire                      o_wb_ack,
-    output reg[WB_DATA_BITS-1:0]     o_wb_data,
-    // DFI 3.1 Control (SERDES_RATIO phases, packed flat)
-    output reg[SERDES_RATIO*17-1:0]             o_dfi_address,
-    output reg[SERDES_RATIO*BA_BITS-1:0]        o_dfi_bank,
-    output reg[SERDES_RATIO*BG_BITS-1:0]        o_dfi_bg,
-    output reg[SERDES_RATIO-1:0]                o_dfi_cs_n,
-    output reg[SERDES_RATIO-1:0]                o_dfi_act_n,
-    output reg[SERDES_RATIO-1:0]                o_dfi_ras_n,
-    output reg[SERDES_RATIO-1:0]                o_dfi_cas_n,
-    output reg[SERDES_RATIO-1:0]                o_dfi_we_n,
-    output reg[SERDES_RATIO-1:0]                o_dfi_cke,
-    output reg[SERDES_RATIO-1:0]                o_dfi_odt,
-    output reg[SERDES_RATIO-1:0]                o_dfi_reset_n,
-    // DFI Write Data
-    output reg[SERDES_RATIO*DFI_DATA_WIDTH-1:0] o_dfi_wrdata,
-    output reg[SERDES_RATIO-1:0]                o_dfi_wrdata_en,
-    output reg[SERDES_RATIO*(DFI_DATA_WIDTH/8)-1:0] o_dfi_wrdata_mask,
-    // DFI Read Data
-    input wire[SERDES_RATIO*DFI_DATA_WIDTH-1:0] i_dfi_rddata,
-    input wire[SERDES_RATIO-1:0]                i_dfi_rddata_valid,
-    output reg[SERDES_RATIO-1:0]                o_dfi_rddata_en,
-    // DFI Status
-    output wire                      o_dfi_init_start,
-    input wire                       i_dfi_init_complete,
-    // DFI Training (MC -> PHY)
-    output reg                       o_dfi_rdlvl_en,
-    output reg                       o_dfi_rdlvl_gate_en,
-    output reg                       o_dfi_wrlvl_en,
-    output reg                       o_dfi_wrlvl_strobe,
-    output reg[SERDES_RATIO-1:0]     o_dfi_lvl_pattern,
-    output reg                       o_dfi_lvl_periodic,
-    // DFI Training (PHY -> MC)
-    input wire[BYTE_LANES-1:0]       i_dfi_rdlvl_resp,
-    input wire[BYTE_LANES-1:0]       i_dfi_wrlvl_resp,
-    input wire                       i_dfi_rdlvl_req,
-    input wire                       i_dfi_rdlvl_gate_req,
-    input wire                       i_dfi_wrlvl_req,
+    input wire                       i_wb_cyc,   // Bus cycle active (held for entire burst)
+    input wire                       i_wb_stb,   // Transfer strobe (qualifies we/addr/data/sel)
+    input wire                       i_wb_we,    // Write enable (1=write, 0=read)
+    input wire[WB_ADDR_BITS-1:0]     i_wb_addr,  // Byte address (burst-aligned)
+    input wire[WB_DATA_BITS-1:0]     i_wb_data,  // Write data from master
+    input wire[WB_SEL_BITS-1:0]      i_wb_sel,   // Byte-lane select (1 bit per byte of write data)
+    output reg                       o_wb_stall, // Pipeline stall (high when slave cannot accept new request)
+    output wire                      o_wb_ack,   // Transfer acknowledge to master
+    output reg[WB_DATA_BITS-1:0]     o_wb_data,  // Read data to master
+
+    // DFI 3.1 Control Interface 
+    output reg[SERDES_RATIO*17-1:0]             o_dfi_address,    // DRAM address bus (per-phase)
+    output reg[SERDES_RATIO*BA_BITS-1:0]        o_dfi_bank,       // DRAM bank address (per-phase)
+    output reg[SERDES_RATIO*BG_BITS-1:0]        o_dfi_bg,         // DRAM bank group (per-phase, DDR4)
+    output reg[SERDES_RATIO-1:0]                o_dfi_cs_n,       // Chip select (per-phase)
+    output reg[SERDES_RATIO-1:0]                o_dfi_act_n,      // Activate (per-phase, DDR4)
+    output reg[SERDES_RATIO-1:0]                o_dfi_ras_n,      // Row address strobe / A16 (per-phase)
+    output reg[SERDES_RATIO-1:0]                o_dfi_cas_n,      // Column address strobe / A15 (per-phase)
+    output reg[SERDES_RATIO-1:0]                o_dfi_we_n,       // Write enable / A14 (per-phase)
+    output reg[SERDES_RATIO-1:0]                o_dfi_cke,        // Clock enable (per-phase)
+    output reg[SERDES_RATIO-1:0]                o_dfi_odt,        // On-die termination (per-phase)
+    output reg[SERDES_RATIO-1:0]                o_dfi_reset_n,    // DRAM reset (per-phase)
+
+    // DFI 3.1 Write Data Interface
+    output reg[SERDES_RATIO*DFI_DATA_WIDTH-1:0] o_dfi_wrdata,     // Write data to PHY
+    output reg[SERDES_RATIO-1:0]                o_dfi_wrdata_en,  // Write data enable (triggers PHY write path)
+    output reg[SERDES_RATIO*(DFI_DATA_WIDTH/8)-1:0] o_dfi_wrdata_mask, // Write data byte mask
+
+    // DFI 3.1 Read Data Interface 
+    input wire[SERDES_RATIO*DFI_DATA_WIDTH-1:0] i_dfi_rddata,       // Read data from PHY
+    input wire[SERDES_RATIO-1:0]                i_dfi_rddata_valid, // Read data valid (PHY asserts with data)
+    output reg[SERDES_RATIO-1:0]                o_dfi_rddata_en,    // Read data enable (MC tells PHY read is expected)
+
+    // DFI 3.1 Status Interface 
+    output wire                      o_dfi_init_start,    // MC requests PHY initialization
+    input wire                       i_dfi_init_complete, // PHY signals initialization complete
+
+    // DFI 3.1 Training Interface: MC -> PHY
+    output reg                       o_dfi_rdlvl_en,      // Read data eye training enable
+    output reg                       o_dfi_rdlvl_gate_en, // Read DQS gate training enable
+    output reg                       o_dfi_wrlvl_en,      // Write leveling enable
+    output reg                       o_dfi_wrlvl_strobe,  // DQS strobe for write leveling
+    output reg[3:0]                  o_dfi_lvl_pattern,   // Training pattern selector (DDR4 MPR encoding)
+    output reg                       o_dfi_lvl_periodic,  // Periodic vs. initial training flag
+
+    // DFI 3.1 Training Interface: PHY -> MC
+    input wire[BYTE_LANES-1:0]       i_dfi_rdlvl_resp,     // Read training done (per byte lane)
+    input wire[BYTE_LANES-1:0]       i_dfi_wrlvl_resp,     // Write leveling done (per byte lane)
+    input wire                       i_dfi_rdlvl_req,      // PHY requests read data eye training
+    input wire                       i_dfi_rdlvl_gate_req, // PHY requests gate training
+    input wire                       i_dfi_wrlvl_req,      // PHY requests write leveling
+
     // Status
-    output reg                       o_calib_complete,
-    output reg                       o_calib_error,
+    output reg                       o_calib_complete, // All training phases finished successfully
+    output reg                       o_calib_error,    // Training failed after retries
+
     // Debug status (lightweight assigns for CSR readback)
     output wire [3:0]                o_calib_state,
     output wire                      o_stage1_pending,
@@ -387,10 +396,10 @@ module ddr4_controller #(
     // When RD and WR land on the same slot (e.g. DDR4-1866),
     // they share it — the controller never issues both at once.
     // =========================================
-    localparam integer READ_SLOT      = get_slot(CMD_RD);
-    localparam integer WRITE_SLOT     = get_slot(CMD_WR);
-    localparam integer ACTIVATE_SLOT  = get_slot(CMD_ACT);
-    localparam integer PRECHARGE_SLOT = get_slot(CMD_PRE);
+    localparam [1:0] READ_SLOT      = get_slot(CMD_RD);
+    localparam [1:0] WRITE_SLOT     = get_slot(CMD_WR);
+    localparam [1:0] ACTIVATE_SLOT  = get_slot(CMD_ACT);
+    localparam [1:0] PRECHARGE_SLOT = get_slot(CMD_PRE);
 
     // =================================================================
     // Computed Delay Counters (controller clock cycles)
@@ -406,43 +415,43 @@ module ddr4_controller #(
     // =================================================================
 
     // Per-bank delays
-    localparam ACTIVATE_TO_READWRITE_DELAY =
-        find_delay(ps_to_nCK(tRCD_ps), ACTIVATE_SLOT, (CL_nCK > CWL_nCK) ? READ_SLOT : WRITE_SLOT); // Q: why combine, uberddr3 has separate ACTIVATE_TO_*, is this really correct? Evaluate thoroughly on all scenarios.  Also Look on jedec ddr4 spec. 
+    localparam ACTIVATE_TO_WRITE_DELAY =
+        find_delay(ps_to_nCK(tRCD_ps), ACTIVATE_SLOT, WRITE_SLOT);
+    localparam ACTIVATE_TO_READ_DELAY =
+        find_delay(ps_to_nCK(tRCD_ps), ACTIVATE_SLOT, READ_SLOT); // tRCD (see JESD79-4D Figure 68)
     localparam READ_TO_PRECHARGE_DELAY =
-        find_delay(max_fn(4, ps_to_nCK(tRTP_ps)), READ_SLOT, PRECHARGE_SLOT); // why needs to find max first? why not just base on tRTP? uberddr3 seems to not use max? Evaluate thoroughly on all scenarios. Also Look on jedec ddr4 spec. 
+        find_delay(ps_to_nCK(tRTP_ps), READ_SLOT, PRECHARGE_SLOT); // tRTP (see JESD79-4D Figure 112)
     localparam WRITE_TO_PRECHARGE_DELAY =
-        find_delay(CWL_nCK + 4 + ps_to_nCK(tWR_ps), WRITE_SLOT, PRECHARGE_SLOT); // why is this computed like this? Look on jedec ddr4 spec. 
+        find_delay(CWL_nCK + 4 + ps_to_nCK(tWR_ps), WRITE_SLOT, PRECHARGE_SLOT); // WL + (BL/2) + tWR (see JESD79-4D Figure 145)
     localparam PRECHARGE_TO_ACTIVATE_DELAY =
-        find_delay(ps_to_nCK(tRP_ps), PRECHARGE_SLOT, ACTIVATE_SLOT);
+        find_delay(ps_to_nCK(tRP_ps), PRECHARGE_SLOT, ACTIVATE_SLOT); // tRP (see JESD79-4D Figure 67)
     localparam ACTIVATE_TO_PRECHARGE_DELAY =
-        find_delay(ps_to_nCK(tRAS_ps), ACTIVATE_SLOT, PRECHARGE_SLOT);
-    // read-to-write turnaround -- JESD79-4D: CL + BL/2 + tRPST - CWL
+        find_delay(ps_to_nCK(tRAS_ps), ACTIVATE_SLOT, PRECHARGE_SLOT); // tRAS (see JESD79-4D Figure 67)
     localparam READ_TO_WRITE_DELAY =
-        find_delay(CL_nCK + 4 + 2 - CWL_nCK, READ_SLOT, WRITE_SLOT);
+        find_delay(CL_nCK + 4 + 2 - CWL_nCK, READ_SLOT, WRITE_SLOT); // CL + (BL/2) + (tRPST+tWPRE) - CWL (see JESD79-4D Figure 98)
 
     // Bank-group-dependent delays (new for DDR4)
     localparam CAS_TO_CAS_DELAY_SAME_BG =
-        find_delay(ps_to_nCK(tCCD_L_ps), READ_SLOT, READ_SLOT);
+        find_delay(ps_to_nCK(tCCD_L_ps), READ_SLOT, READ_SLOT); // tCCD_L (see JESD79-4D Figure 69)
     localparam CAS_TO_CAS_DELAY_DIFF_BG =
-        find_delay(tCCD_S_nCK, READ_SLOT, READ_SLOT);
+        find_delay(tCCD_S_nCK, READ_SLOT, READ_SLOT); // tCCD_S (see JESD79-4D Figure 69)
     localparam WRITE_TO_READ_DELAY_SAME_BG =
-        find_delay(CWL_nCK + 4 + ps_to_nCK(tWTR_L_ps), WRITE_SLOT, READ_SLOT);
+        find_delay(CWL_nCK + 4 + ps_to_nCK(tWTR_L_ps), WRITE_SLOT, READ_SLOT); // WL + (BL/2) + tWTR_L (see JESD79-4D Figure 74)
     localparam WRITE_TO_READ_DELAY_DIFF_BG =
-        find_delay(CWL_nCK + 4 + ps_to_nCK(tWTR_S_ps), WRITE_SLOT, READ_SLOT);
+        find_delay(CWL_nCK + 4 + ps_to_nCK(tWTR_S_ps), WRITE_SLOT, READ_SLOT); // WL + (BL/2) + tWTR_S (see JESD79-4D Figure 73)
     localparam ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG =
-        find_delay(ps_to_nCK(tRRD_L_ps), ACTIVATE_SLOT, ACTIVATE_SLOT);
+        find_delay(ps_to_nCK(tRRD_L_ps), ACTIVATE_SLOT, ACTIVATE_SLOT);  // tRRD_L (see JESD79-4D Figure 71)
     localparam ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG =
-        find_delay(ps_to_nCK(tRRD_S_ps), ACTIVATE_SLOT, ACTIVATE_SLOT);
+        find_delay(ps_to_nCK(tRRD_S_ps), ACTIVATE_SLOT, ACTIVATE_SLOT);  // tRRD_S (see JESD79-4D Figure 71)
 
-    // tFAW in controller cycles (tracked by sliding window)
-    localparam TFAW_CYCLES = nCK_to_cycles(ps_to_nCK(tFAW_ps));
+    // tFAW in controller cycles
+    localparam TFAW_CYCLES = nCK_to_cycles(ps_to_nCK(tFAW_ps)); // tFAW (see JESD79-4D Figure 72)
 
-    // Counter width sizing
-    localparam MAX_PRECHARGE_DELAY = max_fn(max_fn(ACTIVATE_TO_PRECHARGE_DELAY,
-                                    WRITE_TO_PRECHARGE_DELAY), READ_TO_PRECHARGE_DELAY);
-    localparam MAX_ACTIVATE_DELAY  = PRECHARGE_TO_ACTIVATE_DELAY;
-    localparam MAX_WRITE_DELAY     = max_fn(ACTIVATE_TO_READWRITE_DELAY, READ_TO_WRITE_DELAY);
-    localparam MAX_READ_DELAY      = ACTIVATE_TO_READWRITE_DELAY;
+    // Counter width sizing 
+    localparam MAX_PRECHARGE_DELAY = max_fn(max_fn(ACTIVATE_TO_PRECHARGE_DELAY, WRITE_TO_PRECHARGE_DELAY), READ_TO_PRECHARGE_DELAY);
+    localparam MAX_ACTIVATE_DELAY  = PRECHARGE_TO_ACTIVATE_DELAY; // tRRD(act-to-act) uses separate rrd_counter
+    localparam MAX_WRITE_DELAY     = max_fn(ACTIVATE_TO_WRITE_DELAY, READ_TO_WRITE_DELAY); // tCCD(wr-to-wr) uses separate per-BG counter
+    localparam MAX_READ_DELAY      = ACTIVATE_TO_READ_DELAY; // tCCD(rd-to-rd) / tWTR(wr-to-rd) use separate per-BG counters
     localparam MAX_CCD_DELAY       = CAS_TO_CAS_DELAY_SAME_BG;
     localparam MAX_WTR_DELAY       = WRITE_TO_READ_DELAY_SAME_BG;
     localparam MAX_RRD_DELAY       = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG;
@@ -862,13 +871,13 @@ module ddr4_controller #(
                     ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
                 // tRCD -- only raise (protect lingering higher delay)
                 if (delay_before_write_counter_d[stage2_bank]
-                    < ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_WRITE_DELAY):0])
+                    < ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0])
                     delay_before_write_counter_d[stage2_bank] =
-                        ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
+                        ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
                 if (delay_before_read_counter_d[stage2_bank]
-                    < ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_READ_DELAY):0])
+                    < ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0])
                     delay_before_read_counter_d[stage2_bank] =
-                        ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_READ_DELAY):0];
+                        ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0];
                 bank_status_d[stage2_bank] = 1'b1;
                 bank_active_row_d[stage2_bank] = stage2_row;
                 // Per-BG tRRD: same BG = LONG, diff BG = SHORT (only-raise)
@@ -977,13 +986,13 @@ module ddr4_controller #(
             delay_before_precharge_counter_d[stage1_next_bank] =
                 ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
             if (delay_before_write_counter_d[stage1_next_bank]
-                < ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_WRITE_DELAY):0])
+                < ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0])
                 delay_before_write_counter_d[stage1_next_bank] =
-                    ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
+                    ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
             if (delay_before_read_counter_d[stage1_next_bank]
-                < ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_READ_DELAY):0])
+                < ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0])
                 delay_before_read_counter_d[stage1_next_bank] =
-                    ACTIVATE_TO_READWRITE_DELAY[$clog2(MAX_READ_DELAY):0];
+                    ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0];
             bank_status_d[stage1_next_bank] = 1'b1;
             bank_active_row_d[stage1_next_bank] = stage1_next_row;
             for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
@@ -1352,7 +1361,7 @@ module ddr4_controller #(
                             };
                             calib_act_done <= 1'b1;
                             calib_rr_timer <=
-                                ACTIVATE_TO_READWRITE_DELAY[$clog2(T_WRLVL_WW):0];
+                                ACTIVATE_TO_READ_DELAY[$clog2(T_WRLVL_WW):0];
                         end else if (calib_rr_timer == 0) begin
                             cmd_d[READ_SLOT] <= {
                                 1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
@@ -1733,7 +1742,8 @@ module ddr4_controller #(
                  * CONTROLLER_CLK_PERIOD);
 
         $display("-- Computed Delays (controller cycles)");
-        $display("  ACT->RD/WR            = %0d", ACTIVATE_TO_READWRITE_DELAY);
+        $display("  ACT->WR               = %0d", ACTIVATE_TO_WRITE_DELAY);
+        $display("  ACT->RD               = %0d", ACTIVATE_TO_READ_DELAY);
         $display("  RD->PRE               = %0d", READ_TO_PRECHARGE_DELAY);
         $display("  WR->PRE               = %0d", WRITE_TO_PRECHARGE_DELAY);
         $display("  PRE->ACT              = %0d", PRECHARGE_TO_ACTIVATE_DELAY);
@@ -1811,11 +1821,11 @@ module ddr4_controller #(
     //   k>=2: fire at M+k, gap = 4*k + end_slot - start_slot
     //   (k=1 fires at M+1, same as k=0 due to <= 1 check)
     // So for k >= 1 returned by the DDR3-style formula, we add 1 to compensate.
-    function integer find_delay(input integer delay_nCK, input integer start_slot, input integer end_slot);
+    function integer find_delay(input integer delay_nCK, input [1:0] start_slot, input [1:0] end_slot);
         integer k;
         begin
             k = 0;
-            while (((4 - start_slot) + end_slot + 4*k) < delay_nCK)
+            while (((4 - {30'b0, start_slot}) + {30'b0, end_slot} + 4*k) < delay_nCK)
                 k = k + 1;
             if (k > 0) k = k + 1;
             find_delay = k;
@@ -1825,7 +1835,7 @@ module ddr4_controller #(
     // get_slot: assign each command type to one of 4 DFI slots per controller cycle
     // (DFI 3.1). Read/Write slots derived from CL/CWL mod 4; Activate and
     // Precharge fill the remaining slots avoiding collisions.
-    function integer get_slot(input [3:0] cmd);
+    function [1:0] get_slot(input [3:0] cmd);
         integer delay;
         reg [2:0] slot_number, read_slot, write_slot;
         reg [2:0] anticipate_activate_slot, anticipate_precharge_slot;
@@ -1872,11 +1882,11 @@ module ddr4_controller #(
                 anticipate_precharge_slot[1:0] = anticipate_precharge_slot[1:0] - 1'b1;
 
             case (cmd)
-                CMD_RD:  get_slot = {30'b0, read_slot[1:0]};
-                CMD_WR:  get_slot = {30'b0, write_slot[1:0]};
-                CMD_ACT: get_slot = {30'b0, anticipate_activate_slot[1:0]};
-                CMD_PRE: get_slot = {30'b0, anticipate_precharge_slot[1:0]};
-                default: get_slot = 0;
+                CMD_RD:  get_slot = read_slot[1:0];
+                CMD_WR:  get_slot = write_slot[1:0];
+                CMD_ACT: get_slot = anticipate_activate_slot[1:0];
+                CMD_PRE: get_slot = anticipate_precharge_slot[1:0];
+                default: get_slot = 2'b0;
             endcase
         end
     endfunction
