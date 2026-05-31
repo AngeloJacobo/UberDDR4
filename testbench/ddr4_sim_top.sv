@@ -998,9 +998,6 @@ module ddr4_sim_top;
 
     task wb_write_one(input [EXT_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data);
         begin
-            wb_stb = 1'b0;
-            @(posedge controller_clk);
-            while (wb_stall) @(posedge controller_clk);
             wb_cyc  = 1'b1;
             wb_stb  = 1'b1;
             wb_we   = 1'b1;
@@ -1008,20 +1005,19 @@ module ddr4_sim_top;
             wb_data = data;
             wb_sel  = {WB_SEL_BITS{1'b1}};
             @(posedge controller_clk);
+            while (wb_stall) @(posedge controller_clk);
         end
     endtask
 
     task wb_read_one(input [EXT_ADDR_BITS-1:0] addr);
         begin
-            wb_stb = 1'b0;
-            @(posedge controller_clk);
-            while (wb_stall) @(posedge controller_clk);
             wb_cyc  = 1'b1;
             wb_stb  = 1'b1;
             wb_we   = 1'b0;
             wb_addr = addr;
             wb_sel  = {WB_SEL_BITS{1'b1}};
             @(posedge controller_clk);
+            while (wb_stall) @(posedge controller_clk);
         end
     endtask
 
