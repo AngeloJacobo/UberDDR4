@@ -53,8 +53,11 @@
 // Timing properties coverage:
 //  All JEDEC timing (tRCD, tRP, tRAS, tRC, tCCD_L/S, tRRD_L/S,
 //  tWTR_L/S, tWR, tRTP, tFAW) proven by decomposition:
-//  Props 7+10+12+13. Shadow counter approach attempted but not
-//  k-induction provable (solver desynchronizes independent state).
+//  Props 7+10+12+13. Shadow counter approach (DDR3-style timestamps)
+//  is not k-induction provable for DDR4: all per-bank timings
+//  (tRCD, tRP, tRAS, etc.) exceed SERDES_RATIO, so the ts<=timer
+//  invariant cannot close the induction gap at depth 8. DDR3 avoids
+//  this because tCCD = SERDES_RATIO = 4.
 //
 // Engineer: Angelo C. Jacobo
 // Copyright (c) 2025, Angelo C. Jacobo
@@ -715,11 +718,6 @@ end
 //   - Prop 12: counter loading (JEDEC minimums loaded after each cmd)
 //   - Prop 7:  BG counter gating
 //   - Prop 13: tFAW sliding window
-// Shadow counter properties (independent timing verification) were
-// attempted but are not k-induction provable at depth 8: the solver
-// desynchronizes the shadow counter from the RTL counter in the
-// induction step. The decomposed approach is mathematically
-// equivalent and fully proven.
 //
 // Properties 16-19 below cover write ACK, data enable pipelines,
 // and bounded stall latency.

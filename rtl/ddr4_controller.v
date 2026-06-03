@@ -889,8 +889,9 @@ module ddr4_controller #(
             wtr_counter_d[ci] = wtr_counter_q[ci] - (|wtr_counter_q[ci]);
             rrd_counter_d[ci] = rrd_counter_q[ci] - (|rrd_counter_q[ci]);
         end
-        for (ci = 0; ci < 4; ci = ci + 1)
+        for (ci = 0; ci < 4; ci = ci + 1) begin
             activate_timestamp_d[ci] = activate_timestamp_q[ci] - (|activate_timestamp_q[ci]);
+        end
 
         // ROM PRE ALL closes all banks (refresh loop addr 33)
         if (rom_precharge_all) begin
@@ -901,7 +902,6 @@ module ddr4_controller #(
 
         // =============================================================
         // Stage 2 Command Scheduling + Counter Loading
-        // PRE->ACT->RD/WR with bank group awareness.
         // Uses counter_q <= 1 optimization: fire one cycle early
         // because the combinational decrement has already applied.
         // =============================================================
@@ -913,17 +913,24 @@ module ddr4_controller #(
         sched_read      = 1'b0;
         sched_anticipate = 1'b0;
 
+        // Stage 2 scheduling: the request has a target {bank, row, we}.
+        // DDR4 requires a bank to be ACTIVATEd on the correct row before
+        // any RD/WR.  Three mutually exclusive cases arise:
+        //   1. Bank open on WRONG row  -> close it first  (PRECHARGE)
+        //   2. Bank closed             -> open target row  (ACTIVATE)
+        //   3. Bank open on RIGHT row  -> issue data cmd   (WRITE / READ)
+        // Each case loads JEDEC-mandated delay counters so the next
+        // command to that bank (or bank group) cannot fire too early.
         if (stage2_pending && refresh_idle) begin
-            // Q: add comment to explain this code, just enough for reader like me to understand relevance of this. CUrrrently Im lost
 
-            // -- Bank active, wrong row -> PRECHARGE (single bank) --
-            // Q: why use the registered delay_before_precharge_counter_q instead of the combinational delay_before_precharge_counter_d here? Look on UberDDR3, it seems
-            // it always use the NEXT registered cycle (so its like using the combinational _d on the current cycle), I dont know but read ddr3 cotroller
-            // beacuse I think there is scenario where what if delay_before_precharge_counter_q is 1 now (so sched_precharge will assert) BUT this current
-            // cycle also sets delay_before_precharge_counter_d to a large value, isnt it wrong to set sched_precharge in that case since at next cycle
-            // the delay_before_precharge_counter_q is not zero but a large value./
-            // This question applies to all the other places where we check the _q value instead of the _d value in the scheduling logic below, make sure to evaluate properly 
-            // compared to ddr3 controller so we know ddr4 contorlller is fail proof in this aspect.
+            // ---- Case 1: row miss ----
+            // Bank is already active but on a different row than the one
+            // we need.  Issue a single-bank PRECHARGE to close it.
+            // Guard: delay_before_precharge_counter_q <= 1 ensures tRAS
+            // (and tRTP/tWR if a RD/WR loaded it earlier) has elapsed.
+            // After PRE, load tRP into the activate counter so the next
+            // ACTIVATE to this bank waits the required PRECHARGE-to-
+            // ACTIVATE interval before re-opening the bank.
             if (bank_status_q[stage2_bank]
                 && (bank_active_row_q[stage2_bank] != stage2_row)
                 && (delay_before_precharge_counter_q[stage2_bank] <= 1)) begin
@@ -932,16 +939,30 @@ module ddr4_controller #(
                 bank_status_d[stage2_bank] = 1'b0;
             end
 
-            // -- Bank idle -> ACTIVATE --
-            // Q: add comment to explain this code, just enough for reader like me to understand relevance of this. CUrrrently Im lost
+            // ---- Case 2: bank idle -> ACTIVATE ----
+            // Bank is closed.  Open it on the target row.
+            // Three guards must ALL be satisfied before we can fire ACT:
+            //   (a) delay_before_activate_counter <= 1 : tRP from a prior
+            //       PRECHARGE to THIS bank has elapsed.
+            //   (b) rrd_counter[bg] <= 1 : tRRD (ACT-to-ACT within this
+            //       bank group) has elapsed — JEDEC requires a minimum
+            //       interval between consecutive ACTIVATEs.
+            //   (c) !tfaw_blocked : no more than 4 ACTIVATEs have occurred
+            //       in the last tFAW window.
             else if (!bank_status_q[stage2_bank]
                      && (delay_before_activate_counter_q[stage2_bank] <= 1)
                      && (rrd_counter_q[stage2_bg] <= 1)
                      && !tfaw_blocked) begin
                 sched_activate = 1'b1;
-                // tRAS -- minimum time bank must stay active (JESD79-4D) 
+                // tRAS: minimum time bank must stay active before it can
+                // be PRECHARGEd again (JESD79-4D §4.29).
                 delay_before_precharge_counter_d[stage2_bank] = ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
-                // tRCD -- only raise (protect lingering higher delay) Q: what it means by only raise?
+                // tRCD: minimum ACT-to-RD/WR delay.
+                // "Only raise" = use MAX(current, new): if a higher delay
+                // is already pending don't overwrite it with a
+                // shorter value.  The `<` comparison achieves this —
+                // we only load the new value when it is LARGER than what
+                // is already in the counter.
                 if (delay_before_write_counter_d[stage2_bank] < ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0]) begin
                     delay_before_write_counter_d[stage2_bank] = ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
                 end
@@ -950,9 +971,16 @@ module ddr4_controller #(
                 end
                 bank_status_d[stage2_bank] = 1'b1;
                 bank_active_row_d[stage2_bank] = stage2_row;
-                // Per-BG tRRD: same BG = LONG, diff BG = SHORT (only-raise) Q: what it means by only raise? what is tRRd again?
-                // Q: what ci means here?
-                // Q: add comment to explain this code, just enough for reader like me to understand relevance of this. CUrrrently Im lost
+                // tRRD — Row-to-Row Delay: minimum time between two
+                // ACTIVATEs.  DDR4 has TWO tRRD values:
+                //   tRRD_L (Long)  — ACT-to-ACT within the SAME bank group
+                //   tRRD_S (Short) — ACT-to-ACT to a DIFFERENT bank group
+                // Loop over all bank groups (`ci` is the loop iterator).
+                // For the bank group that just fired ACT: unconditionally
+                // load tRRD_L (same-BG, always the longer value).
+                // For every OTHER bank group: only-raise to tRRD_S — load
+                // tRRD_S only if larger than the current counter, so a
+                // previously loaded tRRD_L is never shortened.
                 for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
                     if (ci[BG_BITS-1:0] == stage2_bg) begin
                         rrd_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG[$clog2(MAX_RRD_DELAY):0];
@@ -961,41 +989,58 @@ module ddr4_controller #(
                         rrd_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0];
                     end
                 end
-                // Per-bank activate counter: only-raise for all other banks
-                // (BREAKDOWN counter loading table, belt-and-suspenders with rrd)
-                // Q: add comment to explain this code, just enough for reader like me to understand relevance of this. CUrrrently Im lost
-                // Q: why need this when we already have the tRRD counters above? Add commment for that explanation
+                // Per-bank activate delay (tRRD_S) for every OTHER bank.
+                // Why needed when we already have tRRD counters above?
+                // The rrd_counter is per-BANK-GROUP (4 counters for 4 BGs).
+                // It blocks the next ACT to any bank in that BG. But the
+                // per-bank delay_before_activate_counter is per-BANK (16
+                // counters). It is checked in the ACT guard (case 2 above)
+                // and provides per-bank granularity that tRRD alone cannot:
+                // e.g. tRP (PRE→ACT) is loaded here too, verify each bank's 
+                // counter individually.  Loading tRRD_S into every other bank's
+                // activate counter is belt-and-suspenders: it guarantees
+                // tRRD_S compliance even if the BG-level rrd_counter were
+                // somehow bypassed.
                 for (ci = 0; ci < NUM_BANKS; ci = ci + 1) begin
                     if (ci[BG_BITS+BA_BITS-1:0] != stage2_bank
                         && delay_before_activate_counter_d[ci] < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0])
                         delay_before_activate_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0];
                 end
-                // tFAW -- record this activate's timestamp
+                // tFAW — Four-Activate Window: record this ACT's timestamp
+                // in the circular buffer so the sliding-window check can
+                // block a 5th ACT within the tFAW interval.
                 activate_timestamp_d[activate_index_q] = TFAW_CYCLES[$clog2(TFAW_CYCLES):0];
             end
 
-            // -- Bank active, correct row -> WRITE or READ --
-            // Q: add comment to explain this code, just enough for reader like me to understand relevance of this. CUrrrently Im lost
+            // ---- Case 3: row hit -> issue WRITE or READ ----
+            // Bank is active and already has the correct row open.
+            // No PRE/ACT needed — go straight to the data command.
             else if (bank_status_q[stage2_bank]
                      && (bank_active_row_q[stage2_bank] == stage2_row)) begin
 
-                // WRITE -- ODT on for writes
-                // Q: add comment to explain this code, just enough for reader like me to understand relevance of this. CUrrrently Im lost
+                // WRITE path.
+                // Guards: (a) tRCD elapsed (delay_before_write_counter),
+                //         (b) tCCD elapsed (ccd_counter per bank group).
+                // ODT (On-Die Termination) is enabled for writes — the
+                // DRAM switches its termination resistors to transmit mode.
                 if (stage2_we
                     && (delay_before_write_counter_q[stage2_bank] <= 1)
                     && (ccd_counter_q[stage2_bg] <= 1)) begin
                     sched_write = 1'b1;
                     cmd_odt = 1'b1;
                     stage2_update = 1'b1;
-                    // tWR -- precharge: only raise to protect tRAS
+                    // tWR: minimum WR-to-PRE delay (write recovery time).
+                    // Only-raise: don't shorten a pending tRAS.
                     if (delay_before_precharge_counter_d[stage2_bank] < WRITE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0])
                         delay_before_precharge_counter_d[stage2_bank] = WRITE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
-                    // Per-BG tCCD + tWTR
+                    // Per-BG tCCD (CAS-to-CAS) + tWTR (WR-to-RD turnaround).
+                    // Same BG: unconditionally load the LONG delays.
+                    // Diff BG: only-raise to SHORT delays.
                     for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
                         if (ci[BG_BITS-1:0] == stage2_bg) begin
                             ccd_counter_d[ci] = CAS_TO_CAS_DELAY_SAME_BG[$clog2(MAX_CCD_DELAY):0];
                             wtr_counter_d[ci] = WRITE_TO_READ_DELAY_SAME_BG[$clog2(MAX_WTR_DELAY):0];
-                        end 
+                        end
                         else begin
                             if (ccd_counter_d[ci] < CAS_TO_CAS_DELAY_DIFF_BG[$clog2(MAX_CCD_DELAY):0]) begin
                                 ccd_counter_d[ci] = CAS_TO_CAS_DELAY_DIFF_BG[$clog2(MAX_CCD_DELAY):0];
@@ -1007,25 +1052,35 @@ module ddr4_controller #(
                     end
                 end
 
-                // READ -- ODT off for reads
-                // Q: add comment to explain this code, just enough for reader like me to understand relevance of this. CUrrrently Im lost
+                // READ path.
+                // Guards: (a) tRCD elapsed (delay_before_read_counter),
+                //         (b) tCCD elapsed (ccd_counter per bank group),
+                //         (c) tWTR elapsed (wtr_counter) — must wait for
+                //             any prior WRITE's data to clear the bus
+                //             before driving a READ.
+                // ODT stays off for reads — DRAM is in receive mode.
                 else if (!stage2_we
                          && (delay_before_read_counter_q[stage2_bank] <= 1)
                          && (ccd_counter_q[stage2_bg] <= 1)
                          && (wtr_counter_q[stage2_bg] <= 1)) begin
                     sched_read = 1'b1;
                     stage2_update = 1'b1;
-                    // tRTP -- precharge: only raise
+                    // tRTP: minimum RD-to-PRE delay (read-to-precharge).
+                    // Only-raise: don't shorten a pending tRAS.
                     if (delay_before_precharge_counter_d[stage2_bank] < READ_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0]) begin
                         delay_before_precharge_counter_d[stage2_bank] = READ_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
                     end
-                    // RD->WR turnaround: all banks (global bus/ODT settling)
+                    // RD→WR turnaround: applies to ALL banks globally.
+                    // After a READ, the DQ bus carries read data for
+                    // RL + BL/2 clocks.  A WRITE cannot drive the bus
+                    // until that window plus ODT settling time has passed.
+                    // This is a bus-level (not bank-level) constraint.
                     for (ci = 0; ci < NUM_BANKS; ci = ci + 1) begin
                         if (delay_before_write_counter_d[ci] < READ_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0]) begin
                             delay_before_write_counter_d[ci] = READ_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
                         end
                     end
-                    // Per-BG tCCD
+                    // Per-BG tCCD: same BG = LONG, diff BG = only-raise SHORT
                     for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
                         if (ci[BG_BITS-1:0] == stage2_bg) begin
                             ccd_counter_d[ci] = CAS_TO_CAS_DELAY_SAME_BG[$clog2(MAX_CCD_DELAY):0];
@@ -1038,46 +1093,89 @@ module ddr4_controller #(
             end
         end
 
-        // -- Bank anticipation: pre-ACT next bank while Stage 2 issues WR/RD --
-        // Only fires when stage2_update (WR/RD completing or idle) and Stage 1
-        // has a pending request whose next-bank is idle. This hides the tRCD
-        // latency for the next request by issuing ACT early.
+        // ---- Bank anticipation (speculative ACTIVATE) ----
+        // Performance optimization: while Stage 2 is completing a WR/RD
+        // (or is idle), peek at Stage 1's NEXT request and pre-open its
+        // target bank.  By the time that request reaches Stage 2, tRCD
+        // has already elapsed and the WR/RD can fire immediately —
+        // hiding the ACT-to-CAS latency behind the current transaction.
+        //
+        // Guards (all must be true simultaneously):
+        //   (a) stage2_update      : Stage 2 just finished a WR/RD (or
+        //       is idle), so we have a free command slot this cycle. Q: but in uberddr3 it seems anticipation can also happen when stage2 is still busy with a prior request, 
+        //   (b) stage1_pending     : Stage 1 has a queued request.
+        //   (c) refresh_idle       : no refresh in progress.
+        //   (d) !bank_status_d[next_bank] : target bank is closed.
+        //       Uses _d (not _q) so it sees any PRE that fired THIS
+        //       cycle in Stage 2 — avoids a 1-cycle stale-state hazard. Q: what does it meant by stale-state  hazard?
+        //   (e) delay_before_activate_counter_d == 0 : tRP fully elapsed.
+        //       Checks == 0 (not <= 1) because Stage 2 may have ALSO
+        //       loaded this counter this cycle (e.g. PRE just fired);
+        //       using == 0 ensures no conflict with Stage 2's loads.
+        //   (f) rrd_counter_d == 0 : tRRD fully elapsed (same reason).
+        //   (g) activate_timestamp_d == 0 : tFAW slot is free.  If
+        //       Stage 2 also fired an ACT this cycle, it already wrote
+        //       the tFAW timestamp, so this check correctly blocks a
+        //       second ACT in the same cycle.
+        //
+        // Counter loading below mirrors Case 2 (ACTIVATE) exactly:
+        // same tRAS, tRCD, tRRD, tFAW loads — because this IS an ACT
+        // command, just issued speculatively from a different pipeline
+        // stage.
+        // Q: WHy does in uberddr3 the antiicipate is both precharge and activate, but here only ativate? isnt this a downgrade? WHY DO IT THIS WAY??
         if (stage2_update && stage1_pending && refresh_idle
             && !bank_status_d[stage1_next_bank]
             && (delay_before_activate_counter_d[stage1_next_bank] == 0)
             && (rrd_counter_d[stage1_next_bg] == 0)
             && (activate_timestamp_d[activate_index_q] == 0)) begin
             sched_anticipate = 1'b1;
-            delay_before_precharge_counter_d[stage1_next_bank] =
-                ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
-            if (delay_before_write_counter_d[stage1_next_bank]
-                < ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0])
-                delay_before_write_counter_d[stage1_next_bank] =
-                    ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
-            if (delay_before_read_counter_d[stage1_next_bank]
-                < ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0])
-                delay_before_read_counter_d[stage1_next_bank] =
-                    ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0];
+            // tRAS: block PRE until minimum active time elapses
+            delay_before_precharge_counter_d[stage1_next_bank] = ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
+            // tRCD: block WR/RD until row is fully open (only-raise)
+            if (delay_before_write_counter_d[stage1_next_bank] < ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0]) begin
+                delay_before_write_counter_d[stage1_next_bank] = ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
+            end
+            if (delay_before_read_counter_d[stage1_next_bank] < ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0]) begin
+                delay_before_read_counter_d[stage1_next_bank] = ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0];
+            end
             bank_status_d[stage1_next_bank] = 1'b1;
             bank_active_row_d[stage1_next_bank] = stage1_next_row;
+            // tRRD (Row-to-Row Delay): after this anticipatory ACT, block
+            // the next ACT to respect the JEDEC ACT-to-ACT minimum.
+            // Loop over every bank group:
+            //   - Same BG as the one we just ACTIVATEd: unconditionally
+            //     load tRRD_L (Long), which is the stricter same-BG limit.
+            //   - Different BG: only-raise to tRRD_S (Short).  The `<`
+            //     guard ensures we never overwrite a longer pending delay
+            //     (e.g. a tRRD_L that was loaded by Stage 2's ACT earlier
+            //     this cycle).
             for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
-                if (ci[BG_BITS-1:0] == stage1_next_bg)
-                    rrd_counter_d[ci] =
-                        ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG[$clog2(MAX_RRD_DELAY):0];
-                else if (rrd_counter_d[ci]
-                         < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0])
-                    rrd_counter_d[ci] =
-                        ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0];
+                if (ci[BG_BITS-1:0] == stage1_next_bg) begin
+                    rrd_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG[$clog2(MAX_RRD_DELAY):0];
+                end
+                else if (rrd_counter_d[ci] < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0]) begin
+                    rrd_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0];
+                end
             end
+            // Per-bank activate delay: only-raise tRRD_S into every
+            // OTHER bank's delay_before_activate_counter.  This is
+            // redundant with the per-BG rrd_counter above but provides
+            // per-bank granularity — the same counter also holds tRP
+            // (from PRE), so a single per-bank check in the ACT guard
+            // covers both tRP and tRRD_S.  See Case 2 comment for the
+            // full rationale on why both per-BG and per-bank counters
+            // coexist.
             for (ci = 0; ci < NUM_BANKS; ci = ci + 1) begin
                 if (ci[BG_BITS+BA_BITS-1:0] != stage1_next_bank
-                    && delay_before_activate_counter_d[ci]
-                       < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0])
-                    delay_before_activate_counter_d[ci] =
-                        ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0];
+                    && delay_before_activate_counter_d[ci] < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0]) begin
+                    delay_before_activate_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0];
+                end
             end
-            activate_timestamp_d[activate_index_q] =
-                TFAW_CYCLES[$clog2(TFAW_CYCLES):0];
+            // tFAW (Four-Activate Window): write the tFAW countdown into
+            // the next slot of the 4-entry circular timestamp buffer.
+            // When all 4 slots are non-zero, tfaw_blocked goes high and
+            // no further ACTs can fire until the oldest entry expires.
+            activate_timestamp_d[activate_index_q] = TFAW_CYCLES[$clog2(TFAW_CYCLES):0];
         end
     end
 
