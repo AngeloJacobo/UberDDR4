@@ -7,6 +7,7 @@ An open-source, fully parameterized DDR4 SDRAM controller targeting Xilinx Ultra
 - Configurable timing parameters auto-derived from clock periods (DDR4-1600 through DDR4-2400)
 - 4 bank groups x 4 banks with full tFAW/tRRD/tCCD_L tracking
 - Bank-group interleaved address mapping for maximum throughput
+- Speculative bank anticipation (both PRECHARGE and ACTIVATE) for next-request lookahead
 - Write leveling, read gate training (bitslip), and read eye training (IDELAY tap sweep)
 - Built-in self-test (BIST) with burst, random, and alternating write-read patterns
 - Debug CSR register file accessible via Wishbone

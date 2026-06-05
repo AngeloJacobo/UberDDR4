@@ -842,7 +842,8 @@ module ddr4_controller #(
     reg sched_activate;
     reg sched_write;
     reg sched_read;
-    reg sched_anticipate;
+    reg sched_anticipate_pre;
+    reg sched_anticipate_act;
 
     // tFAW check: JEDEC allows at most 4 ACTs in any tFAW window.
     // activate_timestamp_q[3:0] is a circular buffer of 4 countdown
@@ -867,6 +868,57 @@ module ddr4_controller #(
     // (e.g. 14-16 depending on density), so we zero-pad to 17 bits.
     wire[16:0] stage2_row_padded     = {{(17-ROW_BITS){1'b0}}, stage2_row};
     wire[16:0] stage1_next_row_padded = {{(17-ROW_BITS){1'b0}}, stage1_next_row};
+
+    // =====================================================================
+    // Bank Anticipation — Enable / Guard Wires
+    //
+    // Anticipation speculatively issues PRE/ACT for stage1_next_bank
+    // (the bank that the NEXT sequential WB address maps to) while
+    // Stage 2 is busy with the current request.  By the time the next
+    // request reaches Stage 2, the bank is already open on the correct
+    // row — hiding tRP + tRCD behind the current transaction.
+    //
+    // Architecture: ENABLE (from _q only) + KILL (1 gate after Stage 2)
+    //
+    //   ENABLE resolves purely from registered state, in parallel with
+    //   Stage 2's combinational logic — no timing dependency on Stage 2.
+    //   The <= 1 check means "counter will be zero after the combinational
+    //   decrement this cycle," equivalent to DDR3's _d == 0 check but
+    //   without waiting for Stage 2's mux tree.
+    //
+    //   KILL is a short combinational path that catches the one case
+    //   where Stage 2's same-cycle action invalidates the enable:
+    //   Stage 2 PRE to the same bank loads tRP into activate_counter.
+    //
+    //   BANK COLLISION prevents anticipation from touching the bank
+    //   that Stage 2 is currently working on (would corrupt its state).
+    //
+    //   SLOT CONFLICT (!sched_precharge / !sched_activate) prevents two
+    //   commands on the same DFI slot in the same controller cycle.
+    //
+    // With BG-interleaved mapping (ADDR_MAPPING=1), consecutive WB
+    // addresses cycle through bank groups, so stage1_next_bank is
+    // always a different BG — anticipation fires every cycle during
+    // sequential bursts.  With row-first mapping (ADDR_MAPPING=0),
+    // consecutive addresses stay in the same bank/row, so the enable
+    // conditions naturally evaluate false (bank already active on
+    // correct row) and anticipation stays dormant — no wasted commands.
+    // =====================================================================
+    wire ant_pre_enable = stage1_pending && !refresh_active
+        && bank_status_q[stage1_next_bank]
+        && (bank_active_row_q[stage1_next_bank] != stage1_next_row)
+        && (delay_before_precharge_counter_q[stage1_next_bank] <= 1);
+
+    wire ant_act_enable = stage1_pending && !refresh_active
+        && !bank_status_q[stage1_next_bank]
+        && (delay_before_activate_counter_q[stage1_next_bank] <= 1)
+        && (rrd_counter_q[stage1_next_bg] <= 1)
+        && !tfaw_blocked;
+
+    wire ant_bank_collision = (stage1_next_bank == stage2_bank) && stage2_pending;
+
+    wire ant_act_kill = sched_precharge
+                     && (stage2_bank == stage1_next_bank);
 
     // =====================================================================
     // Combinational Counter Decrement
@@ -911,7 +963,8 @@ module ddr4_controller #(
         sched_activate  = 1'b0;
         sched_write     = 1'b0;
         sched_read      = 1'b0;
-        sched_anticipate = 1'b0;
+        sched_anticipate_pre = 1'b0;
+        sched_anticipate_act = 1'b0;
 
         // Stage 2 scheduling: the request has a target {bank, row, we}.
         // DDR4 requires a bank to be ACTIVATEd on the correct row before
@@ -1093,45 +1146,31 @@ module ddr4_controller #(
             end
         end
 
-        // ---- Bank anticipation (speculative ACTIVATE) ----
-        // Performance optimization: while Stage 2 is completing a WR/RD
-        // (or is idle), peek at Stage 1's NEXT request and pre-open its
-        // target bank.  By the time that request reaches Stage 2, tRCD
-        // has already elapsed and the WR/RD can fire immediately —
-        // hiding the ACT-to-CAS latency behind the current transaction.
-        //
-        // Guards (all must be true simultaneously):
-        //   (a) stage2_update      : Stage 2 just finished a WR/RD (or
-        //       is idle), so we have a free command slot this cycle. Q: but in uberddr3 it seems anticipation can also happen when stage2 is still busy with a prior request, 
-        //   (b) stage1_pending     : Stage 1 has a queued request.
-        //   (c) refresh_idle       : no refresh in progress.
-        //   (d) !bank_status_d[next_bank] : target bank is closed.
-        //       Uses _d (not _q) so it sees any PRE that fired THIS
-        //       cycle in Stage 2 — avoids a 1-cycle stale-state hazard. Q: what does it meant by stale-state  hazard?
-        //   (e) delay_before_activate_counter_d == 0 : tRP fully elapsed.
-        //       Checks == 0 (not <= 1) because Stage 2 may have ALSO
-        //       loaded this counter this cycle (e.g. PRE just fired);
-        //       using == 0 ensures no conflict with Stage 2's loads.
-        //   (f) rrd_counter_d == 0 : tRRD fully elapsed (same reason).
-        //   (g) activate_timestamp_d == 0 : tFAW slot is free.  If
-        //       Stage 2 also fired an ACT this cycle, it already wrote
-        //       the tFAW timestamp, so this check correctly blocks a
-        //       second ACT in the same cycle.
-        //
-        // Counter loading below mirrors Case 2 (ACTIVATE) exactly:
-        // same tRAS, tRCD, tRRD, tFAW loads — because this IS an ACT
-        // command, just issued speculatively from a different pipeline
-        // stage.
-        // Q: WHy does in uberddr3 the antiicipate is both precharge and activate, but here only ativate? isnt this a downgrade? WHY DO IT THIS WAY??
-        if (stage2_update && stage1_pending && refresh_idle
-            && !bank_status_d[stage1_next_bank]
-            && (delay_before_activate_counter_d[stage1_next_bank] == 0)
-            && (rrd_counter_d[stage1_next_bg] == 0)
-            && (activate_timestamp_d[activate_index_q] == 0)) begin
-            sched_anticipate = 1'b1;
-            // tRAS: block PRE until minimum active time elapses
+        // ---- Anticipatory PRECHARGE (fires on PRECHARGE_SLOT) ----
+        // stage1_next_bank is active on wrong row → close it now.
+        // After tRP elapses, anticipatory ACT can open the correct row.
+        // Guards: bank_collision (don't touch Stage 2's bank),
+        //         !sched_precharge (slot 0 conflict with Stage 2 PRE).
+        // No kill needed: only same-bank Stage 2 actions could corrupt
+        // precharge_counter, and bank_collision already blocks those.
+        if (ant_pre_enable && !ant_bank_collision && !sched_precharge) begin
+            sched_anticipate_pre = 1'b1;
+            delay_before_activate_counter_d[stage1_next_bank] = PRECHARGE_TO_ACTIVATE_DELAY[$clog2(MAX_ACTIVATE_DELAY):0];
+            bank_status_d[stage1_next_bank] = 1'b0;
+        end
+
+        // ---- Anticipatory ACTIVATE (fires on ACTIVATE_SLOT) ----
+        // stage1_next_bank is idle → open it on stage1_next_row.
+        // Counter loads mirror Stage 2's Case 2 exactly (tRAS, tRCD,
+        // tRRD per-BG, per-bank activate delay, tFAW timestamp).
+        // Guards: bank_collision, !sched_activate (slot 1 conflict),
+        //         !sched_anticipate_pre (PRE has priority — can't open
+        //         a bank we just closed), ant_act_kill (Stage 2 just
+        //         PREd this bank → tRP was loaded, so ACT is invalid).
+        if (ant_act_enable && !ant_bank_collision
+            && !sched_activate && !sched_anticipate_pre && !ant_act_kill) begin
+            sched_anticipate_act = 1'b1;
             delay_before_precharge_counter_d[stage1_next_bank] = ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
-            // tRCD: block WR/RD until row is fully open (only-raise)
             if (delay_before_write_counter_d[stage1_next_bank] < ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0]) begin
                 delay_before_write_counter_d[stage1_next_bank] = ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
             end
@@ -1140,15 +1179,6 @@ module ddr4_controller #(
             end
             bank_status_d[stage1_next_bank] = 1'b1;
             bank_active_row_d[stage1_next_bank] = stage1_next_row;
-            // tRRD (Row-to-Row Delay): after this anticipatory ACT, block
-            // the next ACT to respect the JEDEC ACT-to-ACT minimum.
-            // Loop over every bank group:
-            //   - Same BG as the one we just ACTIVATEd: unconditionally
-            //     load tRRD_L (Long), which is the stricter same-BG limit.
-            //   - Different BG: only-raise to tRRD_S (Short).  The `<`
-            //     guard ensures we never overwrite a longer pending delay
-            //     (e.g. a tRRD_L that was loaded by Stage 2's ACT earlier
-            //     this cycle).
             for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
                 if (ci[BG_BITS-1:0] == stage1_next_bg) begin
                     rrd_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG[$clog2(MAX_RRD_DELAY):0];
@@ -1157,24 +1187,12 @@ module ddr4_controller #(
                     rrd_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0];
                 end
             end
-            // Per-bank activate delay: only-raise tRRD_S into every
-            // OTHER bank's delay_before_activate_counter.  This is
-            // redundant with the per-BG rrd_counter above but provides
-            // per-bank granularity — the same counter also holds tRP
-            // (from PRE), so a single per-bank check in the ACT guard
-            // covers both tRP and tRRD_S.  See Case 2 comment for the
-            // full rationale on why both per-BG and per-bank counters
-            // coexist.
             for (ci = 0; ci < NUM_BANKS; ci = ci + 1) begin
                 if (ci[BG_BITS+BA_BITS-1:0] != stage1_next_bank
                     && delay_before_activate_counter_d[ci] < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0]) begin
                     delay_before_activate_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0];
                 end
             end
-            // tFAW (Four-Activate Window): write the tFAW countdown into
-            // the next slot of the 4-entry circular timestamp buffer.
-            // When all 4 slots are non-zero, tfaw_blocked goes high and
-            // no further ACTs can fire until the oldest entry expires.
             activate_timestamp_d[activate_index_q] = TFAW_CYCLES[$clog2(TFAW_CYCLES):0];
         end
     end
@@ -1423,7 +1441,17 @@ module ddr4_controller #(
                     stage2_col[9:0] //A9:A0 = column
                 };
             end
-            if (sched_anticipate) begin
+            if (sched_anticipate_pre) begin
+                cmd_d[PRECHARGE_SLOT] <= {
+                    1'b0,           //cs_n = 0
+                    CMD_PRE,        //{act_n=1, ras_n=0, cas_n=1, we_n=0}
+                    cmd_odt, 1'b1, 1'b1,
+                    stage1_next_bg_padded,
+                    stage1_next_bank[BA_BITS-1:0],
+                    7'b0, 1'b0, 9'b0  //A10=0 (single bank precharge)
+                };
+            end
+            if (sched_anticipate_act) begin
                 cmd_d[ACTIVATE_SLOT] <= {
                     1'b0,           //cs_n = 0
                     1'b0,           //act_n = 0 (ACTIVATE)
@@ -1431,7 +1459,7 @@ module ddr4_controller #(
                     stage1_next_row_padded[15],
                     stage1_next_row_padded[14],
                     cmd_odt, 1'b1, 1'b1,
-                    stage1_next_bg_padded, 
+                    stage1_next_bg_padded,
                     stage1_next_bank[BA_BITS-1:0],
                     stage1_next_row_padded
                 };
@@ -1712,7 +1740,7 @@ module ddr4_controller #(
                 activate_timestamp_q[bank_i] <= activate_timestamp_d[bank_i];
 
             // tFAW index advance on any ACT issue (scheduler or anticipation)
-            if (sched_activate || sched_anticipate)
+            if (sched_activate || sched_anticipate_act)
                 activate_index_q <= activate_index_q + 1'b1;
 
             // Stage 1->2 handoff: zero-bubble pipeline

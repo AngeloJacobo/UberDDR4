@@ -474,7 +474,7 @@ always @* begin
             assert(!sched_read);
     end
     // Anticipation also respects RRD on its target BG
-    if (reset_done && sched_anticipate) begin
+    if (reset_done && sched_anticipate_act) begin
         assert(rrd_counter_d[stage1_next_bg] !=
                ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG[$clog2(MAX_RRD_DELAY):0]
                || rrd_counter_q[stage1_next_bg] <= 1);
@@ -507,7 +507,7 @@ always @(posedge i_controller_clk) begin
         if ($past(sched_activate))
             assert(!cmd_d[ACTIVATE_SLOT][CMD_ACT_N]);
         // Anticipation ACTIVATE: act_n must be 0
-        if ($past(sched_anticipate))
+        if ($past(sched_anticipate_act))
             assert(!cmd_d[ACTIVATE_SLOT][CMD_ACT_N]);
         // WRITE: act_n must be 1
         if ($past(sched_write))
@@ -540,8 +540,10 @@ always @* begin
         if (sched_read && stage2_bank == f_bank_const)
             assert(delay_before_read_counter_q[f_bank_const] <= 1);
     end
-    if (reset_done && sched_anticipate && stage1_next_bank == f_bank_const)
-        assert(delay_before_activate_counter_d[f_bank_const] == 0);
+    if (reset_done && sched_anticipate_act && stage1_next_bank == f_bank_const)
+        assert(delay_before_activate_counter_q[f_bank_const] <= 1);
+    if (reset_done && sched_anticipate_pre && stage1_next_bank == f_bank_const)
+        assert(delay_before_precharge_counter_q[f_bank_const] <= 1);
 end
 
 // ===================================================================
@@ -599,7 +601,7 @@ always @(posedge i_controller_clk) begin
                    >= ACTIVATE_TO_READ_DELAY);
             assert(bank_status_q[f_bank_const]);
         end
-        if ($past(sched_anticipate) && $past(stage1_next_bank) == f_bank_const) begin
+        if ($past(sched_anticipate_act) && $past(stage1_next_bank) == f_bank_const) begin
             assert(delay_before_precharge_counter_q[f_bank_const]
                    >= ACTIVATE_TO_PRECHARGE_DELAY);
             assert(delay_before_write_counter_q[f_bank_const]
@@ -607,6 +609,11 @@ always @(posedge i_controller_clk) begin
             assert(delay_before_read_counter_q[f_bank_const]
                    >= ACTIVATE_TO_READ_DELAY);
             assert(bank_status_q[f_bank_const]);
+        end
+        if ($past(sched_anticipate_pre) && $past(stage1_next_bank) == f_bank_const) begin
+            assert(delay_before_activate_counter_q[f_bank_const]
+                   >= PRECHARGE_TO_ACTIVATE_DELAY);
+            assert(!bank_status_q[f_bank_const]);
         end
     end
 end
@@ -676,34 +683,49 @@ always @* begin
     if (reset_done && i_wb_cyc) begin
         if (sched_activate)
             assert(activate_timestamp_q[activate_index_q] == 0);
-        if (sched_anticipate)
-            assert(activate_timestamp_q[activate_index_q] <= 1);
+        if (sched_anticipate_act)
+            assert(!tfaw_blocked);
     end
 end
 
 // ===================================================================
 // 14. Scheduler Mutual Exclusion
 // At most one of {PRE, ACT, WR, RD} fires per cycle (else-if chain).
-// Anticipation is separate and can co-fire with WR/RD.
+// Anticipation uses separate slots and can co-fire with WR/RD.
 // ===================================================================
 always @* begin
-    if (reset_done)
+    if (reset_done) begin
         assert((sched_precharge + sched_activate + sched_write + sched_read) <= 1);
+        assert(!(sched_anticipate_pre && sched_anticipate_act));
+        assert(!(sched_precharge && sched_anticipate_pre));
+        assert(!(sched_activate && sched_anticipate_act));
+        assert(!(sched_anticipate_pre && stage2_pending
+                 && stage1_next_bank == stage2_bank));
+        assert(!(sched_anticipate_act && stage2_pending
+                 && stage1_next_bank == stage2_bank));
+    end
 end
 
 // ===================================================================
 // 15. Anticipation Command Integrity
-// When anticipation fires, the ACT command on ACTIVATE_SLOT must
+// When anticipation fires, the command on the correct slot must
 // carry the correct BG/BA from stage1's next-bank fields.
 // ===================================================================
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(reset_done)) begin
-        if ($past(sched_anticipate)) begin
+        if ($past(sched_anticipate_act)) begin
             assert(cmd_d[ACTIVATE_SLOT][CMD_BG_START-1 +: BG_BITS]
                    == $past(stage1_next_bg));
             assert(cmd_d[ACTIVATE_SLOT][CMD_BA_START:CMD_BA_START-(BA_BITS-1)]
                    == $past(stage1_next_bank[BA_BITS-1:0]));
             assert(!cmd_d[ACTIVATE_SLOT][CMD_CS_N]);
+        end
+        if ($past(sched_anticipate_pre)) begin
+            assert(cmd_d[PRECHARGE_SLOT][CMD_BG_START-1 +: BG_BITS]
+                   == $past(stage1_next_bg));
+            assert(cmd_d[PRECHARGE_SLOT][CMD_BA_START:CMD_BA_START-(BA_BITS-1)]
+                   == $past(stage1_next_bank[BA_BITS-1:0]));
+            assert(!cmd_d[PRECHARGE_SLOT][CMD_CS_N]);
         end
     end
 end
@@ -937,15 +959,18 @@ always @(posedge i_controller_clk) begin
         cover(sched_read);
         cover(sched_precharge);
         cover(sched_activate);
-        cover(sched_anticipate);
+        cover(sched_anticipate_pre);
+        cover(sched_anticipate_act);
     end
 end
 
 // Dual-slot: bank management co-fires with data command
 always @(posedge i_controller_clk) begin
     if (f_past_valid && reset_done) begin
-        cover(sched_anticipate && sched_write);
-        cover(sched_anticipate && sched_read);
+        cover(sched_anticipate_act && sched_write);
+        cover(sched_anticipate_act && sched_read);
+        cover(sched_anticipate_pre && sched_write);
+        cover(sched_anticipate_pre && sched_read);
         cover($countones(f_active_slots) == 2);
     end
 end

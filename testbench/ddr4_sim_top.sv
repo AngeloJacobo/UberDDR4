@@ -94,6 +94,13 @@ module ddr4_sim_top;
 `else
     localparam TB_BIST_MODE = 1;
 `endif
+
+`ifdef SIM_TB_DEPTH_BITS
+    localparam TB_DEPTH_BITS = `SIM_TB_DEPTH_BITS;
+`else
+    localparam TB_DEPTH_BITS = 5;
+`endif
+    localparam TB_DEPTH = 1 << TB_DEPTH_BITS;
     localparam SERDES_RATIO   = 4;
     localparam WB_DATA_BITS   = DQ_BITS * BYTE_LANES * 2 * SERDES_RATIO;
     localparam WB_SEL_BITS    = WB_DATA_BITS / 8;
@@ -953,32 +960,80 @@ module ddr4_sim_top;
     reg all_tests_done;
     initial all_tests_done = 1'b0;
 
-    localparam [EXT_ADDR_BITS-1:0] ROW0_BG0 = 0,
-                                    ROW0_BG1 = 1,
-                                    ROW0_BG2 = 2,
-                                    ROW0_BG3 = 3,
-                                    ROW1_BG0 = (1 << 10) | 0,
-                                    ROW1_BG1 = (1 << 10) | 1,
-                                    ROW1_BG2 = (1 << 10) | 2,
-                                    ROW1_BG3 = (1 << 10) | 3,
-                                    ROW0_BG0_BA1 = (1 << 8) | 0,
-                                    ROW0_BG0_BA2 = (2 << 8) | 0,
-                                    ROW2_BG0 = (2 << 10) | 0,
-                                    ROW2_BG1 = (2 << 10) | 1,
-                                    ROW2_BG2 = (2 << 10) | 2,
-                                    ROW2_BG3 = (2 << 10) | 3,
-                                    ROW2_BG0_C1 = (2 << 10) | (1 << 2) | 0,
-                                    ROW2_BG1_C1 = (2 << 10) | (1 << 2) | 1,
-                                    ROW0_BG0_BA3 = (3 << 8) | 0,
-                                    ROW0_BG1_BA1 = (1 << 8) | 1,
-                                    ROW0_BG1_BA2 = (2 << 8) | 1,
-                                    ROW0_BG1_BA3 = (3 << 8) | 1,
-                                    ROW0_BG2_BA1 = (1 << 8) | 2,
-                                    ROW0_BG2_BA2 = (2 << 8) | 2,
-                                    ROW0_BG2_BA3 = (3 << 8) | 2,
-                                    ROW0_BG3_BA1 = (1 << 8) | 3,
-                                    ROW0_BG3_BA2 = (2 << 8) | 3,
-                                    ROW0_BG3_BA3 = (3 << 8) | 3,
+    // Command counters (used by monitor and throughput)
+    integer act_count, wr_count, rd_count, pre_count;
+    initial begin act_count = 0; wr_count = 0; rd_count = 0; pre_count = 0; end
+
+    // Throughput measurement: free-running cycle counter + per-phase snapshots
+    integer cycle_count;
+    initial cycle_count = 0;
+    always @(posedge controller_clk) if (reset_done_seen) cycle_count = cycle_count + 1;
+
+    integer phase_n_start, phase_n_end;
+    integer phase_o_start, phase_o_end;
+    integer phase_q_start, phase_q_end;
+    integer phase_n_wr_start, phase_o_wr_start, phase_q_wr_start;
+    initial begin
+        phase_n_start = 0; phase_n_end = 0;
+        phase_o_start = 0; phase_o_end = 0;
+        phase_q_start = 0; phase_q_end = 0;
+        phase_n_wr_start = 0; phase_o_wr_start = 0; phase_q_wr_start = 0;
+    end
+
+    // ADDR_MAPPING=1 address field positions
+    localparam ROW_SHIFT = BG_BITS + (COL_BITS - COL_LOW) + BA_BITS;
+    localparam BA_SHIFT  = BG_BITS + (COL_BITS - COL_LOW);
+    localparam COL_SHIFT = BG_BITS;
+
+    // Row offsets for first/middle/last row testing
+    localparam [EXT_ADDR_BITS-1:0] FIRST_ROW_OFF = 0,
+                                    MID_ROW_OFF   = (1 << (ROW_BITS/2)) << ROW_SHIFT,
+                                    LAST_ROW_OFF  = ((1 << ROW_BITS) - 4) << ROW_SHIFT;
+
+    // Base addresses: BG selection (bits [1:0])
+    localparam [EXT_ADDR_BITS-1:0] ADDR_BG0 = 0, ADDR_BG1 = 1,
+                                    ADDR_BG2 = 2, ADDR_BG3 = 3;
+
+    // BA offsets (bits [10:9])
+    localparam [EXT_ADDR_BITS-1:0] BA0_OFF = 0,
+                                    BA1_OFF = (1 << BA_SHIFT),
+                                    BA2_OFF = (2 << BA_SHIFT),
+                                    BA3_OFF = (3 << BA_SHIFT);
+
+    // Column offsets (bits [8:2])
+    localparam [EXT_ADDR_BITS-1:0] COL1_OFF = (1 << COL_SHIFT),
+                                    COL2_OFF = (2 << COL_SHIFT);
+
+    // Row offset for row-miss testing (bits [26:11])
+    localparam [EXT_ADDR_BITS-1:0] ROW1_OFF = (1 << ROW_SHIFT);
+
+    // Composite addresses (backward-compatible names)
+    localparam [EXT_ADDR_BITS-1:0] ROW0_BG0 = ADDR_BG0,
+                                    ROW0_BG1 = ADDR_BG1,
+                                    ROW0_BG2 = ADDR_BG2,
+                                    ROW0_BG3 = ADDR_BG3,
+                                    ROW1_BG0 = ROW1_OFF | ADDR_BG0,
+                                    ROW1_BG1 = ROW1_OFF | ADDR_BG1,
+                                    ROW1_BG2 = ROW1_OFF | ADDR_BG2,
+                                    ROW1_BG3 = ROW1_OFF | ADDR_BG3,
+                                    ROW0_BG0_BA1 = BA1_OFF | ADDR_BG0,
+                                    ROW0_BG0_BA2 = BA2_OFF | ADDR_BG0,
+                                    ROW0_BG0_BA3 = BA3_OFF | ADDR_BG0,
+                                    ROW2_BG0 = (2 << ROW_SHIFT) | ADDR_BG0,
+                                    ROW2_BG1 = (2 << ROW_SHIFT) | ADDR_BG1,
+                                    ROW2_BG2 = (2 << ROW_SHIFT) | ADDR_BG2,
+                                    ROW2_BG3 = (2 << ROW_SHIFT) | ADDR_BG3,
+                                    ROW2_BG0_C1 = (2 << ROW_SHIFT) | COL1_OFF | ADDR_BG0,
+                                    ROW2_BG1_C1 = (2 << ROW_SHIFT) | COL1_OFF | ADDR_BG1,
+                                    ROW0_BG1_BA1 = BA1_OFF | ADDR_BG1,
+                                    ROW0_BG1_BA2 = BA2_OFF | ADDR_BG1,
+                                    ROW0_BG1_BA3 = BA3_OFF | ADDR_BG1,
+                                    ROW0_BG2_BA1 = BA1_OFF | ADDR_BG2,
+                                    ROW0_BG2_BA2 = BA2_OFF | ADDR_BG2,
+                                    ROW0_BG2_BA3 = BA3_OFF | ADDR_BG2,
+                                    ROW0_BG3_BA1 = BA1_OFF | ADDR_BG3,
+                                    ROW0_BG3_BA2 = BA2_OFF | ADDR_BG3,
+                                    ROW0_BG3_BA3 = BA3_OFF | ADDR_BG3,
                                     CSR_BASE = 1 << WB_ADDR_BITS;
 
     // -----------------------------------------------------------------
@@ -1136,160 +1191,173 @@ module ddr4_sim_top;
         repeat (10) @(posedge controller_clk);
         while (wb_stall) @(posedge controller_clk);
 
+        // === Row-offset loop: run corner-case phases at first/middle/last row ===
+        begin : row_loop_blk
+            integer row_iter;
+            reg [EXT_ADDR_BITS-1:0] row_base;
+            for (row_iter = 0; row_iter < 3; row_iter = row_iter + 1) begin
+                case (row_iter)
+                    0: row_base = FIRST_ROW_OFF;
+                    1: row_base = MID_ROW_OFF;
+                    2: row_base = LAST_ROW_OFF;
+                endcase
+                $display("[%0t] ===== ROW ITERATION %0d (row_base=0x%0h) =====",
+                         $realtime, row_iter, row_base);
+
         // -- Phase A: Cold writes to 4 idle banks (ACT -> WR) --
         test_phase = "PHASE_A";
         $display("[%0t] === Phase A: Cold writes to idle banks (ACT->WR) ===", $realtime);
-        wb_write_one(ROW0_BG0, 128'h0A);
+        wb_write_one(ROW0_BG0 + row_base, 128'h0A);
         $display("[%0t]   write BG0/BA0/row0", $realtime);
-        wb_write_one(ROW0_BG1, 128'h0B);
+        wb_write_one(ROW0_BG1 + row_base, 128'h0B);
         $display("[%0t]   write BG1/BA0/row0", $realtime);
-        wb_write_one(ROW0_BG2, 128'h0C);
+        wb_write_one(ROW0_BG2 + row_base, 128'h0C);
         $display("[%0t]   write BG2/BA0/row0", $realtime);
-        wb_write_one(ROW0_BG3, 128'h0D);
+        wb_write_one(ROW0_BG3 + row_base, 128'h0D);
         $display("[%0t]   write BG3/BA0/row0", $realtime);
         drain_pipeline;
         $display("[%0t]   Readback Phase A:", $realtime);
-        wb_read_check(ROW0_BG0, 128'h0A);
-        wb_read_check(ROW0_BG1, 128'h0B);
-        wb_read_check(ROW0_BG2, 128'h0C);
-        wb_read_check(ROW0_BG3, 128'h0D);
+        wb_read_check(ROW0_BG0 + row_base, 128'h0A);
+        wb_read_check(ROW0_BG1 + row_base, 128'h0B);
+        wb_read_check(ROW0_BG2 + row_base, 128'h0C);
+        wb_read_check(ROW0_BG3 + row_base, 128'h0D);
 
         // -- Phase B: Bank hits  -  same bank, same row still open (WR only) --
         test_phase = "PHASE_B";
         $display("[%0t] === Phase B: Bank hits  -  same row open (WR only) ===", $realtime);
-        wb_write_one(ROW0_BG0, 128'h1A);
+        wb_write_one(ROW0_BG0 + row_base, 128'h1A);
         $display("[%0t]   write BG0/BA0/row0 (hit)", $realtime);
-        wb_write_one(ROW0_BG1, 128'h1B);
+        wb_write_one(ROW0_BG1 + row_base, 128'h1B);
         $display("[%0t]   write BG1/BA0/row0 (hit)", $realtime);
-        wb_write_one(ROW0_BG2, 128'h1C);
+        wb_write_one(ROW0_BG2 + row_base, 128'h1C);
         $display("[%0t]   write BG2/BA0/row0 (hit)", $realtime);
-        wb_write_one(ROW0_BG3, 128'h1D);
+        wb_write_one(ROW0_BG3 + row_base, 128'h1D);
         $display("[%0t]   write BG3/BA0/row0 (hit)", $realtime);
         drain_pipeline;
         $display("[%0t]   Readback Phase B:", $realtime);
-        wb_read_check(ROW0_BG0, 128'h1A);
-        wb_read_check(ROW0_BG1, 128'h1B);
-        wb_read_check(ROW0_BG2, 128'h1C);
-        wb_read_check(ROW0_BG3, 128'h1D);
+        wb_read_check(ROW0_BG0 + row_base, 128'h1A);
+        wb_read_check(ROW0_BG1 + row_base, 128'h1B);
+        wb_read_check(ROW0_BG2 + row_base, 128'h1C);
+        wb_read_check(ROW0_BG3 + row_base, 128'h1D);
 
         // -- Phase C: Row miss  -  same bank, different row (PRE -> ACT -> WR) --
         test_phase = "PHASE_C";
         $display("[%0t] === Phase C: Row miss  -  different row (PRE->ACT->WR) ===", $realtime);
         if (TB_BIST_MODE == 2) begin
-            wb_write_one(ROW1_BG0, 128'h2A);
+            wb_write_one(ROW1_BG0 + row_base, 128'h2A);
             $display("[%0t]   write BG0/BA0/row1 (miss)", $realtime);
             drain_pipeline;
-            wb_write_one(ROW1_BG1, 128'h2B);
+            wb_write_one(ROW1_BG1 + row_base, 128'h2B);
             $display("[%0t]   write BG1/BA0/row1 (miss)", $realtime);
             drain_pipeline;
-            wb_write_one(ROW1_BG2, 128'h2C);
+            wb_write_one(ROW1_BG2 + row_base, 128'h2C);
             $display("[%0t]   write BG2/BA0/row1 (miss)", $realtime);
             drain_pipeline;
-            wb_write_one(ROW1_BG3, 128'h2D);
+            wb_write_one(ROW1_BG3 + row_base, 128'h2D);
             $display("[%0t]   write BG3/BA0/row1 (miss)", $realtime);
             drain_pipeline;
         end else begin
-            wb_write_one(ROW1_BG0, 128'h2A);
+            wb_write_one(ROW1_BG0 + row_base, 128'h2A);
             $display("[%0t]   write BG0/BA0/row1 (miss)", $realtime);
-            wb_write_one(ROW1_BG1, 128'h2B);
+            wb_write_one(ROW1_BG1 + row_base, 128'h2B);
             $display("[%0t]   write BG1/BA0/row1 (miss)", $realtime);
-            wb_write_one(ROW1_BG2, 128'h2C);
+            wb_write_one(ROW1_BG2 + row_base, 128'h2C);
             $display("[%0t]   write BG2/BA0/row1 (miss)", $realtime);
-            wb_write_one(ROW1_BG3, 128'h2D);
+            wb_write_one(ROW1_BG3 + row_base, 128'h2D);
             $display("[%0t]   write BG3/BA0/row1 (miss)", $realtime);
             drain_pipeline;
         end
         $display("[%0t]   Readback Phase C:", $realtime);
-        wb_read_check(ROW1_BG0, 128'h2A);
-        wb_read_check(ROW1_BG1, 128'h2B);
-        wb_read_check(ROW1_BG2, 128'h2C);
-        wb_read_check(ROW1_BG3, 128'h2D);
+        wb_read_check(ROW1_BG0 + row_base, 128'h2A);
+        wb_read_check(ROW1_BG1 + row_base, 128'h2B);
+        wb_read_check(ROW1_BG2 + row_base, 128'h2C);
+        wb_read_check(ROW1_BG3 + row_base, 128'h2D);
 
         // -- Phase D: Wait for refresh (PRE ALL closes all banks), then re-access --
         test_phase = "WAIT_REF";
         $display("[%0t] === Waiting for refresh to close all banks... ===", $realtime);
         wb_idle;
-        wait (ref_count >= 2);
+        wait (ref_count >= (row_iter + 1) * 2);
         @(posedge controller_clk);
         while (wb_stall) @(posedge controller_clk);
 
         test_phase = "PHASE_D";
         $display("[%0t] === Phase D: Post-refresh writes (ACT->WR) ===", $realtime);
-        wb_write_one(ROW0_BG0, 128'h3A);
+        wb_write_one(ROW0_BG0 + row_base, 128'h3A);
         $display("[%0t]   write BG0/BA0/row0 (post-refresh)", $realtime);
-        wb_write_one(ROW0_BG1, 128'h3B);
+        wb_write_one(ROW0_BG1 + row_base, 128'h3B);
         $display("[%0t]   write BG1/BA0/row0 (post-refresh)", $realtime);
-        wb_write_one(ROW0_BG2, 128'h3C);
+        wb_write_one(ROW0_BG2 + row_base, 128'h3C);
         $display("[%0t]   write BG2/BA0/row0 (post-refresh)", $realtime);
-        wb_write_one(ROW0_BG3, 128'h3D);
+        wb_write_one(ROW0_BG3 + row_base, 128'h3D);
         $display("[%0t]   write BG3/BA0/row0 (post-refresh)", $realtime);
         drain_pipeline;
         $display("[%0t]   Readback Phase D:", $realtime);
-        wb_read_check(ROW0_BG0, 128'h3A);
-        wb_read_check(ROW0_BG1, 128'h3B);
-        wb_read_check(ROW0_BG2, 128'h3C);
-        wb_read_check(ROW0_BG3, 128'h3D);
+        wb_read_check(ROW0_BG0 + row_base, 128'h3A);
+        wb_read_check(ROW0_BG1 + row_base, 128'h3B);
+        wb_read_check(ROW0_BG2 + row_base, 128'h3C);
+        wb_read_check(ROW0_BG3 + row_base, 128'h3D);
 
         // -- Phase E: Same-BG different-bank writes (tRRD_L / tCCD_L stress) --
         test_phase = "PHASE_E";
         $display("[%0t] === Phase E: Same-BG different-bank writes (tRRD/tCCD_L) ===", $realtime);
-        wb_write_one(ROW0_BG0,     128'h4A);
+        wb_write_one(ROW0_BG0 + row_base,     128'h4A);
         $display("[%0t]   write BG0/BA0/row0", $realtime);
-        wb_write_one(ROW0_BG0_BA1, 128'h4B);
+        wb_write_one(ROW0_BG0_BA1 + row_base, 128'h4B);
         $display("[%0t]   write BG0/BA1/row0 (same BG, diff bank)", $realtime);
-        wb_write_one(ROW0_BG0_BA2, 128'h4C);
+        wb_write_one(ROW0_BG0_BA2 + row_base, 128'h4C);
         $display("[%0t]   write BG0/BA2/row0 (same BG, diff bank)", $realtime);
         drain_pipeline;
         $display("[%0t]   Readback Phase E:", $realtime);
-        wb_read_check(ROW0_BG0,     128'h4A);
-        wb_read_check(ROW0_BG0_BA1, 128'h4B);
-        wb_read_check(ROW0_BG0_BA2, 128'h4C);
+        wb_read_check(ROW0_BG0 + row_base,     128'h4A);
+        wb_read_check(ROW0_BG0_BA1 + row_base, 128'h4B);
+        wb_read_check(ROW0_BG0_BA2 + row_base, 128'h4C);
 
         // -- Phase F: Read + data verify (exercises sched_read path) --
         test_phase = "PHASE_F";
         $display("[%0t] === Phase F: Read requests (ACT->RD, bank hit RD) ===", $realtime);
-        wb_write_one(ROW0_BG0, 128'h5A);
+        wb_write_one(ROW0_BG0 + row_base, 128'h5A);
         $display("[%0t]   write BG0/BA0/row0 (open bank)", $realtime);
-        wb_write_one(ROW0_BG1, 128'h5B);
+        wb_write_one(ROW0_BG1 + row_base, 128'h5B);
         $display("[%0t]   write BG1/BA0/row0 (open bank)", $realtime);
         drain_pipeline;
         $display("[%0t]   Readback Phase F (BG0/BG1=hit, BG2/BG3=cold ACT->RD):", $realtime);
-        wb_read_check(ROW0_BG0, 128'h5A);
-        wb_read_check(ROW0_BG1, 128'h5B);
-        wb_read_check(ROW0_BG2, 128'h3C);
-        wb_read_check(ROW0_BG3, 128'h3D);
+        wb_read_check(ROW0_BG0 + row_base, 128'h5A);
+        wb_read_check(ROW0_BG1 + row_base, 128'h5B);
+        wb_read_check(ROW0_BG2 + row_base, 128'h3C);
+        wb_read_check(ROW0_BG3 + row_base, 128'h3D);
 
         // -- Phase G: Same-bank rapid re-access (tRC stress: ACT->ACT same bank) --
         test_phase = "PHASE_G";
         $display("[%0t] === Phase G: Same-bank rapid re-access (tRC stress) ===", $realtime);
-        wb_write_one(ROW0_BG0, 128'h6A);
+        wb_write_one(ROW0_BG0 + row_base, 128'h6A);
         $display("[%0t]   write BG0/BA0/row0", $realtime);
         drain_pipeline;
-        wb_write_one(ROW1_BG0, 128'h6B);
+        wb_write_one(ROW1_BG0 + row_base, 128'h6B);
         $display("[%0t]   write BG0/BA0/row1 (miss -> PRE+ACT+WR same bank)", $realtime);
         drain_pipeline;
-        wb_write_one(ROW0_BG0, 128'h6C);
+        wb_write_one(ROW0_BG0 + row_base, 128'h6C);
         $display("[%0t]   write BG0/BA0/row0 (miss -> PRE+ACT+WR same bank again)", $realtime);
         drain_pipeline;
         $display("[%0t]   Readback Phase G:", $realtime);
-        wb_read_check(ROW0_BG0, 128'h6C);
-        wb_read_check(ROW1_BG0, 128'h6B);
+        wb_read_check(ROW0_BG0 + row_base, 128'h6C);
+        wb_read_check(ROW1_BG0 + row_base, 128'h6B);
 
         // -- Phase H: Write-then-read same BG (tWTR stress) --
         test_phase = "PHASE_H";
         $display("[%0t] === Phase H: Write-then-read same BG (tWTR stress) ===", $realtime);
-        wb_write_one(ROW0_BG0, 128'h7A);
+        wb_write_one(ROW0_BG0 + row_base, 128'h7A);
         $display("[%0t]   write BG0/BA0/row0", $realtime);
-        wb_read_one(ROW0_BG0);
+        wb_read_one(ROW0_BG0 + row_base);
         $display("[%0t]   read BG0/BA0/row0 (same BG -> tWTR_L)", $realtime);
-        wb_write_one(ROW0_BG1, 128'h7B);
+        wb_write_one(ROW0_BG1 + row_base, 128'h7B);
         $display("[%0t]   write BG1/BA0/row0", $realtime);
-        wb_read_one(ROW0_BG0);
+        wb_read_one(ROW0_BG0 + row_base);
         $display("[%0t]   read BG0/BA0/row0 (diff BG -> tWTR_S applies to BG1)", $realtime);
         drain_pipeline;
         $display("[%0t]   Readback Phase H:", $realtime);
-        wb_read_check(ROW0_BG0, 128'h7A);
-        wb_read_check(ROW0_BG1, 128'h7B);
+        wb_read_check(ROW0_BG0 + row_base, 128'h7A);
+        wb_read_check(ROW0_BG1 + row_base, 128'h7B);
 
         // -- Phase I: Write->Read data round-trip verification --
         // Each pattern targets a different failure mode:
@@ -1298,25 +1366,28 @@ module ddr4_sim_top;
         //   crossbar bugs, walking-1 catches single-bit shorts.
         test_phase = "PHASE_I";
         $display("[%0t] === Phase I: Write->Read round-trip verification ===", $realtime);
-        wb_write_read_check(ROW2_BG0,    128'hDEAD_BEEF_CAFE_BABE_0123_4567_89AB_CDEF);
-        wb_write_read_check(ROW2_BG1,    128'hFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF);
-        wb_write_read_check(ROW2_BG2,    128'h0000_0000_0000_0000_0000_0000_0000_0000);
-        wb_write_read_check(ROW2_BG3,    128'hA5A5_A5A5_5A5A_5A5A_A5A5_A5A5_5A5A_5A5A);
-        wb_write_read_check(ROW2_BG0_C1, 128'h0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF);
-        wb_write_read_check(ROW2_BG1_C1, 128'hFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000);
-        wb_write_read_check(ROW2_BG0,    128'h1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210);
-        wb_write_read_check(ROW2_BG1,    128'h0F0F_0F0F_F0F0_F0F0_0F0F_0F0F_F0F0_F0F0);
-        wb_write_read_check(ROW2_BG2,    128'h0000_0000_0000_0001_8000_0000_0000_0000);
-        wb_write_read_check(ROW2_BG3,    128'hAAAA_AAAA_5555_5555_AAAA_AAAA_5555_5555);
+        wb_write_read_check(ROW2_BG0 + row_base,    128'hDEAD_BEEF_CAFE_BABE_0123_4567_89AB_CDEF);
+        wb_write_read_check(ROW2_BG1 + row_base,    128'hFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF);
+        wb_write_read_check(ROW2_BG2 + row_base,    128'h0000_0000_0000_0000_0000_0000_0000_0000);
+        wb_write_read_check(ROW2_BG3 + row_base,    128'hA5A5_A5A5_5A5A_5A5A_A5A5_A5A5_5A5A_5A5A);
+        wb_write_read_check(ROW2_BG0_C1 + row_base, 128'h0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF);
+        wb_write_read_check(ROW2_BG1_C1 + row_base, 128'hFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000);
+        wb_write_read_check(ROW2_BG0 + row_base,    128'h1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210);
+        wb_write_read_check(ROW2_BG1 + row_base,    128'h0F0F_0F0F_F0F0_F0F0_0F0F_0F0F_F0F0_F0F0);
+        wb_write_read_check(ROW2_BG2 + row_base,    128'h0000_0000_0000_0001_8000_0000_0000_0000);
+        wb_write_read_check(ROW2_BG3 + row_base,    128'hAAAA_AAAA_5555_5555_AAAA_AAAA_5555_5555);
 
         if (rd_err_count == 0)
             $display("[%0t] PASS: All 10 write->read checks passed", $realtime);
         else
             $display("[%0t] FAIL: %0d of 10 write->read checks failed", $realtime, rd_err_count);
 
+            end // for row_iter
+        end // row_loop_blk
+
         // -- Phase J: True pipelined writes  -  STB stays high, no gaps --
         test_phase = "PHASE_J";
-        $display("[%0t] === Phase J: Pipelined write->drain->read (16 addr) ===", $realtime);
+        $display("[%0t] === Phase J: Pipelined write->drain->read (%0d addr) ===", $realtime, TB_DEPTH/2);
         begin : phase_j_blk
             integer pj_idx;
             integer pj_err;
@@ -1331,10 +1402,10 @@ module ddr4_sim_top;
             wb_addr = 27'h1000;
             wb_data = gen_pattern_tb(8'd0);
 
-            for (pj_idx = 0; pj_idx < 16; pj_idx = pj_idx + 1) begin
+            for (pj_idx = 0; pj_idx < (TB_DEPTH/2); pj_idx = pj_idx + 1) begin
                 @(posedge controller_clk);
                 while (wb_stall) @(posedge controller_clk);
-                if (pj_idx < 15) begin
+                if (pj_idx < (TB_DEPTH/2) - 1) begin
                     wb_addr = 27'h1000 + pj_idx + 1;
                     wb_data = gen_pattern_tb(pj_idx[7:0] + 8'd1);
                 end else begin
@@ -1345,7 +1416,7 @@ module ddr4_sim_top;
 
             drain_pipeline;
 
-            for (pj_idx = 0; pj_idx < 16; pj_idx = pj_idx + 1) begin
+            for (pj_idx = 0; pj_idx < (TB_DEPTH/2); pj_idx = pj_idx + 1) begin
                 wb_read_one(27'h1000 + pj_idx);
                 wb_stb = 1'b0;
                 while (!wb_ack) @(posedge controller_clk);
@@ -1454,13 +1525,15 @@ module ddr4_sim_top;
 
         // -- Phase N: Pipeline saturation (32 back-to-back writes) --
         test_phase = "PHASE_N";
-        $display("[%0t] === Phase N: Pipeline saturation (32 writes) ===", $realtime);
+        $display("[%0t] === Phase N: Pipeline saturation (%0d writes) ===", $realtime, TB_DEPTH);
         begin : phase_n_blk
             integer pn_idx;
             integer pn_err;
             reg [WB_DATA_BITS-1:0] pn_exp;
             reg [WB_DATA_BITS-1:0] pn_captured;
             pn_err = 0;
+            phase_n_start = cycle_count;
+            phase_n_wr_start = wr_count;
 
             wb_cyc = 1'b1;
             wb_stb = 1'b1;
@@ -1469,10 +1542,10 @@ module ddr4_sim_top;
             wb_addr = 27'h2000;
             wb_data = gen_pattern_tb(8'd0);
 
-            for (pn_idx = 0; pn_idx < 32; pn_idx = pn_idx + 1) begin
+            for (pn_idx = 0; pn_idx < TB_DEPTH; pn_idx = pn_idx + 1) begin
                 @(posedge controller_clk);
                 while (wb_stall) @(posedge controller_clk);
-                if (pn_idx < 31) begin
+                if (pn_idx < TB_DEPTH - 1) begin
                     wb_addr = 27'h2000 + pn_idx + 1;
                     wb_data = gen_pattern_tb(pn_idx[7:0] + 8'd1);
                 end else begin
@@ -1483,7 +1556,7 @@ module ddr4_sim_top;
 
             drain_pipeline;
 
-            for (pn_idx = 0; pn_idx < 32; pn_idx = pn_idx + 1) begin
+            for (pn_idx = 0; pn_idx < TB_DEPTH; pn_idx = pn_idx + 1) begin
                 wb_read_one(27'h2000 + pn_idx);
                 wb_stb = 1'b0;
                 while (!wb_ack) @(posedge controller_clk);
@@ -1499,10 +1572,11 @@ module ddr4_sim_top;
             end
             wb_idle;
 
+            phase_n_end = cycle_count;
             if (pn_err == 0)
-                $display("[%0t] PASS: Phase N  -  all 32 pipelined write->read checks passed", $realtime);
+                $display("[%0t] PASS: Phase N  -  all %0d pipelined write->read checks passed", $realtime, TB_DEPTH);
             else begin
-                $display("[%0t] FAIL: Phase N  -  %0d of 32 checks failed", $realtime, pn_err);
+                $display("[%0t] FAIL: Phase N  -  %0d of %0d checks failed", $realtime, pn_err, TB_DEPTH);
                 rd_err_count = rd_err_count + pn_err;
             end
         end
@@ -1522,6 +1596,8 @@ module ddr4_sim_top;
 
             ref_start_o = ref_count;
             po_iter = 0;
+            phase_o_start = cycle_count;
+            phase_o_wr_start = wr_count;
             $display("[%0t]   Issuing continuous traffic, waiting for 2 refreshes...", $realtime);
 
             while (ref_count < ref_start_o + 2) begin
@@ -1538,6 +1614,7 @@ module ddr4_sim_top;
                 po_addr = (6 << 10) | ((po_i >> 2) << 8) | (po_i & 3);
                 wb_read_check(po_addr, gen_pattern_tb(po_i[7:0]));
             end
+            phase_o_end = cycle_count;
             $display("[%0t]   Refreshes during traffic: %0d",
                      $realtime, ref_count - ref_start_o);
         end
@@ -1562,6 +1639,8 @@ module ddr4_sim_top;
             reg [EXT_ADDR_BITS-1:0] pq_addr;
             reg [WB_DATA_BITS-1:0] pq_data;
             pq_err_start = rd_err_count;
+            phase_q_start = cycle_count;
+            phase_q_wr_start = wr_count;
 
             for (pq_ba = 0; pq_ba < 4; pq_ba = pq_ba + 1) begin
                 for (pq_bg = 0; pq_bg < 4; pq_bg = pq_bg + 1) begin
@@ -1581,6 +1660,7 @@ module ddr4_sim_top;
                 end
             end
 
+            phase_q_end = cycle_count;
             if (rd_err_count == pq_err_start)
                 $display("[%0t] PASS: Phase Q  -  all 16 banks verified", $realtime);
             else
@@ -1753,9 +1833,9 @@ module ddr4_sim_top;
     wire [3:0] mon_is_rd  = ~mon_cs_n & mon_act_n & mon_ras_n & ~mon_cas_n & mon_we_n;
     wire [3:0] mon_is_pre = ~mon_cs_n & mon_act_n & ~mon_ras_n & mon_cas_n & ~mon_we_n;
 
-    integer act_count, wr_count, rd_count, pre_count;
     integer mon_ph;
-    initial begin act_count = 0; wr_count = 0; rd_count = 0; pre_count = 0; end
+
+
 
     always @(posedge controller_clk) begin
         if (reset_done_seen && !all_tests_done && !bist_busy_int) begin
@@ -1834,6 +1914,11 @@ module ddr4_sim_top;
         $display("[%0t] ===============================================", $realtime);
         $display("[%0t] SUMMARY: ACT=%0d  WR=%0d  RD=%0d  PRE=%0d  REF=%0d  RD_ERR=%0d  BIST_ERR=%0d",
                  $realtime, act_count, wr_count, rd_count, pre_count, ref_count, rd_err_count, bist_error_int);
+        $display("[%0t] THROUGHPUT: Phase_N(32wr+32rd): %0d cycles (%0d WR issued)  Phase_O(burst+ref): %0d cycles (%0d WR issued)  Phase_Q(16bank): %0d cycles (%0d WR issued)",
+                 $realtime,
+                 phase_n_end - phase_n_start, wr_count - phase_n_wr_start,
+                 phase_o_end - phase_o_start, wr_count - phase_o_wr_start,
+                 phase_q_end - phase_q_start, wr_count - phase_q_wr_start);
         if (rd_err_count == 0 && bist_error_int == 0)
             $display("[%0t] PASS: All test phases + BIST + %0d refresh cycles, zero violations",
                      $realtime, ref_count);
