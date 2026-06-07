@@ -186,10 +186,14 @@ module ddr4_controller #(
                     CMD_ZQCL = 4'b1_110,
                     CMD_DES  = 4'b1_111; //same as NOP, cs_n=1 makes it DES
 
-    // The init sequence is driven by a small ROM (steps 0-32). Each ROM
+    // The init sequence is driven by a small ROM (steps 0-35). Each ROM
     // entry is a 32-bit instruction word. The upper 5 bits are a control
-    // field that selects what CKE, RESET_n, and A10 look like during
-    // that step, and whether the lower 20 bits are a delay count.
+    // field decoded as:
+    //   [31] RST_DONE  — when set, asserts reset_done (init complete)
+    //   [30] USE_TIMER — entry has a delay (lower 20 bits = cycle count)
+    //   [29] A10       — drives address bit A10 (used for PRE ALL, ZQCL)
+    //   [28] CKE       — drives CKE to DRAM
+    //   [27] RESET_N   — drives RESET_n to DRAM
     // The presets below are the only combinations the ROM uses:
     localparam[4:0] CTL_CKE0_RST0 = 5'b01000, //power-on: CKE=0, RESET_n=0
                     CTL_CKE0_RST1 = 5'b01001, //pre-CKE: CKE=0, RESET_n=1
@@ -197,13 +201,20 @@ module ddr4_controller #(
                     CTL_TIMER_A10 = 5'b01111, //+ A10=1: PRE ALL, ZQCL
                     CTL_DONE      = 5'b11011; //RST_DONE: init complete
 
-    // ROM instruction bit fields (32 bits)
+    // ROM instruction bit fields (32 bits):
+    //   [31]    RST_DONE   — assert reset_done (init complete flag)
+    //   [30]    USE_TIMER  — lower 20 bits are a delay count
+    //   [29]    A10        — address bit 10 (PRE ALL / ZQCL select)
+    //   [28]    CKE        — clock enable to DRAM
+    //   [27]    RESET_N    — reset_n to DRAM
+    //   [26:23] CMD[3:0]   — command opcode {act_n, ras_n, cas_n, we_n}
+    //   [22:20] MRS_SELECT — bank group + bank addr for MRS commands
+    //   [19:0]  TIMER/ADDR — delay cycle count, or MRS address bits
     localparam ROM_RST_DONE  = 31,
                ROM_USE_TIMER = 30,
                ROM_A10       = 29,
                ROM_CKE       = 28,
                ROM_RESET_N   = 27;
-    //bits [26:23] = CMD, [22:20] = MRS_SELECT, [19:0] = timer/addr
 
     // Named ROM address constants
     localparam[5:0] ROM_ADDR_RD_CAL    = 22,
@@ -456,6 +467,10 @@ module ddr4_controller #(
     localparam MAX_WTR_DELAY       = WRITE_TO_READ_DELAY_SAME_BG;
     localparam MAX_RRD_DELAY       = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG;
 
+    // Calibration gap timer width — must fit the largest value loaded
+    localparam CALIB_GAP_MAX = max_fn(max_fn(T_RDLVL_EN, T_RDLVL_RR),
+                                      max_fn(T_WRLVL_EN, T_WRLVL_WW));
+
     // -- Read/Write data enable pipeline depths (see ddr4_phy.v) --
     //
     // RDDATA_EN_PIPE_WIDTH sets the width of rddata_en_pipe_q, a
@@ -669,10 +684,10 @@ module ddr4_controller #(
 
     // -- Training pump state (driven by the calibration FSM) --
     reg [3:0] calib_state;
-    reg [$clog2(T_RDLVL_MAX):0] calib_timer;
-    reg [$clog2(T_WRLVL_WW):0]  calib_rr_timer;
+    reg [$clog2(max_fn(T_RDLVL_MAX, T_WRLVL_MAX)):0] calib_timer;
+    reg [$clog2(CALIB_GAP_MAX):0] calib_gap_timer;
     reg [1:0] calib_retry_count;
-    reg calib_act_done;
+    reg calib_read_req;
 
     reg rom_cke_hold;
     reg rom_reset_n_hold;
@@ -828,9 +843,7 @@ module ddr4_controller #(
     // rom_firing        = ROM ready to issue (delay done, not paused, not held)
     // rom_precharge_all = PRE ALL actually fires this cycle
     wire rom_prea_hold = rom_is_prea && any_precharge_pending && reset_done;
-    wire rom_firing = delay_counter_is_zero && !pause_counter
-                      && (!reset_done || instruction_address >= ROM_ADDR_REF_START)
-                      && !rom_prea_hold;
+    wire rom_firing = delay_counter_is_zero && !pause_counter && !rom_prea_hold;
     wire rom_precharge_all = rom_firing && rom_is_prea;
 
     wire wb_accept = i_wb_cyc && i_wb_stb && !o_wb_stall;
@@ -1170,15 +1183,20 @@ module ddr4_controller #(
         if (ant_act_enable && !ant_bank_collision
             && !sched_activate && !sched_anticipate_pre && !ant_act_kill) begin
             sched_anticipate_act = 1'b1;
+            // tRAS: minimum time this bank must stay active before PRE
             delay_before_precharge_counter_d[stage1_next_bank] = ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
+            // tRCD (write): only-raise — don't shorten existing delay
             if (delay_before_write_counter_d[stage1_next_bank] < ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0]) begin
                 delay_before_write_counter_d[stage1_next_bank] = ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
             end
+            // tRCD (read): only-raise — don't shorten existing delay
             if (delay_before_read_counter_d[stage1_next_bank] < ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0]) begin
                 delay_before_read_counter_d[stage1_next_bank] = ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0];
             end
+            // Mark bank as open on the predicted next row
             bank_status_d[stage1_next_bank] = 1'b1;
             bank_active_row_d[stage1_next_bank] = stage1_next_row;
+            // tRRD: same-BG gets tRRD_L, different-BG gets only-raise tRRD_S
             for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
                 if (ci[BG_BITS-1:0] == stage1_next_bg) begin
                     rrd_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG[$clog2(MAX_RRD_DELAY):0];
@@ -1187,12 +1205,14 @@ module ddr4_controller #(
                     rrd_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_RRD_DELAY):0];
                 end
             end
+            // Per-bank activate delay: only-raise tRRD_S for every other bank
             for (ci = 0; ci < NUM_BANKS; ci = ci + 1) begin
                 if (ci[BG_BITS+BA_BITS-1:0] != stage1_next_bank
                     && delay_before_activate_counter_d[ci] < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0]) begin
                     delay_before_activate_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0];
                 end
             end
+            // tFAW: record this ACT in the sliding-window circular buffer
             activate_timestamp_d[activate_index_q] = TFAW_CYCLES[$clog2(TFAW_CYCLES):0];
         end
     end
@@ -1241,9 +1261,10 @@ module ddr4_controller #(
             pause_counter <= 1'b0;
             calib_state <= CALIB_IDLE;
             calib_timer <= 0;
-            calib_rr_timer <= 0;
+            calib_gap_timer <= 0;
             calib_retry_count <= 2'b00;
-            calib_act_done <= 1'b0;
+            calib_read_req <= 1'b0;
+
             o_calib_complete <= 1'b0;
             o_calib_error <= 1'b0;
             rom_cke_hold <= 1'b0;
@@ -1301,7 +1322,7 @@ module ddr4_controller #(
             // The ROM controller or scheduler overrides specific slots.
             // =============================================================
             for (bank_i = 0; bank_i < SERDES_RATIO; bank_i = bank_i + 1) begin
-                cmd_d[bank_i] <= {
+                cmd_d[bank_i] <= { // "_d" = next-state of registered o_dfi_* (registered pipeline stage for better timing closure)
                     1'b1,       //cs_n = 1 (deselected)
                     CMD_NOP,    //{act_n=1, ras_n=1, cas_n=1, we_n=1}
                     cmd_odt,    //odt (broadcast to all slots)
@@ -1318,67 +1339,82 @@ module ddr4_controller #(
             // Walks through the 36-entry ROM: power-on reset, MRS writes,
             // ZQCL, DLL lock, calibration windows, then loops the refresh
             // sequence (addrs 33-35) forever after init completes.
+            //
+            // Timing model: each ROM entry = {command, post-command delay}.
+            // On the cycle delay_counter reaches zero:
+            //   1. Current instruction's COMMAND fires on DFI (cmd_d[0])
+            //   2. Current instruction's DELAY loads into delay_counter
+            //   3. instruction_address advances to next entry
+            // Then the counter counts down before the next entry fires.
             // =============================================================
-            if (!reset_done || instruction_address >= ROM_ADDR_REF_START) begin
-                // Delay counter management
-                if (!delay_counter_is_zero) begin
-                    delay_counter <= delay_counter - 1'b1;
-                    delay_counter_is_zero <= (delay_counter == {{(DELAY_COUNTER_WIDTH-1){1'b0}}, 1'b1});
-                end else if (!pause_counter && !rom_prea_hold) begin
-                    // Issue the command from ROM on slot 0
-                    if (rom_cmd_is_mrs) begin
-                        // MRS: cs_n=0, CMD_MRS, bg/ba from MRS_SELECT, addr from instruction
-                        cmd_d[0] <= {
-                            1'b0,                        //cs_n = 0
-                            CMD_MRS,                     //{act_n=1, ras_n=0, cas_n=0, we_n=0}
-                            1'b0,                        //odt = 0
-                            1'b1,                        //cke = 1
-                            1'b1,                        //reset_n = 1
-                            1'b0, rom_instruction[22],   //bg[1:0] = {0, BG0}
-                            rom_instruction[21:20],      //ba[1:0]
-                            3'b000,                      //A16:A14 don't care for MRS
-                            rom_instruction[13:0]        //A13:A0 = MRS address
-                        };
-                    end else begin
-                        // Timer/command instruction
-                        cmd_d[0] <= {
-                            (rom_instruction[26:23] == CMD_DES) ? 1'b1 : 1'b0, //cs_n
-                            rom_instruction[26:23],      //cmd
-                            1'b0,                        //odt = 0
-                            rom_instruction[ROM_CKE],    //cke
-                            rom_instruction[ROM_RESET_N],//reset_n
-                            2'b00,                       //bg
-                            2'b00,                       //ba
-                            {6'b0, rom_instruction[ROM_A10], 10'b0} //A10 for PRE ALL, ZQCL
-                        };
-                    end
+            if (!delay_counter_is_zero) begin
+                delay_counter <= delay_counter - 1'b1;
+                delay_counter_is_zero <= (delay_counter == {{(DELAY_COUNTER_WIDTH-1){1'b0}}, 1'b1});
+            end else if (rom_firing) begin // delay counter is zero, not paused, and no hold needed before PRE ALL
+                // Issue the command from ROM on slot 0 (safe: scheduler
+                // is idle during both init and refresh-active windows)
+                if (rom_cmd_is_mrs) begin
+                    // MRS: cs_n=0, CMD_MRS, bg/ba from MRS_SELECT, addr from instruction
+                    cmd_d[0] <= {
+                        1'b0,                        //cs_n = 0
+                        CMD_MRS,                     //{act_n=1, ras_n=0, cas_n=0, we_n=0}
+                        1'b0,                        //odt = 0
+                        1'b1,                        //cke = 1
+                        1'b1,                        //reset_n = 1
+                        1'b0, rom_instruction[22],   //bg[1:0] = {0, BG0}
+                        rom_instruction[21:20],      //ba[1:0]
+                        3'b000,                      //A16:A14 don't care for MRS
+                        rom_instruction[13:0]        //A13:A0 = MRS address
+                    };
+                end else begin
+                    // Timer/command instruction
+                    // Non-MRS commands: NOP (power-on delays), PRE ALL,
+                    // REF, ZQCL, DES (deselect during init)
+                    cmd_d[0] <= {
+                        (rom_instruction[26:23] == CMD_DES) ? 1'b1 : 1'b0, //cs_n
+                        rom_instruction[26:23],      //cmd
+                        1'b0,                        //odt = 0
+                        rom_instruction[ROM_CKE],    //cke
+                        rom_instruction[ROM_RESET_N],//reset_n
+                        2'b00,                       //bg
+                        2'b00,                       //ba
+                        {6'b0, rom_instruction[ROM_A10], 10'b0} //A10 for PRE ALL, ZQCL
+                    };
+                end
 
-                    // Latch CKE/RESET_N for the duration of this ROM phase.
-                    // MRS instructions always have CKE=1, RESET_N=1.
-                    if (rom_cmd_is_mrs) begin
-                        rom_cke_hold     <= 1'b1;
-                        rom_reset_n_hold <= 1'b1;
-                    end else begin
-                        rom_cke_hold     <= rom_instruction[ROM_CKE];
-                        rom_reset_n_hold <= rom_instruction[ROM_RESET_N];
-                    end
+                // Latch CKE/RESET_N for the duration of this ROM phase.
+                // Needed because cmd_d defaults to NOP each cycle — without
+                // holding, CKE/RESET_N would revert to default 0 between firings.
+                // MRS instructions always have CKE=1, RESET_N=1.
+                if (rom_cmd_is_mrs) begin
+                    rom_cke_hold     <= 1'b1;
+                    rom_reset_n_hold <= 1'b1;
+                end else begin
+                    rom_cke_hold     <= rom_instruction[ROM_CKE];
+                    rom_reset_n_hold <= rom_instruction[ROM_RESET_N];
+                end
 
-                    // Load delay counter for timer instructions
-                    if (rom_use_timer) begin
-                        delay_counter <= rom_instruction[DELAY_COUNTER_WIDTH-1:0];
-                        delay_counter_is_zero <= (rom_instruction[DELAY_COUNTER_WIDTH-1:0] == 0);
-                    end
+                // Load post-command delay (e.g. tMRD, tRFC, tRP).
+                // This instruction already fired above; the delay holds
+                // off the next instruction until the timing is met.
+                if (rom_use_timer) begin
+                    delay_counter <= rom_instruction[DELAY_COUNTER_WIDTH-1:0];
+                    delay_counter_is_zero <= (rom_instruction[DELAY_COUNTER_WIDTH-1:0] == 0);
+                end
 
-                    // Check for RST_DONE
-                    if (rom_instruction[ROM_RST_DONE]) begin
-                        reset_done <= 1'b1;
-                    end
+                // Sticky RST_DONE: must be registered because rom_instruction
+                // changes every advance — the bit is only valid for 1 cycle.
+                if (rom_instruction[ROM_RST_DONE]) begin
+                    reset_done <= 1'b1;
+                end
 
-                    // Advance instruction address
-                    if (instruction_address == ROM_ADDR_REF_END)
-                        instruction_address <= ROM_ADDR_REF_START;
-                    else
-                        instruction_address <= instruction_address + 1'b1;
+                // Advance ROM: sequential walk, wrapping at REF_END
+                // back to REF_START to create the infinite refresh loop.
+                if (instruction_address == ROM_ADDR_REF_END) begin
+                    instruction_address <= ROM_ADDR_REF_START;
+                end
+                else begin
+                    instruction_address <= instruction_address + 1'b1;
                 end
             end
             // =============================================================
@@ -1389,119 +1425,148 @@ module ddr4_controller #(
             // tREFI idle window (between refresh commands).
             // =============================================================
             if (sched_precharge) begin
+                // PRECHARGE single bank (stage2 request that completed WR/RD)
                 cmd_d[PRECHARGE_SLOT] <= {
-                    1'b0,           //cs_n = 0
-                    CMD_PRE,        //{act_n=1, ras_n=0, cas_n=1, we_n=0}
-                    cmd_odt, 1'b1, 1'b1,  //odt, cke=1, reset_n=1
-                    stage2_bg_padded,
-                    stage2_ba,      //ba
-                    7'b0, 1'b0, 9'b0  //A10=0 (single bank precharge)
+                    1'b0,                  // [28]    cs_n = 0 (chip selected)
+                    CMD_PRE,               // [27:24] {act_n=1, ras_n=0, cas_n=1, we_n=0}
+                    cmd_odt, 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
+                    stage2_bg_padded,      // [20:19] bank group from stage2
+                    stage2_ba,             // [18:17] bank address from stage2
+                    7'b0, 1'b0, 9'b0      // [16:0]  A10=0 → single-bank (not PRE ALL)
                 };
             end
             if (sched_activate) begin
+                // ACTIVATE row (DDR4: ACT_N=0, cmd pins carry upper row bits)
                 cmd_d[ACTIVATE_SLOT] <= {
-                    1'b0,           //cs_n = 0
-                    1'b0,           //act_n = 0 (ACTIVATE)
-                    stage2_row_padded[16],  //ras_n -> A16
-                    stage2_row_padded[15],  //cas_n -> A15
-                    stage2_row_padded[14],  //we_n  -> A14
-                    cmd_odt, 1'b1, 1'b1,
-                    stage2_bg_padded,
-                    stage2_ba,
-                    stage2_row_padded  //addr[16:0] = full row address
+                    1'b0,                  // [28]    cs_n = 0 (chip selected)
+                    1'b0,                  // [27]    act_n = 0 (ACTIVATE command)
+                    stage2_row_padded[16], // [26]    RAS_N pin → row A16 (DDR4 ACT encoding)
+                    stage2_row_padded[15], // [25]    CAS_N pin → row A15 (DDR4 ACT encoding)
+                    stage2_row_padded[14], // [24]    WE_N pin  → row A14 (DDR4 ACT encoding)
+                    cmd_odt, 1'b1, 1'b1,  // [23:21] odt, cke=1, reset_n=1
+                    stage2_bg_padded,      // [20:19] bank group from stage2
+                    stage2_ba,             // [18:17] bank address from stage2
+                    stage2_row_padded      // [16:0]  full row address (PHY uses A[13:0])
                 };
             end
             if (sched_write) begin
+                // WRITE to open row (column address on addr bus)
                 cmd_d[WRITE_SLOT] <= {
-                    1'b0,           //cs_n = 0
-                    CMD_WR,         //{act_n=1, ras_n=1, cas_n=0, we_n=0}
-                    cmd_odt, 1'b1, 1'b1,
-                    stage2_bg_padded, 
-                    stage2_ba,
-                    3'b000,         //A16:A14
-                    1'b0,           //A13
-                    1'b0,           //A12 (BL8, no BC4)
-                    (COL_BITS > 10) ? stage2_col[10] : 1'b0, //A11: col[10] for x4
-                    1'b0,           //A10 = 0 (no auto-precharge)
-                    stage2_col[9:0] //A9:A0 = column
+                    1'b0,                  // [28]    cs_n = 0 (chip selected)
+                    CMD_WR,                // [27:24] {act_n=1, ras_n=1, cas_n=0, we_n=0}
+                    cmd_odt, 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
+                    stage2_bg_padded,      // [20:19] bank group from stage2
+                    stage2_ba,             // [18:17] bank address from stage2
+                    3'b000,                // [16:14] A16:A14 = 0 (unused for col cmds)
+                    1'b0,                  // [13]    A13 = 0 (reserved)
+                    1'b0,                  // [12]    A12 = 0 (BL8 mode, not BC4)
+                    (COL_BITS > 10) ? stage2_col[10] : 1'b0, // [11] A11: col[10] for x4 devices
+                    1'b0,                  // [10]    A10 = 0 (no auto-precharge)
+                    stage2_col[9:0]        // [9:0]   A9:A0 = column address
                 };
             end
             if (sched_read) begin
+                // READ from open row (column address on addr bus)
                 cmd_d[READ_SLOT] <= {
-                    1'b0,           //cs_n = 0
-                    CMD_RD,         //{act_n=1, ras_n=1, cas_n=0, we_n=1}
-                    cmd_odt, 1'b1, 1'b1,
-                    stage2_bg_padded, 
-                    stage2_ba,
-                    3'b000,         //A16:A14
-                    1'b0,           //A13
-                    1'b0,           //A12 (BL8, no BC4)
-                    (COL_BITS > 10) ? stage2_col[10] : 1'b0, //A11: col[10] for x4
-                    1'b0,           //A10 = 0 (no auto-precharge)
-                    stage2_col[9:0] //A9:A0 = column
+                    1'b0,                  // [28]    cs_n = 0 (chip selected)
+                    CMD_RD,                // [27:24] {act_n=1, ras_n=1, cas_n=0, we_n=1}
+                    cmd_odt, 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
+                    stage2_bg_padded,      // [20:19] bank group from stage2
+                    stage2_ba,             // [18:17] bank address from stage2
+                    3'b000,                // [16:14] A16:A14 = 0 (unused for col cmds)
+                    1'b0,                  // [13]    A13 = 0 (reserved)
+                    1'b0,                  // [12]    A12 = 0 (BL8 mode, not BC4)
+                    (COL_BITS > 10) ? stage2_col[10] : 1'b0, // [11] A11: col[10] for x4 devices
+                    1'b0,                  // [10]    A10 = 0 (no auto-precharge)
+                    stage2_col[9:0]        // [9:0]   A9:A0 = column address
                 };
             end
             if (sched_anticipate_pre) begin
+                // Anticipatory PRECHARGE (stage1 lookahead — next request's bank)
                 cmd_d[PRECHARGE_SLOT] <= {
-                    1'b0,           //cs_n = 0
-                    CMD_PRE,        //{act_n=1, ras_n=0, cas_n=1, we_n=0}
-                    cmd_odt, 1'b1, 1'b1,
-                    stage1_next_bg_padded,
-                    stage1_next_bank[BA_BITS-1:0],
-                    7'b0, 1'b0, 9'b0  //A10=0 (single bank precharge)
+                    1'b0,                  // [28]    cs_n = 0 (chip selected)
+                    CMD_PRE,               // [27:24] {act_n=1, ras_n=0, cas_n=1, we_n=0}
+                    cmd_odt, 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
+                    stage1_next_bg_padded, // [20:19] bank group from stage1 lookahead
+                    stage1_next_bank[BA_BITS-1:0], // [18:17] bank addr from stage1
+                    7'b0, 1'b0, 9'b0      // [16:0]  A10=0 → single-bank (not PRE ALL)
                 };
             end
             if (sched_anticipate_act) begin
+                // Anticipatory ACTIVATE (stage1 lookahead — next request's row)
                 cmd_d[ACTIVATE_SLOT] <= {
-                    1'b0,           //cs_n = 0
-                    1'b0,           //act_n = 0 (ACTIVATE)
-                    stage1_next_row_padded[16],
-                    stage1_next_row_padded[15],
-                    stage1_next_row_padded[14],
-                    cmd_odt, 1'b1, 1'b1,
-                    stage1_next_bg_padded,
-                    stage1_next_bank[BA_BITS-1:0],
-                    stage1_next_row_padded
+                    1'b0,                       // [28]    cs_n = 0 (chip selected)
+                    1'b0,                       // [27]    act_n = 0 (ACTIVATE command)
+                    stage1_next_row_padded[16], // [26]    RAS_N pin → row A16
+                    stage1_next_row_padded[15], // [25]    CAS_N pin → row A15
+                    stage1_next_row_padded[14], // [24]    WE_N pin  → row A14
+                    cmd_odt, 1'b1, 1'b1,       // [23:21] odt, cke=1, reset_n=1
+                    stage1_next_bg_padded,      // [20:19] bank group from stage1
+                    stage1_next_bank[BA_BITS-1:0], // [18:17] bank addr from stage1
+                    stage1_next_row_padded      // [16:0]  full row address
                 };
             end
 
             // ===========================================================
-            // Read/Write Data Enable Pipelines + WB ACK
-            // Shift registers track when dfi_rddata_en / dfi_wrdata_en
-            // should assert after a READ / WRITE command. WB ACK is
-            // generated from write command issue and dfi_rddata_valid.
+            // Write/Read Data Timing Pipelines
+            //
+            // The DRAM needs write data to arrive exactly CWL clocks
+            // after the WR command, and the PHY needs a "heads up"
+            // (rddata_en) exactly CL clocks after a RD command.
+            //
+            // These shift registers act as countdown timers:
+            //
+            //   Cycle 0 (WR fires):  [3]=1  [2]=0  [1]=0  [0]=0
+            //   Cycle 1 (shift):     [3]=0  [2]=1  [1]=0  [0]=0
+            //   Cycle 2 (shift):     [3]=0  [2]=0  [1]=1  [0]=0
+            //   Cycle 3 (output!):   [3]=0  [2]=0  [1]=0  [0]=1 → DFI
+            //
+            // The data pipeline works identically but carries the
+            // 128-bit write data instead of a 1-bit flag.
+            //
+            // Why "shift first, then load" instead of if/else?
+            //   Back-to-back writes: write_A may be at [1] while
+            //   write_B enters at [3]. Both coexist in the same pipe.
+            //   "else" would stop write_A from shifting when B loads.
+            //
+            // Area cost: WRITE_DATA_DELAY ≈ 3 for DDR4-2400, so the
+            // data pipe is just 4 × 128 bits = 512 flops (negligible).
             // ===========================================================
 
-            // Write data enable shift register
-            wrdata_en_pipe_q <= {1'b0, wrdata_en_pipe_q[WRITE_DATA_DELAY:1]};
-            if (sched_write)
-                wrdata_en_pipe_q[WRITE_DATA_DELAY] <= 1'b1;
-            o_dfi_wrdata_en <= {SERDES_RATIO{wrdata_en_pipe_q[0]}};
+            // --- Write enable: tells PHY when to drive DQ/DQS ---
+            wrdata_en_pipe_q <= {1'b0, wrdata_en_pipe_q[WRITE_DATA_DELAY:1]}; // shift right
+            if (sched_write) begin
+                wrdata_en_pipe_q[WRITE_DATA_DELAY] <= 1'b1; // inject '1' at far end
+            end
+            o_dfi_wrdata_en <= {SERDES_RATIO{wrdata_en_pipe_q[0]}}; // output when '1' reaches [0]
 
-            // Write data delay pipeline -- mirrors wrdata_en_pipe_q
-            // shift structure: right-shift, load at [WD], read at [0].
+            // --- Write data/mask: same shift, carries actual payload ---
             for (bank_i = 0; bank_i < WRITE_DATA_DELAY; bank_i = bank_i + 1) begin
-                wr_data_pipe_q[bank_i] <= wr_data_pipe_q[bank_i + 1];
+                wr_data_pipe_q[bank_i] <= wr_data_pipe_q[bank_i + 1]; // shift right
                 wr_dm_pipe_q[bank_i]   <= wr_dm_pipe_q[bank_i + 1];
             end
-            wr_data_pipe_q[WRITE_DATA_DELAY] <= {WB_DATA_BITS{1'b0}};
+            wr_data_pipe_q[WRITE_DATA_DELAY] <= {WB_DATA_BITS{1'b0}}; // default: zero at far end
             wr_dm_pipe_q[WRITE_DATA_DELAY]   <= {WB_SEL_BITS{1'b0}};
             if (sched_write) begin
-                wr_data_pipe_q[WRITE_DATA_DELAY] <= stage2_data;
+                wr_data_pipe_q[WRITE_DATA_DELAY] <= stage2_data; // override: load real data
                 wr_dm_pipe_q[WRITE_DATA_DELAY]   <= stage2_dm;
             end
-            o_dfi_wrdata      <= wr_data_pipe_q[0];
-            o_dfi_wrdata_mask <= ~wr_dm_pipe_q[0];
+            o_dfi_wrdata      <= wr_data_pipe_q[0]; // output when data reaches [0]
+            o_dfi_wrdata_mask <= ~wr_dm_pipe_q[0];  // DFI mask is active-high (inverted from WB sel)
 
-            // Read data enable shift register
-            rddata_en_pipe_q <= {1'b0, rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1:1]};
-            if (sched_read)
-                rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
-            o_dfi_rddata_en <= {SERDES_RATIO{rddata_en_pipe_q[0]}};
+            // --- Read enable: tells PHY when to expect return data ---
+            rddata_en_pipe_q <= {1'b0, rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1:1]}; // shift right
+            if (sched_read) begin
+                rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1; // inject '1' at far end
+            end
+            o_dfi_rddata_en <= {SERDES_RATIO{rddata_en_pipe_q[0]}}; // output when '1' reaches [0]
 
-            // Read data capture from DFI
-            if (|i_dfi_rddata_valid)
+            // --- Read data capture: latch data when PHY says it's valid ---
+            // 4 bits wide because DFI has one valid flag per phase (SERDES_RATIO=4).
+            // For BL8, all 4 phases return data together, so OR-reduce works.
+            if (|i_dfi_rddata_valid) begin
                 o_wb_data <= i_dfi_rddata;
+            end
 
             // WB ACK generation
             // Write ACK: 1 cycle after WR command issues
@@ -1511,203 +1576,248 @@ module ddr4_controller #(
 
             // ===========================================================
             // Training Command Pump (DFI 3.1 Full Training Mode)
-            // MC-side calibration FSM: drives DFI training enables and
-            // pumps READ commands / wrlvl strobes during calibration
-            // windows opened by the init ROM (addrs 22, 27). The pump
-            // takes over cmd_d directly while pause_counter is held.
-            // See the training FSM states above.
+            //
+            // WHY: After DDR4 init completes (MRS writes, ZQCL, DLL
+            // lock), the PHY still doesn't know the correct timing to
+            // sample read data or align write DQS to CK. Training
+            // teaches the PHY these timings by having the MC repeatedly
+            // issue known-pattern READ commands or write-leveling strobes 
+            // while the PHY adjusts its internal delays.
+            //
+            // HOW IT WORKS:
+            //   1. The init ROM walks to a calibration window (addr 22
+            //      for reads, addr 27 for writes) then stalls.
+            //   2. This FSM detects the stall, asserts pause_counter
+            //      (freezing the ROM), and takes over cmd_d directly.
+            //   3. It asserts the DFI training enable (rdlvl_gate_en,
+            //      rdlvl_en, or wrlvl_en) to tell the PHY "start
+            //      adjusting your delays."
+            //   4. It pumps READ commands (or wrlvl strobes) every
+            //      T_RDLVL_RR (or T_WRLVL_WW) cycles — the PHY
+            //      observes the returning data to tune its delays.
+            //   5. When the PHY finishes (all bits of rdlvl_resp or
+            //      wrlvl_resp go high), training is done.
+            //   6. The FSM releases pause_counter, and the ROM resumes.
+            //
+            // THREE PHASES (in order):
+            //   Gate training:  PHY learns WHEN the read-valid window
+            //                   opens (DQS gate timing).
+            //   Eye training:   PHY centres its sampling clock within
+            //                   the data eye for maximum margin.
+            //   Write leveling: PHY aligns DQS edges to CK at the DRAM
+            //                   (compensates PCB flight-time skew).
+            //
+            // TIMERS:
+            //   calib_timer    — overall timeout (loaded with T_RDLVL_MAX
+            //                    or T_WRLVL_MAX). If it hits zero before
+            //                    PHY responds, the FSM retries or errors.
+            //   calib_gap_timer — minimum gap between commands. Loaded with:
+            //                      T_RDLVL_EN  (enable → first cmd)
+            //                      T_RDLVL_RR  (READ → READ spacing)
+            //                      T_WRLVL_EN  (enable → first strobe)
+            //                      T_WRLVL_WW  (strobe → strobe spacing)
             // ===========================================================
             begin
-                if (calib_timer != 0)
+                // calib_timer continues to decrement to 0
+                if (calib_timer != 0) begin
                     calib_timer <= calib_timer - 1'b1;
-                if (calib_rr_timer != 0)
-                    calib_rr_timer <= calib_rr_timer - 1'b1;
+                end
+                // calib_gap_timer continues to decrement to 0
+                if (calib_gap_timer != 0) begin
+                    calib_gap_timer <= calib_gap_timer - 1'b1;
+                end
+                // Self-clearing pulse — set by FSM, fires READ one cycle later
+                calib_read_req <= 1'b0;
 
                 case (calib_state)
+                    // Wait for ROM to reach the read-calibration window
+                    // (ROM addr 22). Pause the ROM immediately to prevent
+                    // it from advancing past the window, then wait for the
+                    // PHY to signal readiness (DFI 3.1 section 4.1: MC must 
+                    // not start training until dfi_init_complete is asserted).
                     CALIB_IDLE: begin
-                        if (instruction_address == ROM_ADDR_RD_CAL
-                            && delay_counter_is_zero
-                            && i_dfi_init_complete) begin
+                        if (instruction_address == ROM_ADDR_RD_CAL) begin
+                            // Freeze ROM so it can't advance past the
+                            // calibration window while we wait for PHY.
                             pause_counter <= 1'b1;
-                            calib_state <= CALIB_GATE_EN;
-                            calib_rr_timer <= T_RDLVL_EN[$clog2(T_WRLVL_WW):0];
+                            if (i_dfi_init_complete) begin
+                                calib_state <= CALIB_GATE_EN;
+                                calib_gap_timer <= T_RDLVL_EN;
+                            end
                         end
                     end
 
+                    // Assert gate training enable to PHY. Wait T_RDLVL_EN
                     CALIB_GATE_EN: begin
                         o_dfi_rdlvl_gate_en <= 1'b1;
-                        if (calib_rr_timer == 0) begin
+                        if (calib_gap_timer == 0) begin
                             calib_state <= CALIB_GATE_READ;
-                            calib_timer <= T_RDLVL_MAX[$clog2(T_RDLVL_MAX):0];
+                            calib_timer <= T_RDLVL_MAX;
                         end
                     end
 
+                    // Issue first training READ. No ACTIVATE needed —
+                    // JESD79-4D 4.10.1: only MRS/RD/WR/DES/REF allowed in
+                    // MPR mode. MPR data comes from internal registers,
+                    // not the array, so no row needs to be open.
+                    // DRAM returns known 01010101 pattern (MPR page 0).
                     CALIB_GATE_READ: begin
-                        if (!calib_act_done) begin
-                            // ACT BG0/BA0/row0 before first training READ
-                            cmd_d[ACTIVATE_SLOT] <= {
-                                1'b0, 1'b0, 3'b000,
-                                cmd_odt, 1'b1, 1'b1,
-                                2'b00, 2'b00, 17'b0
-                            };
-                            calib_act_done <= 1'b1;
-                            calib_rr_timer <=
-                                ACTIVATE_TO_READ_DELAY[$clog2(T_WRLVL_WW):0];
-                        end else if (calib_rr_timer == 0) begin
-                            cmd_d[READ_SLOT] <= {
-                                1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
-                                2'b00, 2'b00, 17'b0
-                            };
-                            rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
-                            calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
+                        if (calib_gap_timer == 0) begin
+                            calib_read_req <= 1'b1;
+                            calib_gap_timer <= T_RDLVL_RR;
                             calib_state <= CALIB_GATE_WAIT;
                         end
                     end
 
+                    // Keep pumping READs every T_RDLVL_RR cycles until
+                    // PHY responds (rdlvl_resp=all 1s) or timeout expires.
+                    // On timeout: retry (back to GATE_EN) or give up.
+                    // T_RDLVL_MAX=4096 is sufficient: PHY trains ALL byte
+                    // lanes in parallel (not sequentially), so lane count
+                    // doesn't increase training time. With T_RDLVL_RR=16,
+                    // the MC issues ~256 READs per attempt — well above the
+                    // ~64-128 taps a typical PHY needs to sweep. Retries
+                    // (CALIB_RETRY_MAX=3) provide further safety margin.
                     CALIB_GATE_WAIT: begin
-                        if (calib_timer == 0) begin
-                            if (calib_retry_count < CALIB_RETRY_MAX) begin
+                        if (calib_timer == 0) begin // T_RDLVL_MAX expired
+                            // CALIB_RETRY_MAX is not yet exceed so repeat gate training
+                            if (calib_retry_count < CALIB_RETRY_MAX) begin 
                                 calib_retry_count <= calib_retry_count + 1'b1;
                                 calib_state <= CALIB_GATE_EN;
-                                calib_rr_timer <=
-                                    T_RDLVL_EN[$clog2(T_WRLVL_WW):0];
-                            end else
+                                calib_gap_timer <= T_RDLVL_EN;
+                            end else begin // CALIB_RETRY_MAX is now exceeded so stop
                                 calib_state <= CALIB_ERROR;
-                        end else if (&i_dfi_rdlvl_resp) begin
+                            end
+                        end else if (&i_dfi_rdlvl_resp) begin // all byte lanes are done
                             calib_state <= CALIB_GATE_EXIT;
-                        end else if (calib_rr_timer == 0) begin
-                            cmd_d[READ_SLOT] <= {
-                                1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
-                                2'b00, 2'b00, 17'b0
-                            };
-                            rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
-                            calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
+                        end else if (calib_gap_timer == 0) begin // re-issue READ
+                            calib_read_req <= 1'b1;
+                            calib_gap_timer <= T_RDLVL_RR;
                         end
                     end
 
+                    // Gate training done. De-assert enable, reset retry counter, proceed to read eye training.
                     CALIB_GATE_EXIT: begin
                         o_dfi_rdlvl_gate_en <= 1'b0;
                         calib_state <= CALIB_EYE_EN;
-                        calib_rr_timer <= T_RDLVL_EN[$clog2(T_WRLVL_WW):0];
+                        calib_gap_timer <= T_RDLVL_EN;
                         calib_retry_count <= 2'b00;
                     end
 
+                    // Assert eye training enable.
                     CALIB_EYE_EN: begin
                         o_dfi_rdlvl_en <= 1'b1;
-                        if (calib_rr_timer == 0) begin
+                        if (calib_gap_timer == 0) begin
                             calib_state <= CALIB_EYE_READ;
-                            calib_timer <= T_RDLVL_MAX[$clog2(T_RDLVL_MAX):0];
+                            calib_timer <= T_RDLVL_MAX;
                         end
                     end
 
+                    // Issue first eye-training READ (same MPR pattern).
                     CALIB_EYE_READ: begin
-                        // bank already activated from gate training
-                        cmd_d[READ_SLOT] <= {
-                            1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
-                            2'b00, 2'b00, 17'b0
-                        };
-                        rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
-                        calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
+                        calib_read_req <= 1'b1;
+                        calib_gap_timer <= T_RDLVL_RR;
                         calib_state <= CALIB_EYE_WAIT;
                     end
 
+                    // Pump READs until PHY centres its sampling clock
+                    // (rdlvl_resp=all 1s) or timeout → retry/error.
                     CALIB_EYE_WAIT: begin
-                        if (calib_timer == 0) begin
+                        if (calib_timer == 0) begin // T_RDLVL_MAX expired
+                            // CALIB_RETRY_MAX is not yet exceed so repeat read eye training
                             if (calib_retry_count < CALIB_RETRY_MAX) begin
                                 calib_retry_count <= calib_retry_count + 1'b1;
                                 calib_state <= CALIB_EYE_EN;
-                                calib_rr_timer <=
-                                    T_RDLVL_EN[$clog2(T_WRLVL_WW):0];
-                            end else
+                                calib_gap_timer <= T_RDLVL_EN;
+                            end else begin // CALIB_RETRY_MAX is now exceeded SO STOP
                                 calib_state <= CALIB_ERROR;
-                        end else if (&i_dfi_rdlvl_resp) begin
+                            end
+                        end else if (&i_dfi_rdlvl_resp) begin // all byte lanes are done
                             calib_state <= CALIB_EYE_EXIT;
-                        end else if (calib_rr_timer == 0) begin
-                            cmd_d[READ_SLOT] <= {
-                                1'b0, CMD_RD, cmd_odt, 1'b1, 1'b1,
-                                2'b00, 2'b00, 17'b0
-                            };
-                            rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
-                            calib_rr_timer <= T_RDLVL_RR[$clog2(T_WRLVL_WW):0];
+                        end else if (calib_gap_timer == 0) begin // re-issue READ
+                            calib_read_req <= 1'b1;
+                            calib_gap_timer <= T_RDLVL_RR;
                         end
                     end
-
+                    // Eye training done.
+                    // Release pause_counter so ROM resumes (disables MPR
+                    // via MR3, then walks to write-leveling window at 27).
+                    // Re-pause when ROM reaches addr 27 for WL phase.
                     CALIB_EYE_EXIT: begin
                         o_dfi_rdlvl_en <= 1'b0;
-                        if (calib_act_done) begin
-                            // precharge BG0/BA0 before ROM issues MRS
-                            cmd_d[PRECHARGE_SLOT] <= {
-                                1'b0, CMD_PRE, cmd_odt, 1'b1, 1'b1,
-                                2'b00, 2'b00,
-                                7'b0, 1'b0, 9'b0
-                            };
-                            calib_act_done <= 1'b0;
-                            calib_rr_timer <=
-                                PRECHARGE_TO_ACTIVATE_DELAY[$clog2(T_WRLVL_WW):0];
-                        end else if (calib_rr_timer == 0 && pause_counter) begin
-                            pause_counter <= 1'b0;
-                        end
-                        // wait for ROM to reach write leveling window
-                        if (instruction_address == ROM_ADDR_WL_CAL
-                            && delay_counter_is_zero && !pause_counter) begin
+                        if (instruction_address == ROM_ADDR_WL_CAL) begin
+                            // ROM reached WL trigger so freeze it and
+                            // begin write leveling phase.
                             pause_counter <= 1'b1;
                             calib_state <= CALIB_WL_EN;
-                            calib_rr_timer <= T_WRLVL_EN[$clog2(T_WRLVL_WW):0];
+                            calib_gap_timer <= T_WRLVL_EN;
                             calib_retry_count <= 2'b00;
+                        end else begin
+                            // ROM still advancing (22→27).
+                            pause_counter <= 1'b0;
                         end
                     end
 
+                    // Assert wrlvl_en — DRAM is already in WL mode
+                    // (ROM addr 25 wrote MR1 with A7=1). Wait for PHY.
                     CALIB_WL_EN: begin
                         o_dfi_wrlvl_en <= 1'b1;
-                        if (calib_rr_timer == 0) begin
+                        if (calib_gap_timer == 0) begin
                             calib_state <= CALIB_WL_STROBE;
-                            calib_timer <= T_WRLVL_MAX[$clog2(T_RDLVL_MAX):0];
+                            calib_timer <= T_WRLVL_MAX;
                         end
                     end
 
+                    // Pulse wrlvl_strobe once — PHY drives DQS, DRAM
+                    // samples CK and returns 0 or 1 on DQ to indicate
+                    // whether DQS edge is before or after CK edge.
                     CALIB_WL_STROBE: begin
                         o_dfi_wrlvl_strobe <= 1'b1;
-                        calib_rr_timer <= T_WRLVL_WW[$clog2(T_WRLVL_WW):0];
+                        calib_gap_timer <= T_WRLVL_WW;
                         calib_state <= CALIB_WL_WAIT;
                     end
 
+                    // De-assert strobe, keep pulsing every T_WRLVL_WW
+                    // until PHY finds the 0→1 transition (wrlvl_resp=
+                    // all-1) or timeout → retry/error.
                     CALIB_WL_WAIT: begin
                         o_dfi_wrlvl_strobe <= 1'b0;
-                        if (calib_timer == 0) begin
+                        if (calib_timer == 0) begin // T_WRLVL_MAX expired
+                            // CALIB_RETRY_MAX is not yet exceed so repeat gate training
                             if (calib_retry_count < CALIB_RETRY_MAX) begin
                                 calib_retry_count <= calib_retry_count + 1'b1;
                                 calib_state <= CALIB_WL_EN;
-                                calib_rr_timer <=
-                                    T_WRLVL_EN[$clog2(T_WRLVL_WW):0];
-                            end else
+                                calib_gap_timer <= T_WRLVL_EN;
+                            end else begin // CALIB_RETRY_MAX is now exceeded so stop
                                 calib_state <= CALIB_ERROR;
-                        end else if (&i_dfi_wrlvl_resp) begin
+                            end
+                        end else if (&i_dfi_wrlvl_resp) begin // all byte lanes are done
                             calib_state <= CALIB_WL_EXIT;
-                        end else if (calib_rr_timer == 0) begin
+                        end else if (calib_gap_timer == 0) begin // reissue write strobe
                             o_dfi_wrlvl_strobe <= 1'b1;
-                            calib_rr_timer <=
-                                T_WRLVL_WW[$clog2(T_WRLVL_WW):0];
+                            calib_gap_timer <= T_WRLVL_WW;
                         end
                     end
 
+                    // Write leveling done. Release ROM so it finishes
+                    // init (MR1 WL off, final REF, reset_done).
+                    // Once reset_done asserts → CALIB_DONE.
                     CALIB_WL_EXIT: begin
                         o_dfi_wrlvl_en <= 1'b0;
                         o_dfi_wrlvl_strobe <= 1'b0;
-                        if (!pause_counter) begin
-                            // already released -- wait for init to finish
-                            if (reset_done) begin
-                                calib_state <= CALIB_DONE;
-                                o_calib_complete <= 1'b1;
-                            end
-                        end else begin
-                            pause_counter <= 1'b0;
+                        pause_counter <= 1'b0;
+                        if (reset_done) begin
+                            calib_state <= CALIB_DONE;
+                            o_calib_complete <= 1'b1;
                         end
                     end
 
+                    // All training complete — controller is ready for wishbone traffic.
                     CALIB_DONE: begin
                         o_calib_complete <= 1'b1;
                     end
 
+                    // Training failed after all retries — fatal, needs reset.
                     CALIB_ERROR: begin
                         o_calib_error <= 1'b1;
                     end
@@ -1716,6 +1826,23 @@ module ddr4_controller #(
                         calib_state <= CALIB_ERROR;
                     end
                 endcase
+
+                // Training READ handler — fires one cycle after FSM
+                // sets calib_read_req. Single point of cmd_d construction
+                // for all read-training states (gate + eye).
+                if (calib_read_req) begin
+                    cmd_d[READ_SLOT] <= {
+                        1'b0,       // cs_n=0: chip selected
+                        CMD_RD,     // {act_n, ras_n, cas_n, we_n} = READ
+                        cmd_odt,    // ODT (always 0 during training)
+                        1'b1,       // CKE held high
+                        1'b1,       // RESET_N held high
+                        2'b00,      // BG[1:0] = 0 (don't-care for MPR)
+                        2'b00,      // BA[1:0] = 0 (MPR location 0)
+                        17'b0       // addr[16:0] = 0 (don't-care for MPR)
+                    };
+                    rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
+                end
             end
 
             // ===========================================================
@@ -1736,15 +1863,17 @@ module ddr4_controller #(
                 wtr_counter_q[bank_i] <= wtr_counter_d[bank_i];
                 rrd_counter_q[bank_i] <= rrd_counter_d[bank_i];
             end
-            for (bank_i = 0; bank_i < 4; bank_i = bank_i + 1)
+            for (bank_i = 0; bank_i < 4; bank_i = bank_i + 1) begin
                 activate_timestamp_q[bank_i] <= activate_timestamp_d[bank_i];
+            end
 
             // tFAW index advance on any ACT issue (scheduler or anticipation)
-            if (sched_activate || sched_anticipate_act)
+            if (sched_activate || sched_anticipate_act) begin
                 activate_index_q <= activate_index_q + 1'b1;
+            end
 
             // Stage 1->2 handoff: zero-bubble pipeline
-            // stage2_update=1 when Stage 2 idle OR just issued WR/RD (completing).
+            // stage2_update=1 when Stage 2 idle OR just issued WR/RD this cycle.
             // Consume Stage 1's request immediately -- no wasted cycles.
             if (stage2_update) begin
                 if (stage1_pending) begin
@@ -1803,20 +1932,39 @@ module ddr4_controller #(
     // 36 addresses (0-35): init sequence + calibration windows + refresh loop
     // ==============================================================
 
+    // Pack a timed ROM entry: issues 'cmd' with control lines 'ctl'
+    // (CKE/RESET_N encoding), then waits 'timer' DFI cycles before
+    // the next instruction fires. 
     function [31:0] rom_timer(input [4:0] ctl, input [3:0] cmd, input integer timer);
-        rom_timer = {ctl, cmd, 3'b000, timer[19:0]};
+        rom_timer = {ctl[4:0], cmd[3:0], 3'b000, timer[19:0]};
     endfunction
 
+    // Pack an MRS (Mode Register Set) ROM entry: selects MR bank via
+    // mrs_sel[2:0] (BG0+BA[1:0]) and programs mrs_addr[13:0] into the
+    // DRAM mode register. Delay is implicit (tMRD/tMOD from next entry).
     function [31:0] rom_mrs(input [2:0] mrs_sel, input [13:0] mrs_addr);
-        rom_mrs = {2'b00, mrs_addr[10], 2'b11, CMD_MRS, mrs_sel, 6'b0, mrs_addr};
+        rom_mrs = {2'b00, mrs_addr[10], 2'b11, CMD_MRS, mrs_sel[2:0], 6'b0, mrs_addr[13:0]};
     endfunction
 
+    // ROM lookup table: maps instruction address (0-35) to a 32-bit
+    // encoded command. The ROM controller sequences through these
+    // entries to perform JEDEC DDR4 initialization, calibration
+    // trigger points, and the periodic refresh loop.
+    // Bit fields per entry:
+    //   [31]    RST_DONE         — assert reset_done (init complete flag)
+    //   [30]    USE_TIMER        — lower 20 bits are a delay count
+    //   [29]    A10              — address bit 10 (PRE ALL / ZQCL select)
+    //   [28]    CKE              — clock enable to DRAM
+    //   [27]    RESET_N          — reset_n to DRAM
+    //   [26:23] CMD[3:0]         — command opcode {act_n, ras_n, cas_n, we_n}
+    //   [22:20] MRS_SELECT[2:0]  — bank group + bank addr for MRS commands
+    //   [19:0]  TIMER/ADDR[19:0] — delay cycle count, or MRS address bits
     function [31:0] read_rom_instruction(input [5:0] addr);
         case (addr)
             // -- Power-on reset (JESD79-4D Figure 7) --
             6'd0:  read_rom_instruction = rom_timer(CTL_CKE0_RST0, CMD_NOP, ps_to_cycles(POWER_ON_RESET_HIGH_ps)); // RESET_n=0, CKE=0, wait >=200us
             6'd1:  read_rom_instruction = rom_timer(CTL_CKE0_RST1, CMD_NOP, ps_to_cycles(INITIAL_CKE_LOW_ps));     // RESET_n=1, CKE=0, wait >=500us
-            6'd2:  read_rom_instruction = rom_timer(CTL_TIMER,      CMD_DES, ps_to_cycles(tXPR_ps));                // CKE=1, deselect, wait tXPR
+            6'd2:  read_rom_instruction = rom_timer(CTL_TIMER,     CMD_DES, ps_to_cycles(tXPR_ps));                // CKE=1, deselect, wait tXPR
 
             // -- Mode register writes (MR3->MR6->MR5->MR4->MR2->MR1->MR0) --
             6'd3:  read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_DIS);                          // MR3: MPR off
@@ -1832,21 +1980,21 @@ module ddr4_controller #(
             6'd13: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_DIS);                           // MR1: DLL on, drive, RTT_NOM, WL off
             6'd14: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tMRD_nCK)); // wait tMRD
             6'd15: read_rom_instruction = rom_mrs  (MRS_MR0, MR0);                                  // MR0: BL8, CL, DLL reset, WR
-            6'd16: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));    // wait tMOD
+            6'd16: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));   // wait tMOD
 
             // -- ZQCL + DLL lock --
             6'd17: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_ZQCL, nCK_to_cycles(tZQinit_nCK)); // ZQCL (A10=1), wait tZQinit
             6'd18: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tDLLK_nCK));    // wait tDLLK (DLL lock)
             6'd19: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));        // PRE ALL (A10=1), wait tRP
 
-            // -- Read calibration window (MPR mode, JESD79-4D) --
+            // -- Read calibration window (JESD79-4D section 4.10.3 "MPR Reads") --
             6'd20: read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_EN);                              // MR3: MPR enable (A2=1)
             6'd21: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));    // wait tMOD
             6'd22: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, 0);                        // read leveling trigger (pause_counter gates ROM) (ROM_ADDR_RD_CAL)
             6'd23: read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_DIS);                             // MR3: MPR disable
             6'd24: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));    // wait tMOD
 
-            // -- Write leveling window (JESD79-4D) --
+            // -- Write leveling window (JESD79-4D §4.7 "Write Leveling") --
             6'd25: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_EN);                               // MR1: write leveling on (A7=1)
             6'd26: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tWLMRD_nCK)); // wait tWLMRD
             6'd27: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, 0);                        // write leveling trigger (pause_counter gates ROM) (ROM_ADDR_WL_CAL)
@@ -2000,18 +2148,17 @@ module ddr4_controller #(
         nCK_to_cycles = (nck + SERDES_RATIO - 1) / SERDES_RATIO;
     endfunction
 
-    // find_delay: slot-aware delay counter value for DFI 3.1 4-phase packing.
-    // Returns the value to load into a per-bank delay counter such that
-    // the DDR gap between a command in start_slot and a command in end_slot
-    // meets or exceeds delay_nCK DDR clock cycles.
+    // Compute the delay counter value needed to enforce a minimum gap
+    // of 'delay_nCK' DDR cycles between two commands that land on
+    // different DFI slots (4 slots per controller cycle).
     //
-    // UberDDR3 uses registered eligibility (counter_d==0 -> register -> fire next cycle),
-    // giving gap = 4*(k+1) + end_slot - start_slot for k >= 0.
-    // UberDDR4 fires directly when counter_q <= 1 (no registered pipeline), giving:
-    //   k=0 : fire at M+1, gap = 4 + end_slot - start_slot
-    //   k>=2: fire at M+k, gap = 4*k + end_slot - start_slot
-    //   (k=1 fires at M+1, same as k=0 due to <= 1 check)
-    // So for k >= 1 returned by the DDR3-style formula, we add 1 to compensate.
+    // Example: CL=16, READ on slot 0, next READ also on slot 0.
+    //   find_delay(16, 0, 0) returns the counter load value such that
+    //   the scheduler won't fire the second READ until >=16 nCK later.
+    //
+    // The +1 adjustment (if k>0) accounts for the controller's
+    // "fire when counter_q <= 1" optimization (1-cycle earlier than
+    // a naive counter==0 check).
     function integer find_delay(input integer delay_nCK, input [1:0] start_slot, input [1:0] end_slot);
         integer k;
         begin
@@ -2062,8 +2209,9 @@ module ddr4_controller #(
             anticipate_activate_slot[1:0] = slot_number[1:0];
             // resolve collisions with data slots
             while (anticipate_activate_slot[1:0] == write_slot[1:0] ||
-                   anticipate_activate_slot[1:0] == read_slot[1:0])
+                   anticipate_activate_slot[1:0] == read_slot[1:0]) begin
                 anticipate_activate_slot[1:0] = anticipate_activate_slot[1:0] - 1'b1;
+            end
 
             // Precharge slot: first remaining slot
             anticipate_precharge_slot = 0;

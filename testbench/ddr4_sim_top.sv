@@ -970,12 +970,12 @@ module ddr4_sim_top;
     always @(posedge controller_clk) if (reset_done_seen) cycle_count = cycle_count + 1;
 
     integer phase_n_start, phase_n_end;
-    integer phase_o_start, phase_o_end;
+    integer phase_o_start, phase_o_end, phase_o_wr_count;
     integer phase_q_start, phase_q_end;
     integer phase_n_wr_start, phase_o_wr_start, phase_q_wr_start;
     initial begin
         phase_n_start = 0; phase_n_end = 0;
-        phase_o_start = 0; phase_o_end = 0;
+        phase_o_start = 0; phase_o_end = 0; phase_o_wr_count = 0;
         phase_q_start = 0; phase_q_end = 0;
         phase_n_wr_start = 0; phase_o_wr_start = 0; phase_q_wr_start = 0;
     end
@@ -1111,6 +1111,7 @@ module ddr4_sim_top;
         reg [WB_DATA_BITS-1:0] captured;
         begin
             wb_write_one(addr, wdata);
+            while (!wb_ack) @(posedge controller_clk);
             drain_pipeline;
             wb_read_one(addr);
             wb_stb = 1'b0;
@@ -1615,6 +1616,7 @@ module ddr4_sim_top;
                 wb_read_check(po_addr, gen_pattern_tb(po_i[7:0]));
             end
             phase_o_end = cycle_count;
+            phase_o_wr_count = wr_count - phase_o_wr_start;
             $display("[%0t]   Refreshes during traffic: %0d",
                      $realtime, ref_count - ref_start_o);
         end
@@ -1914,18 +1916,43 @@ module ddr4_sim_top;
         $display("[%0t] ===============================================", $realtime);
         $display("[%0t] SUMMARY: ACT=%0d  WR=%0d  RD=%0d  PRE=%0d  REF=%0d  RD_ERR=%0d  BIST_ERR=%0d",
                  $realtime, act_count, wr_count, rd_count, pre_count, ref_count, rd_err_count, bist_error_int);
-        $display("[%0t] THROUGHPUT: Phase_N(32wr+32rd): %0d cycles (%0d WR issued)  Phase_O(burst+ref): %0d cycles (%0d WR issued)  Phase_Q(16bank): %0d cycles (%0d WR issued)",
-                 $realtime,
-                 phase_n_end - phase_n_start, wr_count - phase_n_wr_start,
-                 phase_o_end - phase_o_start, wr_count - phase_o_wr_start,
-                 phase_q_end - phase_q_start, wr_count - phase_q_wr_start);
+        $display("[%0t]   Note: WR >> RD because Phase O is a sustained write-bandwidth test", $realtime);
+        $display("[%0t]   (%0d burst writes through 2 refresh intervals, only 8 verify reads)", $realtime, phase_o_wr_count);
+        $display("[%0t]", $realtime);
+        begin : summary_bw_block
+            real clk_ns, peak_bw, pn_ns_per_txn, po_ns_per_wr, pq_ns_per_txn;
+            real pn_bw, po_bw, pq_bw;
+            integer pn_cycles, po_cycles, pq_cycles;
+            integer pn_txns, pq_txns;
+            clk_ns = CTRL_CLK_PERIOD / 1000.0;
+            peak_bw = (WB_DATA_BITS / 8.0) / (clk_ns / 1000.0);
+            pn_cycles = phase_n_end - phase_n_start;
+            po_cycles = phase_o_end - phase_o_start;
+            pq_cycles = phase_q_end - phase_q_start;
+            pn_txns = TB_DEPTH * 2;
+            pq_txns = 32;
+            pn_ns_per_txn = (pn_cycles * clk_ns) / pn_txns;
+            po_ns_per_wr  = (po_cycles * clk_ns) / phase_o_wr_count;
+            pq_ns_per_txn = (pq_cycles * clk_ns) / pq_txns;
+            pn_bw = (pn_txns * (WB_DATA_BITS / 8.0)) / (pn_cycles * clk_ns / 1000.0);
+            po_bw = (phase_o_wr_count * (WB_DATA_BITS / 8.0)) / (po_cycles * clk_ns / 1000.0);
+            pq_bw = (pq_txns * (WB_DATA_BITS / 8.0)) / (pq_cycles * clk_ns / 1000.0);
+            $display("[%0t] THROUGHPUT (ctrl_clk = %0.2f ns, DDR4-%0d, peak BW = %0.0f MB/s):",
+                     $realtime, clk_ns, 2000000 / DDR4_CLK_PERIOD, peak_bw);
+            $display("[%0t]   Phase N  %0d WR + %0d RD sequential:  %0d cycles = %0.1f ns/txn,  %0.0f MB/s (%0.1f%% eff)",
+                     $realtime, TB_DEPTH, TB_DEPTH, pn_cycles, pn_ns_per_txn, pn_bw, pn_bw * 100.0 / peak_bw);
+            $display("[%0t]   Phase O  %0d WR sustained (2 REFs):   %0d cycles = %0.1f ns/WR,   %0.0f MB/s (%0.1f%% eff)",
+                     $realtime, phase_o_wr_count, po_cycles, po_ns_per_wr, po_bw, po_bw * 100.0 / peak_bw);
+            $display("[%0t]   Phase Q  16 WR + 16 RD (all banks):   %0d cycles = %0.1f ns/txn,  %0.0f MB/s (%0.1f%% eff)",
+                     $realtime, pq_cycles, pq_ns_per_txn, pq_bw, pq_bw * 100.0 / peak_bw);
+        end
+        $display("[%0t]", $realtime);
         if (rd_err_count == 0 && bist_error_int == 0)
             $display("[%0t] PASS: All test phases + BIST + %0d refresh cycles, zero violations",
                      $realtime, ref_count);
         else
             $display("[%0t] FAIL: rd_err=%0d bist_err=%0d",
                      $realtime, rd_err_count, bist_error_int);
-        $display("[%0t] Simulation finished successfully", $realtime);
         $display("[%0t] ===============================================", $realtime);
         $finish;
     end

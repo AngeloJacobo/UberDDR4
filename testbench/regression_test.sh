@@ -138,7 +138,7 @@ for entry in "${TESTS[@]}"; do
     LOG="$LOG_DIR/${NAME}.log"
 
     start_time=$(date +%s)
-    setsid bash -c 'timeout 60m bash UberDDR4/testbench/run_xsim.sh 2>&1 | sed "s/\x1b\[[0-9;]*m//g"' > "$LOG" &
+    setsid bash -c 'set -o pipefail; timeout 60m bash UberDDR4/testbench/run_xsim.sh 2>&1 | sed "s/\x1b\[[0-9;]*m//g"' > "$LOG" &
     SIM_PID=$!
     wait $SIM_PID
     if [[ $? -eq 0 ]]; then
@@ -153,7 +153,8 @@ for entry in "${TESTS[@]}"; do
     violation_count=$(grep -c "VIOLATION" "$LOG" 2>/dev/null)
     violation_count=${violation_count:-0}
 
-    if $sim_ok && grep -q "PASS: All.*test phases\|PASS: All 10 write\|PASS: init_failed asserted as expected" "$LOG" \
+    if $sim_ok && grep -q "PASS: All test phases + BIST\|PASS: init_failed asserted as expected" "$LOG" \
+              && ! grep -q "Simulation FAILED\|FAIL: rd_err\|FAIL: bist" "$LOG" \
               && [[ "$violation_count" -eq 0 ]]; then
         RESULTS+=("PASS")
         ((pass_count++))
