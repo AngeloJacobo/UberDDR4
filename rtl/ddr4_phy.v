@@ -155,10 +155,13 @@ module ddr4_phy #(
                CMD_BA_START = 18;
 
     // -----------------------------------------------------------------
-    // ODELAYE3/IDELAYE3 delay configuration
-    // DQS output is 90 deg shifted relative to DQ via ODELAYE3 (ps).
-    // BISC calibrates ps->taps automatically (UG571 ch.2, p.183).
-    // Write leveling reads CNTVALUEOUT for the BISC-calibrated starting tap.
+    // ODELAYE3/IDELAYE3 delay configuration (all in TIME mode, ps units)
+    // DQS ODELAYE3 adds DDR4_CLK_PERIOD/4 ps = 90° phase shift so DQS
+    // edges are centered in the DQ data eye at the DRAM receiver.
+    // BISC (Built-In Self-Calibration) converts the ps value to taps
+    // automatically at power-up (UG571, DELAY_FORMAT=TIME section).
+    // Write leveling reads CNTVALUEOUT to get the BISC-calibrated
+    // starting tap before sweeping additional delay.
     // -----------------------------------------------------------------
     localparam integer DATA_INITIAL_ODELAY_TAP = 0;
     localparam integer DATA_INITIAL_IDELAY_TAP = 0;
@@ -180,17 +183,23 @@ module ddr4_phy #(
                     PHY_WL_CHECK      = 4'd10,
                     PHY_WL_DONE       = 4'd11;
 
-    // MPR page 0 after ISERDESE3 8:1 DDR deserialize (JEDEC JESD79-4D ch.4.25)
-    // Q[0]=D0=0(rise), Q[1]=D1=1(fall), ... Q[7]=D7=1(fall) -> 8'b10101010
+    // MPR page 0, MPR0 register value = 8'h55 = 01010101 (JESD79-4D Table 56).
+    // Serial readout sends bit[7] first: UI0=0, UI1=1, UI2=0, ..., UI7=1.
+    // ISERDESE3 8:1 DDR captures Q[0]=first bit received (UG571 Table 2-5):
+    //   Q[0]=UI0=0(rise), Q[1]=UI1=1(fall), ..., Q[7]=UI7=1(fall)
+    //   -> Q[7:0] = 8'b10101010
     localparam [7:0] MPR_PATTERN = 8'b10101010;
 
-    // Eye training: sweep IDELAYE3 in steps of 4 (512/4 = 128 iterations)
+    // Eye training: sweep IDELAYE3 from tap 0 to 508 in steps of 4 (~128 iterations).
+    // Stops at 508 (not 511) to avoid 9-bit overflow on the +4 addition.
     localparam [3:0] TAP_SWEEP_STEP = 4'd4;
 
     // Write leveling: sweep ODELAYE3 DQS in steps of 4
     localparam [3:0] WL_TAP_STEP = 4'd4;
 
-    // VTC settle: ~200 controller_clk cycles after EN_VTC assertion (UG571)
+    // VTC settle: guard time after EN_VTC goes HIGH before normal operation.
+    // Per UG571 VAR_LOAD procedure step 8: "Set EN_VTC High for VT compensation"
+    // then wait before resuming. 200 cycles is conservative for BISC re-lock.
     localparam [7:0] VTC_SETTLE_CYCLES = 8'd200;
 
     // Derived constants for DFI data indexing
@@ -202,7 +211,8 @@ module ddr4_phy #(
     // -----------------------------------------------------------------
     // Synchronous Reset
     // 2-FF synchronizer: i_rst_n (async, active-low) -> sync_rst (sync, active-high)
-    // Per UG571 ch.7.6: all SERDES/delay primitives share this reset.
+    // Per UG571 "Component Mode Reset Sequence": all SERDES/delay primitives
+    // share this reset, asserted/deasserted in the i_ddr4_clk domain.
     // IDELAYCTRL reset is released separately (see IDELAYCTRL section below).
     //
     // Why 2-FF? Async assert, sync deassert avoids metastability on the
@@ -516,10 +526,14 @@ module ddr4_phy #(
     wire dqs_tristate = ~dqs_output_enable;
     wire dq_tristate  = ~dq_output_enable;
 
-    // WL state detection -- used by DQS pattern and tristate overrides
+    // WL (write leveling) state detection -- gates DQS pattern to emit a
+    // single rising edge instead of toggle, and overrides tristate control.
     wire wl_active;
 
-    // DQS pattern: toggle during data, single rising edge during WL strobe
+    // DQS pattern sent to OSERDESE3:
+    //   Normal write: 8'b01010101 (continuous toggle, DQS edges center-aligned with DQ)
+    //   Write leveling: 8'b00000001 (single rising edge per JEDEC §4.7.2 strobe)
+    //   Idle: 8'b00000000 (DQS held low, bus tri-stated by T input)
     reg [7:0] dqs_pattern;
     reg       wl_dqs_strobe;
     always @* begin
@@ -538,8 +552,9 @@ module ddr4_phy #(
     wire wl_dqs_drive = wl_dqs_strobe | wl_dqs_strobe_d1;
     wire dqs_tristate_wl = wl_active ? ~wl_dqs_drive : dqs_tristate;
 
-    // EN_VTC: LOW during training (tap changes), HIGH in normal operation (UG571).
-    // TIME mode requires VTC active after calibration for PVT drift compensation.
+    // EN_VTC: LOW during training so IDELAYE3/ODELAYE3 tap values can be
+    // loaded without the IDELAYCTRL overwriting them. HIGH in normal operation
+    // so the IDELAYCTRL continuously compensates delay for PVT drift (UG571).
     reg en_vtc_q;
 
     // -----------------------------------------------------------------
@@ -578,8 +593,9 @@ module ddr4_phy #(
             for (dq_bit = 0; dq_bit < DQ_BITS; dq_bit = dq_bit + 1) begin : gen_dq_bit
                 localparam integer DQ_IDX = dq_lane * DQ_BITS + dq_bit;
 
-                // DFI wrdata -> OSERDESE3 D mapping
-                // D[0]=first transmitted, {p3_fall, p3_rise, ..., p0_fall, p0_rise}
+                // DFI wrdata -> OSERDESE3 D[7:0] mapping
+                // D[0] is transmitted first (UG571 Table 2-8).
+                // Concatenation order (MSB..LSB): p3_fall, p3_rise, ..., p0_fall, p0_rise
                 wire [7:0] dq_wr_d = {
                     i_dfi_wrdata[3*DFI_DATA_WIDTH + BEAT_WIDTH + DQ_IDX],
                     i_dfi_wrdata[3*DFI_DATA_WIDTH + DQ_IDX],
@@ -667,9 +683,12 @@ module ddr4_phy #(
     // -----------------------------------------------------------------
     // DQS Strobe Path (per byte lane)
     // Write: OSERDESE3(dqs_pattern) -> ODELAYE3 -> IOBUFDS -> DQS+/-
-    // Read:  DQS+/- -> IOBUFDS -> IDELAYE3 -> ISERDESE3 (training only)
-    // The DQS ISERDESE3 is only used during gate training and write
-    // leveling feedback. Normal reads use the DQ ISERDESE3 outputs.
+    //        ODELAYE3 adds ~90° (DDR4_CLK_PERIOD/4 ps) so DQS edges
+    //        are center-aligned with DQ data at the DRAM receiver.
+    // Read:  DQS+/- -> IOBUFDS -> IDELAYE3(FIXED) -> ISERDESE3
+    //        This path is used only during training (gate alignment
+    //        and write leveling feedback). Normal reads rely solely
+    //        on the DQ ISERDESE3 outputs clocked by i_ddr4_clk.
     // -----------------------------------------------------------------
     generate
         genvar dqs_lane;
@@ -705,6 +724,9 @@ module ddr4_phy #(
                 .CASC_IN(1'b0), .CASC_RETURN(1'b0), .CASC_OUT()
             );
 
+            // DQS_BIAS="TRUE": weak keeper biases DQS to VDD/2 when bus is
+            // floating (between bursts). Prevents ISERDESE3 from seeing glitches
+            // on the undriven differential pair (Xilinx UG571, IOBUFDS section).
             wire ibuf_dqs_out;
             IOBUFDS #(
                 .DQS_BIAS("TRUE")
@@ -807,10 +829,12 @@ module ddr4_phy #(
 
     // -----------------------------------------------------------------
     // Fabric Bitslip Barrel Shifter
-    // ISERDESE3 has no BITSLIP pin (unlike ISERDESE2), so alignment is
-    // done in fabric. We keep {prev_cycle, cur_cycle} = 16-bit window
-    // per DQ bit and barrel-shift by the per-lane bitslip_count.
-    // Gate training determines the correct bitslip_count for each lane.
+    // ISERDESE3 has no BITSLIP pin (UG571 lists this as removed vs.
+    // ISERDESE2), so word alignment is done in fabric logic.
+    // Method: concatenate {current_Q[7:0], previous_Q[7:0]} into a
+    // 16-bit window and barrel-shift by the per-lane bitslip_count
+    // (0-7). This effectively selects the correct 8-bit word boundary.
+    // Gate training (MPR pattern match) determines bitslip_count.
     // Before training, bitslip_count=0 (no correction applied).
     // -----------------------------------------------------------------
     reg [7:0]  prev_iserdes_q [TOTAL_DQ-1:0];
@@ -1164,10 +1188,12 @@ module ddr4_phy #(
                         if (phy_timer != 0)
                             phy_timer <= phy_timer - 1'b1;
                         else begin
-                            // Write leveling edge detection (JESD79-4D ch.4.18):
-                            // prev initialized to 0; detect 0->1 CK crossing.
-                            // Lockstep: both DQ and DQS taps incremented
-                            // together to preserve the 90 deg offset.
+                            // Write leveling edge detection (JESD79-4D §4.7):
+                            // DRAM samples CK with the rising DQS edge and feeds
+                            // back the result on ALL DQ bits. The controller sweeps
+                            // DQS delay until DQ transitions 0->1, indicating DQS
+                            // rising edge is now aligned with CK rising edge.
+                            // DQ ODELAYE3 tracks DQS to preserve the 90° write offset.
                             `ifndef YOSYS
                             $display("[%0t] PHY WL sweep: lane %0d dqs_tap=%0d dq_tap=%0d DQ=%0b prev=%0b",
                                 $realtime, train_lane, wl_tap[train_lane],

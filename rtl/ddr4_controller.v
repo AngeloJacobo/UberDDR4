@@ -716,8 +716,39 @@ module ddr4_controller #(
     reg                           read_ack_q;
 
     // -- Static outputs --
+    // WB B4 Rule 3.30 compliance handled by ddr4_top (CYC gating at top-level output)
     assign o_wb_ack = i_rst_n && reset_done && (write_ack_q || read_ack_q);
     assign o_dfi_init_start = ~reset_done; // request PHY init until ROM completes
+
+    // =============================================================================================================
+    // Pipeline Diagram
+    //
+    //     WB input          Stage 1            Stage 2           Scheduler                      DFI output
+    //    ──────────     ───────────────     ───────────────     ─────────────               ─────────────────
+    //
+    // WRITE:
+    //
+    //    STB+WE ──────► stage1_pending ───► stage2_pending ───► sched_write
+    //                                                               │
+    //   o_wb_ack ◄────────────────────────── write_ack_q ◄──────────┤ 
+    //                 (+1 clk)                                      │
+    //                                                               └─► wrdata_en_pipe_q ──► o_dfi_wrdata_en
+    //                                                                 (+WRITE_DATA_DELAY)
+    //
+    // READ:
+    //
+    //    STB+!WE ─────► stage1_pending ───► stage2_pending ───► sched_read
+    //                                                               │
+    //                                                               └──► rddata_en_pipe_q ──► o_dfi_rddata_en
+    //                                                                (+RDDATA_EN_PIPE_WIDTH)
+    //                                                                              
+    //   o_wb_ack ◄───────────────────────────────────────────────────────── read_ack_q ◄───── i_dfi_rddata_valid
+    //
+    // Key differences:
+    //   - WRITE: ACK fires 1 cycle after sched_write (data already captured)
+    //   - READ:  ACK fires 1 cycle after PHY returns rddata_valid (variable latency)
+    //   - Both paths share Stage 1/2; direction selected by stage2_we
+    // =============================================================================================================
 
     // =====================================================================
     // Address Decode

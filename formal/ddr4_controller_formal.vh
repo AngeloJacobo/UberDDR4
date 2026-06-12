@@ -88,12 +88,13 @@ always @(posedge i_controller_clk) f_past_valid <= 1'b1;
 
 // Wishbone B4 Rule 3.25: CYC must remain asserted for the duration
 // of a bus cycle. A compliant master only deasserts CYC after all
-// outstanding ACKs are received. We encode this as: CYC must be
-// high whenever requests are in-flight (f_outstanding > 0).
-// When idle, the solver is free to toggle CYC — testing that the
-// slave handles inter-burst CYC deassertion correctly.
+// outstanding ACKs are received. We use pipeline occupancy directly
+// When pipeline is idle, solver freely toggles CYC — verifying the
+// RTL's Rule 3.30 ACK gating and stall behavior between sessions.
 always @* begin
-    if (reset_done && i_rst_n && f_outstanding > 0)
+    if (reset_done && i_rst_n
+        && (stage1_pending || stage2_pending
+            || write_ack_q || |rddata_en_pipe_q || read_ack_q))
         assume(i_wb_cyc);
 end
 
@@ -105,12 +106,14 @@ end
 
 // -- Prop 19 bounded-stall localparams (must precede fwb_slave) --
 `ifdef FORMAL_BOUNDED_STALL
-localparam F_MAX_STALL =
-    MAX_PRECHARGE_DELAY + 1
-    + max_fn(max_fn(PRECHARGE_TO_ACTIVATE_DELAY, MAX_RRD_DELAY),
-             TFAW_CYCLES) + 1
-    + max_fn(max_fn(ACTIVATE_TO_WRITE_DELAY, ACTIVATE_TO_READ_DELAY),
-             max_fn(CAS_TO_CAS_DELAY_SAME_BG, WRITE_TO_READ_DELAY_SAME_BG)) + 1;
+// Worst-case stall = row-miss path through the scheduler:
+//   1. Close current row:  max(WR->PRE, RD->PRE) + 1 pipeline cycle
+//   2. Open new row:       max(tRP, tRRD, tFAW)  + 1 pipeline cycle
+//   3. Issue data command: max(tRCD_WR, tRCD_RD, tCCD, tWTR) + 1 pipeline cycle
+// The +1's account for the 1-cycle pipeline register between each scheduler phase.
+localparam F_MAX_STALL = MAX_PRECHARGE_DELAY + 1
+                            + max_fn(max_fn(PRECHARGE_TO_ACTIVATE_DELAY, MAX_RRD_DELAY), TFAW_CYCLES) + 1
+                            + max_fn(max_fn(ACTIVATE_TO_WRITE_DELAY, ACTIVATE_TO_READ_DELAY), max_fn(CAS_TO_CAS_DELAY_SAME_BG, WRITE_TO_READ_DELAY_SAME_BG)) + 1;
 localparam F_MAX_ACK_DELAY = 0;
 localparam F_DLYBITS = $clog2(F_MAX_STALL + 1);
 wire [F_DLYBITS-1:0] f_stall_count_w;
@@ -150,19 +153,13 @@ fwb_slave #(
     .f_stall_count(f_stall_count_w)
 );
 
-// Prop 18: Induction invariant linking fwb_slave's request counter to
-// the actual pipeline occupancy. Tells the solver: "the number of
-// outstanding WB requests equals the sum of all in-flight stages":
-//   stage1_pending      — accepted, waiting to enter scheduler
-//   stage2_pending      — in scheduler, waiting for timing clearance
-//   write_ack_q         — WR fired, ACK will assert next cycle
-//   rddata_en_pipe_q    — RD fired, waiting for read data return
-//   read_ack_q          — read data received, ACK will assert next cycle
-//
-// Why assume (not assert): fwb_slave's internal counter has no
-// structural connection to our pipeline registers. The solver can
-// start induction with mismatched values. Base case proves they
-// always match from reset, so the assume is sound.
+// Prop 18: Pipeline occupancy equals fwb_slave's outstanding counter.
+// Both sides increment on wb_accept and decrement on o_wb_ack. Proven
+// correct from reset (base case passes). Used as assume because
+// read_ack_q is registered from the free PHY input i_dfi_rddata_valid;
+// at induction step 0 the solver sets read_ack_q without structural
+// justification. Upgrading to assert requires internalizing the read
+// return path in RTL (as UberDDR3 does).
 always @* begin
     if (reset_done && i_wb_cyc && i_rst_n)
         assume(f_outstanding ==
@@ -328,7 +325,7 @@ mini_fifo #(
     .DATA_WIDTH(F_PIPE_DATA_WIDTH)
 ) f_pipeline_fifo (
     .i_clk(i_controller_clk),
-    .i_rst_n(i_rst_n),
+    .i_rst_n(i_rst_n && i_wb_cyc),
     .read_fifo(f_pipe_read),
     .write_fifo(f_pipe_write),
     .empty(f_pipe_empty),
@@ -492,7 +489,11 @@ end
 // The solver picks a fixed BG and proves the property holds for it.
 // Since the BG is unconstrained, this covers all possible BG values.
 // ===================================================================
+`ifndef FORMAL_JASPERGOLD
 (* anyconst *) reg [BG_BITS-1:0] f_bg_const;
+`else
+reg [BG_BITS-1:0] f_bg_const;
+`endif
 
 always @* begin
     if (reset_done && stage2_pending) begin
@@ -560,7 +561,11 @@ end
 // per-bank counter hasn't expired. Complements property 7 (which
 // covers per-BG counters). Uses a separate anyconst bank register.
 // ===================================================================
+`ifndef FORMAL_JASPERGOLD
 (* anyconst *) reg [BG_BITS+BA_BITS-1:0] f_bank_const;
+`else
+reg [BG_BITS+BA_BITS-1:0] f_bank_const;
+`endif
 
 always @* begin
     if (reset_done && i_wb_cyc) begin
@@ -805,6 +810,7 @@ always @(posedge i_controller_clk) begin
     end
 end
 
+
 // ===================================================================
 // 19. Bounded Stall / ACK Latency
 // Proves: the bus never stalls longer than the worst-case row-miss
@@ -828,7 +834,11 @@ end
 //     assumed bounded (nothing to prove when pipeline is empty).
 // ===================================================================
 `ifdef FORMAL_BOUNDED_STALL
+`ifndef FORMAL_JASPERGOLD
 (* keep *) wire [$clog2(F_MAX_STALL+1):0] f_max_stall_w = F_MAX_STALL;
+`else
+wire [$clog2(F_MAX_STALL+1):0] f_max_stall_w = F_MAX_STALL;
+`endif
 
 // -- Stimulus constraint: no WB requests during init/refresh --
 always @* begin
