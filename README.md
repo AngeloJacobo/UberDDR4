@@ -88,19 +88,35 @@ number of 8-bit lanes across all devices.
 
 Generate all clocks from a single MMCM/PLL.
 
-### Wishbone B4 Pipelined Interface
+### Wishbone B4 Pipelined Interface (DRAM Data Path)
 
 | Port | Direction | Description |
 | :---: | :---: | :--- |
 | `i_wb_cyc` | in | Bus cycle active |
 | `i_wb_stb` | in | Transfer request strobe |
 | `i_wb_we` | in | Write enable (1 = write, 0 = read) |
-| `i_wb_addr` | in | Address bus (`EXT_ADDR_BITS` wide) |
+| `i_wb_addr` | in | Address bus (`WB_ADDR_BITS` wide) |
 | `i_wb_data` | in | Write data (`WB_DATA_BITS` wide, default 128 bits) |
 | `i_wb_sel` | in | Byte select / write strobe (`WB_SEL_BITS` wide) |
 | `o_wb_stall` | out | Pipeline stall (do not issue new STB when high) |
 | `o_wb_ack` | out | Transfer acknowledge |
 | `o_wb_data` | out | Read data (`WB_DATA_BITS` wide) |
+
+### Debug CSR Wishbone B4 Port (Separate, Always Accessible)
+
+| Port | Direction | Description |
+| :---: | :---: | :--- |
+| `i_wb_dbg_cyc` | in | Bus cycle active |
+| `i_wb_dbg_stb` | in | Transfer request strobe |
+| `i_wb_dbg_we` | in | Write enable |
+| `i_wb_dbg_addr` | in | CSR address (4-bit, selects 1 of 16 registers) |
+| `i_wb_dbg_data` | in | Write data (32-bit) |
+| `i_wb_dbg_sel` | in | Byte select (4-bit) |
+| `o_wb_dbg_stall` | out | Always 0 (zero-wait-state slave) |
+| `o_wb_dbg_ack` | out | Transfer acknowledge (1-cycle latency) |
+| `o_wb_dbg_data` | out | Read data (32-bit) |
+
+This port is completely independent of the DRAM data path. It can be used to read training status, BIST results, and PHY debug registers even when the controller is stalled during calibration.
 
 ### Status Outputs
 
@@ -151,23 +167,23 @@ Set `XILINX_VIVADO` to the Vivado install path (e.g. `/path/to/Vivado/2023.1`).
 # Architecture
 
 ```
-+---------------------------------------------+
-|               ddr4_top.v                    |
-|  +--------------+  +----------------------+ |
-|  | ddr4_prober  |  |   ddr4_controller    | |
-|  | (BIST + CSR) |  |   (scheduling,       | |
-|  |              |  |    timing, refresh)   | |
-|  +------+-------+  +----------+-----------+ |
-|         |    Wishbone mux     | DFI 3.1     |
-|  WB ----+                     |             |
-|         |              +------+-----------+ |
-|         |              |    ddr4_phy      | |
-|         |              |  (SERDES, IDELAY,| |
-|         |              |   training FSM)  | |
-|         |              +------+-----------+ |
-+---------+---------------------+-------------+
-          |                     | DDR4 SDRAM
-     o_init_done          ck/addr/cmd/dq/dqs
++--------------------------------------------------+
+|                  ddr4_top.v                       |
+|  +--------------+     +----------------------+   |
+|  | ddr4_prober  |     |   ddr4_controller    |   |
+|  | (BIST + CSR) |     |   (scheduling,       |   |
+|  |              |     |    timing, refresh)   |   |
+|  +---+------+---+     +----------+-----------+   |
+|      |      |   DRAM WB mux      | DFI 3.1       |
+|  DBG |  DRAM|---+                 |               |
+|  WB -+  WB -+--+          +------+-----------+   |
+|                            |    ddr4_phy      |   |
+|                            |  (SERDES, IDELAY,|   |
+|                            |   training FSM)  |   |
+|                            +------+-----------+   |
++-----------------------------------+---------------+
+                                    | DDR4 SDRAM
+     o_init_done              ck/addr/cmd/dq/dqs
      o_init_failed
 ```
 
@@ -179,7 +195,7 @@ AXI4 slave --> axim2wbsp --> ddr4_top (Wishbone) --> DDR4
 
 ### CSR Register Map
 
-When `DEBUG_CSR_ENABLE=1`, the top address bit selects between DRAM access (bit=0) and CSR access (bit=1). CSR registers are 32-bit, read via Wishbone with `addr[3:0]` selecting the register:
+CSR registers are 32-bit, accessed via the dedicated debug Wishbone port (`i_wb_dbg_addr[3:0]` selects the register):
 
 | Addr | Name | Access | Description |
 | :---: | :--- | :---: | :--- |

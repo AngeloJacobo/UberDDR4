@@ -1,0 +1,50 @@
+feat: separate debug WB port, PHY MPR2 training, stall forwarding
+
+Architectural changes:
+- Replace shared-address-MSB CSR decode with a dedicated pipelined
+  Wishbone B4 debug port (i_wb_dbg_*).  The debug port is always
+  accessible regardless of controller calibration state or BIST
+  activity, eliminating the deadlock where outstanding DRAM requests
+  blocked CSR reads.
+- Remove EXT_ADDR_BITS parameter; DRAM WB address is now exactly
+  WB_ADDR_BITS wide.
+- Move BIST auto-start and init_done/init_failed logic from ddr4_top
+  into ddr4_prober for better modularity.  Prober now owns
+  o_init_done and o_init_failed outputs.
+- Remove o_correct_count and o_error_count ports from prober (internal
+  only, exposed via CSR reads).
+
+Controller (ddr4_controller.v):
+- Zero-bubble stall forwarding: accept a new WB request even when
+  stage1 is occupied, provided stage2 can absorb stage1 this cycle
+  (stage2_update high).  Improves sustained throughput.
+- Switch gate training to MPR page 2 (period-8 pattern 00001111)
+  which uniquely identifies all 8 bitslip values, replacing the
+  period-2 pattern from MPR page 0 that was ambiguous.
+- Increase MICRON_SIM power-on timings (100ns reset, 200ns CKE low)
+  to ensure PHY internal reset completes reliably.
+
+PHY (ddr4_phy.v):
+- Update MPR_PATTERN localparam to 8'b11110000 matching MPR2.
+- Rewrite gate/eye/write-leveling training FSM for robustness:
+  per-lane failure tracking (o_phy_train_fail_gate/eye/wl), clearer
+  state transitions, proper VTC handling.
+- Remove unused CMD_* localparam bit-field constants (command
+  encoding is handled by the controller).
+
+Formal (ddr4_controller_formal.vh):
+- Update Prop 4 (zero-bubble stall) to match new forwarding logic.
+- Add Prop 23: write data integrity — shadow pipeline proves
+  i_wb_data is preserved end-to-end through stage1 → stage2 →
+  wr_data_pipe → o_dfi_wrdata without corruption.
+
+Testbench (ddr4_sim_top.sv):
+- Add debug WB port signals and deterministic 2-edge read/write
+  tasks (wb_dbg_read, wb_dbg_write) — no ACK polling needed since
+  the debug slave is zero-wait-state.
+- All CSR accesses now use the dedicated debug port.
+- Update hierarchical references to reach into prober for
+  correct_count_w and error_count_w.
+
+Build (run_xsim.sh):
+- Pass $EXTRA_DEFS to xvlog for define injection.

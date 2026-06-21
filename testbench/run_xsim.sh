@@ -74,6 +74,7 @@ echo -e "${DIM}Vivado: $XILINX_VIVADO${RESET}"
 
 step "Compiling RTL"
 "$XVLOG" -sv \
+  $EXTRA_DEFS \
   UberDDR4/rtl/ddr4_controller.v \
   UberDDR4/rtl/ddr4_phy.v \
   UberDDR4/rtl/ddr4_prober.v \

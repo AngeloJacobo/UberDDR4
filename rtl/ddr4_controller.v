@@ -388,8 +388,8 @@ module ddr4_controller #(
 
     // ----- Power-On / Init Sequence (JESD79-4D Figure 7) -----
     // Shortened for simulation when MICRON_SIM=1.
-    localparam POWER_ON_RESET_HIGH_ps = MICRON_SIM ? 10_000 : 200_000_000; // tPW_RESET >=200us
-    localparam INITIAL_CKE_LOW_ps     = MICRON_SIM ? 10_000 : 500_000_000; // >=500us after RESET_n deassert
+    localparam POWER_ON_RESET_HIGH_ps = MICRON_SIM ? 100_000 : 200_000_000; // tPW_RESET >=200us
+    localparam INITIAL_CKE_LOW_ps     = MICRON_SIM ? 200_000 : 500_000_000; // >=500us after RESET_n deassert (200ns min for PHY reset)
     // tXPR : Exit reset to first command (Tables 172-173)
     localparam tXPR_ps = max_fn(5 * DDR4_CLK_PERIOD, tRFC_ps + 10_000); // max(5nCK, tRFC+10ns)
 
@@ -1249,9 +1249,11 @@ module ddr4_controller #(
     end
 
     // --- Stall: combinational, reflects current registered state ---
+    // Forwarding: accept new request even when stage1 is full, as long as
+    // stage2 can absorb stage1 this cycle (stage2 idle or issuing WR/RD).
     always @* begin
-        o_wb_stall = stage1_pending || !reset_done || refresh_active
-                     || !o_calib_complete;
+        o_wb_stall = (stage1_pending && !stage2_update) || !reset_done
+                     || refresh_active || !o_calib_complete;
     end
 
     // -- Main sequential block --
@@ -1691,7 +1693,7 @@ module ddr4_controller #(
                     // JESD79-4D 4.10.1: only MRS/RD/WR/DES/REF allowed in
                     // MPR mode. MPR data comes from internal registers,
                     // not the array, so no row needs to be open.
-                    // DRAM returns known 01010101 pattern (MPR page 0).
+                    // DRAM returns MPR2 = 00001111 (period-8 pattern).
                     CALIB_GATE_READ: begin
                         if (calib_gap_timer == 0) begin
                             calib_read_req <= 1'b1;
@@ -1869,7 +1871,7 @@ module ddr4_controller #(
                         1'b1,       // CKE held high
                         1'b1,       // RESET_N held high
                         2'b00,      // BG[1:0] = 0 (don't-care for MPR)
-                        2'b00,      // BA[1:0] = 0 (MPR location 0)
+                        2'b10,      // BA[1:0] = 2 (MPR location 2: period-8 pattern 00001111)
                         17'b0       // addr[16:0] = 0 (don't-care for MPR)
                     };
                     rddata_en_pipe_q[RDDATA_EN_PIPE_WIDTH-1] <= 1'b1;
@@ -2381,6 +2383,11 @@ module ddr4_controller #(
     // =======================
 `ifdef FORMAL
     `include "ddr4_controller_formal.vh"
+`endif
+
+`ifdef FORMAL_BLACKBOX
+    always @* if (reset_done)
+        assume(!refresh_active);
 `endif
 
 endmodule

@@ -8,14 +8,18 @@
 //  top module for Wishbone integration.
 //
 //  Architecture:
-//    User WB --+--> [WB Mux] --> ddr4_controller <--DFI--> ddr4_phy --> DDR4
-//              |        ^
-//              |        |
-//              +-> ddr4_prober (BIST engine + debug CSR)
+//    User WB ----+--> [WB Mux] --> ddr4_controller <--DFI--> ddr4_phy --> DDR4
+//                |        ^
+//                |        |
+//                +-> ddr4_prober (BIST engine)
 //
-//  The Wishbone mux gives BIST priority when active; user transactions
-//  are stalled until BIST completes.  Address MSB selects between DRAM
-//  access (MSB=0) and debug CSR reads (MSB=1).
+//    Debug WB -------> ddr4_prober (CSR register file, always accessible)
+//
+//  Two independent Wishbone ports:
+//    - DRAM port: pipelined, used for data traffic and BIST.  BIST has
+//      priority when active; user transactions stalled until complete.
+//    - Debug CSR port: pipelined, zero-wait-state.  Accessible at all
+//      times regardless of controller calibration state or BIST activity.
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -84,7 +88,7 @@ module ddr4_top #(
     parameter[4:0] CWL = 0,
     // BIST / debug prober configuration
     //   BIST_MODE: 0=disabled, 1=burst sequential only, 2=full (burst+random+alternating)
-    parameter[1:0] BIST_MODE = 0,
+    parameter[1:0] BIST_MODE = 1,
     // Debug CSR register file: 0=disabled (saves area), 1=enabled
     parameter DEBUG_CSR_ENABLE = 1,
     // Derived from DEVICE_WIDTH -- do not override
@@ -99,18 +103,26 @@ module ddr4_top #(
               WB_DATA_BITS = DQ_BITS * BYTE_LANES * 2 * SERDES_RATIO,
               WB_SEL_BITS = WB_DATA_BITS / 8,
               COL_LOW = $clog2(SERDES_RATIO * 2),
-              WB_ADDR_BITS = ROW_BITS + BG_BITS + BA_BITS + COL_BITS - COL_LOW,
-              EXT_ADDR_BITS = WB_ADDR_BITS + DEBUG_CSR_ENABLE
+              WB_ADDR_BITS = ROW_BITS + BG_BITS + BA_BITS + COL_BITS - COL_LOW
 ) (
     input wire i_controller_clk, i_ddr4_clk, i_ref_clk,
     input wire i_rst_n,
-    // Wishbone B4
+    // Wishbone B4 — DRAM data path (pipelined)
     input wire i_wb_cyc, i_wb_stb, i_wb_we,
-    input wire [EXT_ADDR_BITS-1:0] i_wb_addr,
+    input wire [WB_ADDR_BITS-1:0] i_wb_addr,
     input wire [WB_DATA_BITS-1:0] i_wb_data,
     input wire [WB_SEL_BITS-1:0] i_wb_sel,
     output wire o_wb_stall, o_wb_ack,
     output wire [WB_DATA_BITS-1:0] o_wb_data,
+    // Wishbone B4 — Debug CSR port (pipelined, independent of DRAM path).
+    // Always accessible regardless of controller calibration state.
+    input wire i_wb_dbg_cyc, i_wb_dbg_stb, i_wb_dbg_we,
+    input wire [3:0] i_wb_dbg_addr,
+    input wire [31:0] i_wb_dbg_data,
+    input wire [3:0] i_wb_dbg_sel,
+    output wire o_wb_dbg_stall,
+    output wire o_wb_dbg_ack,
+    output wire [31:0] o_wb_dbg_data,
     // DDR4 SDRAM Interface
     output wire o_ddr4_ck_p, o_ddr4_ck_n,
     output wire o_ddr4_reset_n, o_ddr4_cke, o_ddr4_cs_n, o_ddr4_act_n,
@@ -164,15 +176,14 @@ module ddr4_top #(
     wire [9*BYTE_LANES-1:0] phy_idelay_center;
     wire [9*BYTE_LANES-1:0] phy_wl_tap;
     wire [3*BYTE_LANES-1:0] phy_bitslip;
+    wire [BYTE_LANES-1:0]   phy_train_fail_gate;
+    wire [BYTE_LANES-1:0]   phy_train_fail_eye;
+    wire [BYTE_LANES-1:0]   phy_train_fail_wl;
 
     // -----------------------------------------------------------------
     // Prober (BIST + CSR) Wires
     // -----------------------------------------------------------------
     wire                     prober_bist_busy;
-    wire                     prober_bist_pass;
-    wire                     prober_bist_fail;
-    wire [31:0]              prober_correct;
-    wire [31:0]              prober_error;
     wire                     prober_reset_req; // V2: connect to reset path for auto-recovery
     wire                     prober_wb_cyc;
     wire                     prober_wb_stb;
@@ -180,29 +191,16 @@ module ddr4_top #(
     wire [WB_ADDR_BITS-1:0]  prober_wb_addr;
     wire [WB_DATA_BITS-1:0]  prober_wb_data;
     wire [WB_SEL_BITS-1:0]   prober_wb_sel;
-    wire [31:0]              prober_csr_data;
+
 
     // -----------------------------------------------------------------
-    // WB Address Decode + BIST Priority Mux
+    // DRAM WB Mux: BIST has priority when active
     // -----------------------------------------------------------------
     // When BIST is running, it owns the controller WB port; user
     // transactions see stall=1, ack=0.  When idle, the user port
     // passes through directly.
     wire bist_active = prober_bist_busy;
 
-    // Address MSB decode: MSB=1 -> debug CSR, MSB=0 -> DRAM access.
-    // Qualified by STB per WB B4 RULE 3.60.
-    wire debug_access;
-    generate if (DEBUG_CSR_ENABLE) begin : gen_dbg_decode
-        assign debug_access = i_wb_cyc && i_wb_stb && i_wb_addr[WB_ADDR_BITS];
-    end else begin : gen_no_dbg_decode
-        assign debug_access = 1'b0;
-    end endgenerate
-
-    wire [WB_ADDR_BITS-1:0] dram_addr = i_wb_addr[WB_ADDR_BITS-1:0];
-    wire dram_stb = i_wb_stb && !debug_access;
-
-    // Mux WB to controller: BIST has priority when active
     wire                     ctrl_wb_cyc;
     wire                     ctrl_wb_stb;
     wire                     ctrl_wb_we;
@@ -214,84 +212,21 @@ module ddr4_top #(
     wire [WB_DATA_BITS-1:0]  ctrl_wb_rdata;
 
     assign ctrl_wb_cyc  = bist_active ? prober_wb_cyc  : i_wb_cyc;
-    assign ctrl_wb_stb  = bist_active ? prober_wb_stb  : dram_stb;
+    assign ctrl_wb_stb  = bist_active ? prober_wb_stb  : i_wb_stb;
     assign ctrl_wb_we   = bist_active ? prober_wb_we   : i_wb_we;
-    assign ctrl_wb_addr = bist_active ? prober_wb_addr : dram_addr;
+    assign ctrl_wb_addr = bist_active ? prober_wb_addr : i_wb_addr;
     assign ctrl_wb_data = bist_active ? prober_wb_data : i_wb_data;
     assign ctrl_wb_sel  = bist_active ? prober_wb_sel  : i_wb_sel;
 
     // Route stall/ack to active master, block inactive master
-    wire user_wb_stall = bist_active ? 1'b1          : ctrl_wb_stall;
-    wire user_wb_ack   = bist_active ? 1'b0          : ctrl_wb_ack;
     wire bist_wb_stall = bist_active ? ctrl_wb_stall : 1'b1;
     wire bist_wb_ack   = bist_active ? ctrl_wb_ack   : 1'b0;
 
-    // Outstanding DRAM request counter -- prevents a CSR ACK from being
-    // returned while DRAM read ACKs are still in-flight (would corrupt
-    // the WB pipeline ordering).
-    reg [3:0] dram_outstanding_q;
-    wire dram_request_accepted = i_wb_cyc && dram_stb && !user_wb_stall;
-    wire dram_ack_returned     = user_wb_ack;
+    assign o_wb_stall = bist_active ? 1'b1          : ctrl_wb_stall;
+    assign o_wb_ack   = bist_active ? 1'b0          : ctrl_wb_ack;
+    assign o_wb_data  = ctrl_wb_rdata;
 
-    always @(posedge i_controller_clk) begin
-        if (!i_rst_n)
-            dram_outstanding_q <= 4'd0;
-        else
-            dram_outstanding_q <= dram_outstanding_q
-                                + {3'd0, dram_request_accepted}
-                                - {3'd0, dram_ack_returned};
-    end
 
-    wire csr_blocked = (dram_outstanding_q != 0);
-    wire csr_ready   = debug_access && !csr_blocked;
-
-    // Final output mux
-    assign o_wb_stall = debug_access ? csr_blocked   : user_wb_stall;
-    assign o_wb_ack   = csr_ready    ? 1'b1          : user_wb_ack;
-    assign o_wb_data  = csr_ready    ? {{(WB_DATA_BITS-32){1'b0}}, prober_csr_data}
-                                     : ctrl_wb_rdata;
-
-    // -----------------------------------------------------------------
-    // BIST Auto-Start + Init Status
-    // -----------------------------------------------------------------
-    // On rising edge of calib_complete (if BIST_MODE != 0), auto-start
-    // fires the BIST engine once.  init_done and init_failed are sticky:
-    //   - init_done:   calibration OK and (BIST passed or BIST disabled)
-    //   - init_failed: calibration error OR BIST failure
-    reg calib_complete_q;
-    always @(posedge i_controller_clk) begin
-        if (!i_rst_n)
-            calib_complete_q <= 1'b0;
-        else
-            calib_complete_q <= calib_complete;
-    end
-
-    wire bist_auto_start = calib_complete && !calib_complete_q && (BIST_MODE != 0);
-    wire bist_start      = bist_auto_start;
-
-    wire csr_we = csr_ready && i_wb_we;
-
-    reg init_done_q, init_failed_q;
-    always @(posedge i_controller_clk) begin
-        if (!i_rst_n) begin
-            init_done_q   <= 1'b0;
-            init_failed_q <= 1'b0;
-        end else begin
-            if (calib_error)
-                init_failed_q <= 1'b1;
-            if (!init_done_q && !init_failed_q) begin
-                if (calib_complete && (BIST_MODE == 0))
-                    init_done_q <= 1'b1;
-                if (calib_complete && BIST_MODE != 0 && prober_bist_pass)
-                    init_done_q <= 1'b1;
-                if (calib_complete && BIST_MODE != 0 && prober_bist_fail)
-                    init_failed_q <= 1'b1;
-            end
-        end
-    end
-
-    assign o_init_done   = init_done_q;
-    assign o_init_failed = init_failed_q;
 
     // -----------------------------------------------------------------
     // Controller Instantiation
@@ -444,7 +379,10 @@ module ddr4_top #(
         .o_phy_state(phy_train_state),
         .o_phy_idelay_center(phy_idelay_center),
         .o_phy_wl_tap(phy_wl_tap),
-        .o_phy_bitslip(phy_bitslip)
+        .o_phy_bitslip(phy_bitslip),
+        .o_phy_train_fail_gate(phy_train_fail_gate),
+        .o_phy_train_fail_eye(phy_train_fail_eye),
+        .o_phy_train_fail_wl(phy_train_fail_wl)
     );
 
     // -----------------------------------------------------------------
@@ -465,13 +403,13 @@ module ddr4_top #(
     ) u_prober (
         .i_clk(i_controller_clk),
         .i_rst_n(i_rst_n),
-        .i_start(bist_start),
         .i_calib_complete(calib_complete),
+        .i_calib_error(calib_error),
+        .o_init_done(o_init_done),
+        .o_init_failed(o_init_failed),
         .o_bist_busy(prober_bist_busy),
-        .o_bist_pass(prober_bist_pass),
-        .o_bist_fail(prober_bist_fail),
-        .o_correct_count(prober_correct),
-        .o_error_count(prober_error),
+        .o_bist_pass(),
+        .o_bist_fail(),
         .o_bist_reset_req(prober_reset_req),
         .o_wb_cyc(prober_wb_cyc),
         .o_wb_stb(prober_wb_stb),
@@ -482,10 +420,15 @@ module ddr4_top #(
         .i_wb_stall(bist_wb_stall),
         .i_wb_ack(bist_wb_ack),
         .i_wb_data(ctrl_wb_rdata),
-        .i_csr_sel(i_wb_addr[3:0]),
-        .i_csr_we(csr_we),
-        .i_csr_wdata(i_wb_data[31:0]),
-        .o_csr_data(prober_csr_data),
+        .i_wb_dbg_cyc(i_wb_dbg_cyc),
+        .i_wb_dbg_stb(i_wb_dbg_stb),
+        .i_wb_dbg_we(i_wb_dbg_we),
+        .i_wb_dbg_addr(i_wb_dbg_addr),
+        .i_wb_dbg_data(i_wb_dbg_data),
+        .i_wb_dbg_sel(i_wb_dbg_sel),
+        .o_wb_dbg_stall(o_wb_dbg_stall),
+        .o_wb_dbg_ack(o_wb_dbg_ack),
+        .o_wb_dbg_data(o_wb_dbg_data),
         .i_calib_state(ctrl_calib_state),
         .i_stage1_pending(ctrl_stage1_pending),
         .i_stage2_pending(ctrl_stage2_pending),
@@ -495,7 +438,8 @@ module ddr4_top #(
         .i_phy_state(phy_train_state),
         .i_phy_idelay_center(phy_idelay_center),
         .i_phy_wl_tap(phy_wl_tap),
-        .i_phy_bitslip(phy_bitslip)
+        .i_phy_bitslip(phy_bitslip),
+        .i_phy_train_fail({phy_train_fail_wl, phy_train_fail_eye, phy_train_fail_gate})
     );
 
 endmodule

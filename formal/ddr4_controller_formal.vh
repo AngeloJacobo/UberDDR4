@@ -232,13 +232,13 @@ end
 // ===================================================================
 // 4. Zero-Bubble Stall
 // During normal operation (reset_done, not refresh, calibration done),
-// stall must be LOW whenever stage1 is free. Calibration adds a
-// stall term until o_calib_complete --  guarded here so the property
-// only fires after training completes.
+// stall must be LOW whenever stage1 is free OR stage2 can absorb
+// stage1 this cycle (forwarding). This matches the RTL stall equation:
+//   o_wb_stall = (stage1_pending && !stage2_update) || ...
 // ===================================================================
 always @* begin
     if (reset_done && !refresh_active && o_calib_complete) begin
-        if (!stage1_pending)
+        if (!stage1_pending || stage2_update)
             assert(!o_wb_stall);
     end
 end
@@ -970,6 +970,96 @@ always @(posedge i_controller_clk) begin
             assert(cmd_d[READ_SLOT][10]  == 1'b0);
         end
     end
+end
+
+// ===================================================================
+// 23. Write Data Integrity (end-to-end: i_wb_data → o_dfi_wrdata)
+//
+// Proves the actual payload bits are preserved from Wishbone accept
+// through the 2-stage pipeline and fixed-length shift register to the
+// DFI output. Three layers:
+//   a) Shadow stage1/stage2 registers capture i_wb_data/i_wb_sel at
+//      the same events as the RTL — inductive because both sides are
+//      written identically on the same trigger.
+//   b) Shadow shift register mirrors wr_data_pipe_q, loaded from the
+//      shadow stage2 on sched_write — inductive (same structure).
+//   c) Assert DFI outputs match shadow pipe output.
+// ===================================================================
+
+// 23a: Shadow pipeline stages
+reg [WB_DATA_BITS-1:0] f_stage1_data;
+reg [WB_SEL_BITS-1:0]  f_stage1_dm;
+reg [WB_DATA_BITS-1:0] f_stage2_data;
+reg [WB_SEL_BITS-1:0]  f_stage2_dm;
+
+always @(posedge i_controller_clk) begin
+    if (!i_rst_n) begin
+        f_stage1_data <= {WB_DATA_BITS{1'b0}};
+        f_stage1_dm   <= {WB_SEL_BITS{1'b0}};
+        f_stage2_data <= {WB_DATA_BITS{1'b0}};
+        f_stage2_dm   <= {WB_SEL_BITS{1'b0}};
+    end else begin
+        if (wb_accept) begin
+            f_stage1_data <= i_wb_data;
+            f_stage1_dm   <= i_wb_sel;
+        end
+        if (stage2_update && stage1_pending) begin
+            f_stage2_data <= f_stage1_data;
+            f_stage2_dm   <= f_stage1_dm;
+        end
+    end
+end
+
+always @* begin
+    if (reset_done && o_calib_complete && i_wb_cyc) begin
+        if (stage1_pending) begin
+            assert(stage1_data == f_stage1_data);
+            assert(stage1_dm   == f_stage1_dm);
+        end
+        if (stage2_pending) begin
+            assert(stage2_data == f_stage2_data);
+            assert(stage2_dm   == f_stage2_dm);
+        end
+    end
+end
+
+// 23b: Shadow write data shift register
+reg [WB_DATA_BITS-1:0] f_wr_data_pipe [WRITE_DATA_DELAY:0];
+reg [WB_SEL_BITS-1:0]  f_wr_dm_pipe   [WRITE_DATA_DELAY:0];
+
+integer f_wdi;
+always @(posedge i_controller_clk) begin
+    if (!i_rst_n) begin
+        for (f_wdi = 0; f_wdi <= WRITE_DATA_DELAY; f_wdi = f_wdi + 1) begin
+            f_wr_data_pipe[f_wdi] <= {WB_DATA_BITS{1'b0}};
+            f_wr_dm_pipe[f_wdi]   <= {WB_SEL_BITS{1'b0}};
+        end
+    end else begin
+        for (f_wdi = 0; f_wdi < WRITE_DATA_DELAY; f_wdi = f_wdi + 1) begin
+            f_wr_data_pipe[f_wdi] <= f_wr_data_pipe[f_wdi + 1];
+            f_wr_dm_pipe[f_wdi]   <= f_wr_dm_pipe[f_wdi + 1];
+        end
+        f_wr_data_pipe[WRITE_DATA_DELAY] <= {WB_DATA_BITS{1'b0}};
+        f_wr_dm_pipe[WRITE_DATA_DELAY]   <= {WB_SEL_BITS{1'b0}};
+        if (sched_write) begin
+            f_wr_data_pipe[WRITE_DATA_DELAY] <= f_stage2_data;
+            f_wr_dm_pipe[WRITE_DATA_DELAY]   <= f_stage2_dm;
+        end
+    end
+end
+
+// 23c: Assert DFI outputs match shadow pipe
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && $past(reset_done)) begin
+        assert(o_dfi_wrdata      == $past(f_wr_data_pipe[0]));
+        assert(o_dfi_wrdata_mask == ~$past(f_wr_dm_pipe[0]));
+    end
+end
+
+// 23d: Cover — write data actually flows through
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && reset_done)
+        cover(|o_dfi_wrdata_en && |o_dfi_wrdata);
 end
 
 // ===================================================================

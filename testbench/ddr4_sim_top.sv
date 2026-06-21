@@ -106,7 +106,6 @@ module ddr4_sim_top;
     localparam WB_SEL_BITS    = WB_DATA_BITS / 8;
     localparam COL_LOW        = $clog2(SERDES_RATIO * 2);
     localparam WB_ADDR_BITS   = ROW_BITS + BG_BITS + BA_BITS + COL_BITS - COL_LOW;
-    localparam EXT_ADDR_BITS  = WB_ADDR_BITS + 1;
     localparam NUM_DEVICES    = (DEVICE_WIDTH == 16) ? (BYTE_LANES / 2) :
                                 (DEVICE_WIDTH == 4)  ? (BYTE_LANES * 2) :
                                                         BYTE_LANES;
@@ -129,6 +128,7 @@ module ddr4_sim_top;
 `else
     localparam FLY_BY = 0;
 `endif
+
 
 `ifdef SIM_ADDR_MAPPING
     localparam TB_ADDR_MAPPING = `SIM_ADDR_MAPPING;
@@ -199,12 +199,20 @@ module ddr4_sim_top;
     reg                      wb_cyc;
     reg                      wb_stb;
     reg                      wb_we;
-    reg [EXT_ADDR_BITS-1:0]  wb_addr;
+    reg [WB_ADDR_BITS-1:0]   wb_addr;
     reg [WB_DATA_BITS-1:0]   wb_data;
     reg [WB_SEL_BITS-1:0]    wb_sel;
     wire                     wb_stall;
     wire                     wb_ack;
     wire [WB_DATA_BITS-1:0]  wb_rdata;
+
+    // Debug CSR port (separate WB B4 — always accessible)
+    reg        wb_dbg_cyc, wb_dbg_stb, wb_dbg_we;
+    reg [3:0]  wb_dbg_addr;
+    reg [31:0] wb_dbg_data;
+    reg [3:0]  wb_dbg_sel;
+    wire       wb_dbg_stall, wb_dbg_ack;
+    wire [31:0] wb_dbg_rdata;
     wire                     init_done;
     wire                     init_failed;
 
@@ -215,13 +223,25 @@ module ddr4_sim_top;
         wb_addr    = 'z;
         wb_data    = 'z;
         wb_sel     = 'z;
+        wb_dbg_cyc    = 'z;
+        wb_dbg_stb    = 'z;
+        wb_dbg_we     = 'z;
+        wb_dbg_addr   = 'z;
+        wb_dbg_data   = 'z;
+        wb_dbg_sel    = 'z;
         #1;
         wb_cyc     = 1'b0;
         wb_stb     = 1'b0;
         wb_we      = 1'b0;
-        wb_addr    = {EXT_ADDR_BITS{1'b0}};
+        wb_addr    = {WB_ADDR_BITS{1'b0}};
         wb_data    = {WB_DATA_BITS{1'b0}};
         wb_sel     = {WB_SEL_BITS{1'b0}};
+        wb_dbg_cyc    = 1'b0;
+        wb_dbg_stb    = 1'b0;
+        wb_dbg_we     = 1'b0;
+        wb_dbg_addr   = 4'd0;
+        wb_dbg_data   = 32'd0;
+        wb_dbg_sel    = 4'hF;
     end
 
     // ===================================================================
@@ -254,6 +274,15 @@ module ddr4_sim_top;
         .o_wb_stall        (wb_stall),
         .o_wb_ack          (wb_ack),
         .o_wb_data         (wb_rdata),
+        .i_wb_dbg_cyc            (wb_dbg_cyc),
+        .i_wb_dbg_stb            (wb_dbg_stb),
+        .i_wb_dbg_we             (wb_dbg_we),
+        .i_wb_dbg_addr           (wb_dbg_addr),
+        .i_wb_dbg_data           (wb_dbg_data),
+        .i_wb_dbg_sel            (wb_dbg_sel),
+        .o_wb_dbg_stall          (wb_dbg_stall),
+        .o_wb_dbg_ack            (wb_dbg_ack),
+        .o_wb_dbg_data           (wb_dbg_rdata),
         .o_ddr4_ck_p       (ddr4_ck_p),
         .o_ddr4_ck_n       (ddr4_ck_n),
         .o_ddr4_reset_n    (ddr4_reset_n),
@@ -281,9 +310,9 @@ module ddr4_sim_top;
     // ===================================================================
     wire calib_complete_int = u_dut.calib_complete;
     wire bist_busy_int      = u_dut.prober_bist_busy;
-    wire bist_fail_int      = u_dut.prober_bist_fail;
-    wire [31:0] bist_correct_int = u_dut.prober_correct;
-    wire [31:0] bist_error_int   = u_dut.prober_error;
+    wire bist_fail_int      = u_dut.u_prober.o_bist_fail;
+    wire [31:0] bist_correct_int = u_dut.u_prober.correct_count_w;
+    wire [31:0] bist_error_int   = u_dut.u_prober.error_count_w;
 
     // ===================================================================
     // Micron DDR4 Models  -  direct instantiation (no wrapper module)
@@ -352,22 +381,24 @@ module ddr4_sim_top;
         end
 
         for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_bidi
-            for (gj = 0; gj < 8; gj = gj + 1) begin : gen_dq
+            begin : normal
+                for (gj = 0; gj < 8; gj = gj + 1) begin : gen_dq
+                    `ifdef XILINX_SIMULATOR
+                    short bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                    `else
+                    tran  bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                    `endif
+                end
                 `ifdef XILINX_SIMULATOR
-                short bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                short bidiDQS_t(iDDR4[gi].DQS_t, ddr4_dqs_p[gi]);
+                short bidiDQS_c(iDDR4[gi].DQS_c, ddr4_dqs_n[gi]);
+                short bidiDM   (iDDR4[gi].DM_n,   ddr4_dm_n[gi]);
                 `else
-                tran  bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                tran  bidiDQS_t(iDDR4[gi].DQS_t, ddr4_dqs_p[gi]);
+                tran  bidiDQS_c(iDDR4[gi].DQS_c, ddr4_dqs_n[gi]);
+                tran  bidiDM   (iDDR4[gi].DM_n,   ddr4_dm_n[gi]);
                 `endif
             end
-            `ifdef XILINX_SIMULATOR
-            short bidiDQS_t(iDDR4[gi].DQS_t, ddr4_dqs_p[gi]);
-            short bidiDQS_c(iDDR4[gi].DQS_c, ddr4_dqs_n[gi]);
-            short bidiDM   (iDDR4[gi].DM_n,   ddr4_dm_n[gi]);
-            `else
-            tran  bidiDQS_t(iDDR4[gi].DQS_t, ddr4_dqs_p[gi]);
-            tran  bidiDQS_c(iDDR4[gi].DQS_c, ddr4_dqs_n[gi]);
-            tran  bidiDM   (iDDR4[gi].DM_n,   ddr4_dm_n[gi]);
-            `endif
         end
 
         for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_mem
@@ -430,35 +461,37 @@ module ddr4_sim_top;
         end
 
         for (gi = 0; gi < NUM_DEVICES; gi = gi + 1) begin : gen_bidi
-            for (gj = 0; gj < 8; gj = gj + 1) begin : gen_dq_lo
+            begin : normal
+                for (gj = 0; gj < 8; gj = gj + 1) begin : gen_dq_lo
+                    `ifdef XILINX_SIMULATOR
+                    short bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[(gi*2)*8 + gj]);
+                    `else
+                    tran  bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[(gi*2)*8 + gj]);
+                    `endif
+                end
+                for (gj = 0; gj < 8; gj = gj + 1) begin : gen_dq_hi
+                    `ifdef XILINX_SIMULATOR
+                    short bidiDQ(iDDR4[gi].DQ[8 + gj], ddr4_dq[(gi*2+1)*8 + gj]);
+                    `else
+                    tran  bidiDQ(iDDR4[gi].DQ[8 + gj], ddr4_dq[(gi*2+1)*8 + gj]);
+                    `endif
+                end
                 `ifdef XILINX_SIMULATOR
-                short bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[(gi*2)*8 + gj]);
+                short bidiDQS_t0(iDDR4[gi].DQS_t[0], ddr4_dqs_p[gi*2]);
+                short bidiDQS_c0(iDDR4[gi].DQS_c[0], ddr4_dqs_n[gi*2]);
+                short bidiDQS_t1(iDDR4[gi].DQS_t[1], ddr4_dqs_p[gi*2+1]);
+                short bidiDQS_c1(iDDR4[gi].DQS_c[1], ddr4_dqs_n[gi*2+1]);
+                short bidiDM0   (iDDR4[gi].DM_n[0],   ddr4_dm_n[gi*2]);
+                short bidiDM1   (iDDR4[gi].DM_n[1],   ddr4_dm_n[gi*2+1]);
                 `else
-                tran  bidiDQ(iDDR4[gi].DQ[gj], ddr4_dq[(gi*2)*8 + gj]);
+                tran  bidiDQS_t0(iDDR4[gi].DQS_t[0], ddr4_dqs_p[gi*2]);
+                tran  bidiDQS_c0(iDDR4[gi].DQS_c[0], ddr4_dqs_n[gi*2]);
+                tran  bidiDQS_t1(iDDR4[gi].DQS_t[1], ddr4_dqs_p[gi*2+1]);
+                tran  bidiDQS_c1(iDDR4[gi].DQS_c[1], ddr4_dqs_n[gi*2+1]);
+                tran  bidiDM0   (iDDR4[gi].DM_n[0],   ddr4_dm_n[gi*2]);
+                tran  bidiDM1   (iDDR4[gi].DM_n[1],   ddr4_dm_n[gi*2+1]);
                 `endif
             end
-            for (gj = 0; gj < 8; gj = gj + 1) begin : gen_dq_hi
-                `ifdef XILINX_SIMULATOR
-                short bidiDQ(iDDR4[gi].DQ[8 + gj], ddr4_dq[(gi*2+1)*8 + gj]);
-                `else
-                tran  bidiDQ(iDDR4[gi].DQ[8 + gj], ddr4_dq[(gi*2+1)*8 + gj]);
-                `endif
-            end
-            `ifdef XILINX_SIMULATOR
-            short bidiDQS_t0(iDDR4[gi].DQS_t[0], ddr4_dqs_p[gi*2]);
-            short bidiDQS_c0(iDDR4[gi].DQS_c[0], ddr4_dqs_n[gi*2]);
-            short bidiDQS_t1(iDDR4[gi].DQS_t[1], ddr4_dqs_p[gi*2+1]);
-            short bidiDQS_c1(iDDR4[gi].DQS_c[1], ddr4_dqs_n[gi*2+1]);
-            short bidiDM0   (iDDR4[gi].DM_n[0],   ddr4_dm_n[gi*2]);
-            short bidiDM1   (iDDR4[gi].DM_n[1],   ddr4_dm_n[gi*2+1]);
-            `else
-            tran  bidiDQS_t0(iDDR4[gi].DQS_t[0], ddr4_dqs_p[gi*2]);
-            tran  bidiDQS_c0(iDDR4[gi].DQS_c[0], ddr4_dqs_n[gi*2]);
-            tran  bidiDQS_t1(iDDR4[gi].DQS_t[1], ddr4_dqs_p[gi*2+1]);
-            tran  bidiDQS_c1(iDDR4[gi].DQS_c[1], ddr4_dqs_n[gi*2+1]);
-            tran  bidiDM0   (iDDR4[gi].DM_n[0],   ddr4_dm_n[gi*2]);
-            tran  bidiDM1   (iDDR4[gi].DM_n[1],   ddr4_dm_n[gi*2+1]);
-            `endif
         end
 
         for (gi = 0; gi < NUM_DEVICES; gi = gi + 1) begin : gen_mem
@@ -553,31 +586,33 @@ module ddr4_sim_top;
         end
 
         for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_bidi
-            for (gj = 0; gj < 4; gj = gj + 1) begin : gen_dq_lo
+            begin : normal
+                for (gj = 0; gj < 4; gj = gj + 1) begin : gen_dq_lo
+                    `ifdef XILINX_SIMULATOR
+                    short bidiDQ(iDDR4_lo[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                    `else
+                    tran  bidiDQ(iDDR4_lo[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                    `endif
+                end
+                for (gj = 0; gj < 4; gj = gj + 1) begin : gen_dq_hi
+                    `ifdef XILINX_SIMULATOR
+                    short bidiDQ(iDDR4_hi[gi].DQ[gj], ddr4_dq[gi*8 + 4 + gj]);
+                    `else
+                    tran  bidiDQ(iDDR4_hi[gi].DQ[gj], ddr4_dq[gi*8 + 4 + gj]);
+                    `endif
+                end
                 `ifdef XILINX_SIMULATOR
-                short bidiDQ(iDDR4_lo[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                short bidiDQS_tlo(iDDR4_lo[gi].DQS_t, ddr4_dqs_p[gi]);
+                short bidiDQS_clo(iDDR4_lo[gi].DQS_c, ddr4_dqs_n[gi]);
+                short bidiDQS_thi(iDDR4_hi[gi].DQS_t, ddr4_dqs_p[gi]);
+                short bidiDQS_chi(iDDR4_hi[gi].DQS_c, ddr4_dqs_n[gi]);
                 `else
-                tran  bidiDQ(iDDR4_lo[gi].DQ[gj], ddr4_dq[gi*8 + gj]);
+                tran  bidiDQS_tlo(iDDR4_lo[gi].DQS_t, ddr4_dqs_p[gi]);
+                tran  bidiDQS_clo(iDDR4_lo[gi].DQS_c, ddr4_dqs_n[gi]);
+                tran  bidiDQS_thi(iDDR4_hi[gi].DQS_t, ddr4_dqs_p[gi]);
+                tran  bidiDQS_chi(iDDR4_hi[gi].DQS_c, ddr4_dqs_n[gi]);
                 `endif
             end
-            for (gj = 0; gj < 4; gj = gj + 1) begin : gen_dq_hi
-                `ifdef XILINX_SIMULATOR
-                short bidiDQ(iDDR4_hi[gi].DQ[gj], ddr4_dq[gi*8 + 4 + gj]);
-                `else
-                tran  bidiDQ(iDDR4_hi[gi].DQ[gj], ddr4_dq[gi*8 + 4 + gj]);
-                `endif
-            end
-            `ifdef XILINX_SIMULATOR
-            short bidiDQS_tlo(iDDR4_lo[gi].DQS_t, ddr4_dqs_p[gi]);
-            short bidiDQS_clo(iDDR4_lo[gi].DQS_c, ddr4_dqs_n[gi]);
-            short bidiDQS_thi(iDDR4_hi[gi].DQS_t, ddr4_dqs_p[gi]);
-            short bidiDQS_chi(iDDR4_hi[gi].DQS_c, ddr4_dqs_n[gi]);
-            `else
-            tran  bidiDQS_tlo(iDDR4_lo[gi].DQS_t, ddr4_dqs_p[gi]);
-            tran  bidiDQS_clo(iDDR4_lo[gi].DQS_c, ddr4_dqs_n[gi]);
-            tran  bidiDQS_thi(iDDR4_hi[gi].DQS_t, ddr4_dqs_p[gi]);
-            tran  bidiDQS_chi(iDDR4_hi[gi].DQS_c, ddr4_dqs_n[gi]);
-            `endif
         end
 
         for (gi = 0; gi < BYTE_LANES; gi = gi + 1) begin : gen_mem
@@ -986,29 +1021,29 @@ module ddr4_sim_top;
     localparam COL_SHIFT = BG_BITS;
 
     // Row offsets for first/middle/last row testing
-    localparam [EXT_ADDR_BITS-1:0] FIRST_ROW_OFF = 0,
+    localparam [WB_ADDR_BITS-1:0] FIRST_ROW_OFF = 0,
                                     MID_ROW_OFF   = (1 << (ROW_BITS/2)) << ROW_SHIFT,
                                     LAST_ROW_OFF  = ((1 << ROW_BITS) - 4) << ROW_SHIFT;
 
     // Base addresses: BG selection (bits [1:0])
-    localparam [EXT_ADDR_BITS-1:0] ADDR_BG0 = 0, ADDR_BG1 = 1,
+    localparam [WB_ADDR_BITS-1:0] ADDR_BG0 = 0, ADDR_BG1 = 1,
                                     ADDR_BG2 = 2, ADDR_BG3 = 3;
 
     // BA offsets (bits [10:9])
-    localparam [EXT_ADDR_BITS-1:0] BA0_OFF = 0,
+    localparam [WB_ADDR_BITS-1:0] BA0_OFF = 0,
                                     BA1_OFF = (1 << BA_SHIFT),
                                     BA2_OFF = (2 << BA_SHIFT),
                                     BA3_OFF = (3 << BA_SHIFT);
 
     // Column offsets (bits [8:2])
-    localparam [EXT_ADDR_BITS-1:0] COL1_OFF = (1 << COL_SHIFT),
+    localparam [WB_ADDR_BITS-1:0] COL1_OFF = (1 << COL_SHIFT),
                                     COL2_OFF = (2 << COL_SHIFT);
 
     // Row offset for row-miss testing (bits [26:11])
-    localparam [EXT_ADDR_BITS-1:0] ROW1_OFF = (1 << ROW_SHIFT);
+    localparam [WB_ADDR_BITS-1:0] ROW1_OFF = (1 << ROW_SHIFT);
 
     // Composite addresses (backward-compatible names)
-    localparam [EXT_ADDR_BITS-1:0] ROW0_BG0 = ADDR_BG0,
+    localparam [WB_ADDR_BITS-1:0] ROW0_BG0 = ADDR_BG0,
                                     ROW0_BG1 = ADDR_BG1,
                                     ROW0_BG2 = ADDR_BG2,
                                     ROW0_BG3 = ADDR_BG3,
@@ -1033,8 +1068,7 @@ module ddr4_sim_top;
                                     ROW0_BG2_BA3 = BA3_OFF | ADDR_BG2,
                                     ROW0_BG3_BA1 = BA1_OFF | ADDR_BG3,
                                     ROW0_BG3_BA2 = BA2_OFF | ADDR_BG3,
-                                    ROW0_BG3_BA3 = BA3_OFF | ADDR_BG3,
-                                    CSR_BASE = 1 << WB_ADDR_BITS;
+                                    ROW0_BG3_BA3 = BA3_OFF | ADDR_BG3;
 
     // -----------------------------------------------------------------
     // Wishbone helper tasks
@@ -1049,9 +1083,12 @@ module ddr4_sim_top;
     // wb_write_read_check - write, drain, read-back, compare
     // wb_read_check  - read-only compare (data must already be in DRAM)
     // wb_write_masked- write with partial wb_sel (byte-lane mask for DM)
+    //
+    // wb_dbg_read       - read a CSR register via the debug port
+    // wb_dbg_write      - write a CSR register via the debug port
     // -----------------------------------------------------------------
 
-    task wb_write_one(input [EXT_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data);
+    task wb_write_one(input [WB_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data);
         begin
             wb_cyc  = 1'b1;
             wb_stb  = 1'b1;
@@ -1061,10 +1098,11 @@ module ddr4_sim_top;
             wb_sel  = {WB_SEL_BITS{1'b1}};
             @(posedge controller_clk);
             while (wb_stall) @(posedge controller_clk);
+            wb_stb = 1'b0;
         end
     endtask
 
-    task wb_read_one(input [EXT_ADDR_BITS-1:0] addr);
+    task wb_read_one(input [WB_ADDR_BITS-1:0] addr);
         begin
             wb_cyc  = 1'b1;
             wb_stb  = 1'b1;
@@ -1073,6 +1111,7 @@ module ddr4_sim_top;
             wb_sel  = {WB_SEL_BITS{1'b1}};
             @(posedge controller_clk);
             while (wb_stall) @(posedge controller_clk);
+            wb_stb = 1'b0;
         end
     endtask
 
@@ -1081,6 +1120,45 @@ module ddr4_sim_top;
             wb_stb = 1'b0;
             wb_cyc = 1'b0;
             wb_we  = 1'b0;
+        end
+    endtask
+
+    // Debug CSR port tasks (always accessible, 1-cycle latency).
+    // The slave is zero-wait-state: accepts on EDGE A, responds on EDGE B.
+    // No ACK polling needed — deterministic 2-edge sequence.
+    task wb_dbg_read(input [3:0] addr);
+        begin
+            wb_dbg_cyc  = 1'b1;
+            wb_dbg_stb  = 1'b1;
+            wb_dbg_we   = 1'b0;
+            wb_dbg_addr = addr;
+            wb_dbg_sel  = 4'hF;
+            @(posedge controller_clk); // EDGE A: slave accepts request
+            wb_dbg_stb = 1'b0;
+            @(posedge controller_clk); // EDGE B: ACK + data valid
+            // wb_dbg_rdata is valid at this point
+        end
+    endtask
+
+    task wb_dbg_write(input [3:0] addr, input [31:0] wdata);
+        begin
+            wb_dbg_cyc  = 1'b1;
+            wb_dbg_stb  = 1'b1;
+            wb_dbg_we   = 1'b1;
+            wb_dbg_addr = addr;
+            wb_dbg_data = wdata;
+            wb_dbg_sel  = 4'hF;
+            @(posedge controller_clk); // EDGE A: slave accepts + executes write
+            wb_dbg_stb = 1'b0;
+            @(posedge controller_clk); // EDGE B: ACK asserted (write complete)
+        end
+    endtask
+
+    task wb_dbg_idle;
+        begin
+            wb_dbg_stb = 1'b0;
+            wb_dbg_cyc = 1'b0;
+            wb_dbg_we  = 1'b0;
         end
     endtask
 
@@ -1105,7 +1183,7 @@ module ddr4_sim_top;
     initial rd_err_count = 0;
 
     task wb_write_read_check(
-        input [EXT_ADDR_BITS-1:0] addr,
+        input [WB_ADDR_BITS-1:0] addr,
         input [WB_DATA_BITS-1:0]  wdata
     );
         reg [WB_DATA_BITS-1:0] captured;
@@ -1130,7 +1208,7 @@ module ddr4_sim_top;
     endtask
 
     task wb_read_check(
-        input [EXT_ADDR_BITS-1:0] addr,
+        input [WB_ADDR_BITS-1:0] addr,
         input [WB_DATA_BITS-1:0]  expected
     );
         reg [WB_DATA_BITS-1:0] captured;
@@ -1152,7 +1230,7 @@ module ddr4_sim_top;
     endtask
 
     task wb_write_masked(
-        input [EXT_ADDR_BITS-1:0] addr,
+        input [WB_ADDR_BITS-1:0] addr,
         input [WB_DATA_BITS-1:0]  data,
         input [WB_SEL_BITS-1:0]   sel
     );
@@ -1167,6 +1245,7 @@ module ddr4_sim_top;
             wb_data = data;
             wb_sel  = sel;
             @(posedge controller_clk);
+            wb_stb = 1'b0;
         end
     endtask
 
@@ -1195,7 +1274,7 @@ module ddr4_sim_top;
         // === Row-offset loop: run corner-case phases at first/middle/last row ===
         begin : row_loop_blk
             integer row_iter;
-            reg [EXT_ADDR_BITS-1:0] row_base;
+            reg [WB_ADDR_BITS-1:0] row_base;
             for (row_iter = 0; row_iter < 3; row_iter = row_iter + 1) begin
                 case (row_iter)
                     0: row_base = FIRST_ROW_OFF;
@@ -1473,8 +1552,8 @@ module ddr4_sim_top;
             $display("[%0t] === Phase L: Byte-lane masking (DM verification) ===", $realtime);
         end
         if (DEVICE_WIDTH != 4) begin : phase_l_blk
-            localparam [EXT_ADDR_BITS-1:0] PL_ADDR0 = (5 << 10) | 0;
-            localparam [EXT_ADDR_BITS-1:0] PL_ADDR1 = (5 << 10) | 1;
+            localparam [WB_ADDR_BITS-1:0] PL_ADDR0 = (5 << 10) | 0;
+            localparam [WB_ADDR_BITS-1:0] PL_ADDR1 = (5 << 10) | 1;
 
             wb_write_one(PL_ADDR0, 128'hAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
             drain_pipeline;
@@ -1593,7 +1672,7 @@ module ddr4_sim_top;
             integer ref_start_o;
             integer po_iter;
             integer po_i;
-            reg [EXT_ADDR_BITS-1:0] po_addr;
+            reg [WB_ADDR_BITS-1:0] po_addr;
 
             ref_start_o = ref_count;
             po_iter = 0;
@@ -1638,7 +1717,7 @@ module ddr4_sim_top;
         begin : phase_q_blk
             integer pq_bg, pq_ba;
             integer pq_err_start;
-            reg [EXT_ADDR_BITS-1:0] pq_addr;
+            reg [WB_ADDR_BITS-1:0] pq_addr;
             reg [WB_DATA_BITS-1:0] pq_data;
             pq_err_start = rd_err_count;
             phase_q_start = cycle_count;
@@ -1675,16 +1754,12 @@ module ddr4_sim_top;
         $display("[%0t] === CSR Read Test: registers 0x0-0xC ===", $realtime);
         begin : csr_read_block
             integer csr_idx;
-            reg [WB_DATA_BITS-1:0] csr_val;
             reg [31:0] csr_vals [0:12];
             for (csr_idx = 0; csr_idx < 13; csr_idx = csr_idx + 1) begin
-                wb_read_one(CSR_BASE | csr_idx);
-                wb_stb = 1'b0;
-                while (!wb_ack) @(posedge controller_clk);
-                csr_val = wb_rdata;
-                csr_vals[csr_idx] = csr_val[31:0];
-                wb_idle;
-                $display("[%0t]   CSR[0x%0h] = 0x%08h", $realtime, csr_idx, csr_val[31:0]);
+                wb_dbg_read(csr_idx[3:0]);
+                csr_vals[csr_idx] = wb_dbg_rdata;
+                wb_dbg_idle;
+                $display("[%0t]   CSR[0x%0h] = 0x%08h", $realtime, csr_idx, csr_vals[csr_idx]);
                 repeat (2) @(posedge controller_clk);
             end
 
@@ -1729,7 +1804,8 @@ module ddr4_sim_top;
         // the automatic post-init run has already completed.
         test_phase = "RETRIG";
         $display("[%0t] === BIST Re-trigger Test (via CSR 0xC) ===", $realtime);
-        wb_write_one(CSR_BASE | 4'hC, {{(WB_DATA_BITS-1){1'b0}}, 1'b1});
+        wb_dbg_write(4'hC, 32'd1);
+        wb_dbg_idle;
         drain_pipeline;
         begin : retrig_block
             integer retrig_timeout;
@@ -1738,11 +1814,9 @@ module ddr4_sim_top;
             repeat (100) @(posedge controller_clk);
             csr5_val = 32'd0;
             while (retrig_timeout < 200000) begin
-                wb_read_one(CSR_BASE | 4'h5);
-                wb_stb = 1'b0;
-                while (!wb_ack) @(posedge controller_clk);
-                csr5_val = wb_rdata[31:0];
-                wb_idle;
+                wb_dbg_read(4'h5);
+                csr5_val = wb_dbg_rdata;
+                wb_dbg_idle;
                 if (!csr5_val[3]) break;
                 repeat (1000) @(posedge controller_clk);
                 retrig_timeout = retrig_timeout + 1000;
@@ -1764,25 +1838,19 @@ module ddr4_sim_top;
         begin : csr_post_retrig
             reg [31:0] cv3, cv4, cv5;
 
-            wb_read_one(CSR_BASE | 4'h3);
-            wb_stb = 1'b0;
-            while (!wb_ack) @(posedge controller_clk);
-            cv3 = wb_rdata[31:0];
-            wb_idle;
+            wb_dbg_read(4'h3);
+            cv3 = wb_dbg_rdata;
+            wb_dbg_idle;
             repeat (2) @(posedge controller_clk);
 
-            wb_read_one(CSR_BASE | 4'h4);
-            wb_stb = 1'b0;
-            while (!wb_ack) @(posedge controller_clk);
-            cv4 = wb_rdata[31:0];
-            wb_idle;
+            wb_dbg_read(4'h4);
+            cv4 = wb_dbg_rdata;
+            wb_dbg_idle;
             repeat (2) @(posedge controller_clk);
 
-            wb_read_one(CSR_BASE | 4'h5);
-            wb_stb = 1'b0;
-            while (!wb_ack) @(posedge controller_clk);
-            cv5 = wb_rdata[31:0];
-            wb_idle;
+            wb_dbg_read(4'h5);
+            cv5 = wb_dbg_rdata;
+            wb_dbg_idle;
             repeat (2) @(posedge controller_clk);
 
             $display("[%0t]   Post-retrig CSR[3]=%0d CSR[4]=%0d CSR[5]=0x%0h",
