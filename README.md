@@ -99,8 +99,10 @@ Generate all clocks from a single MMCM/PLL.
 | `i_wb_data` | in | Write data (`WB_DATA_BITS` wide, default 128 bits) |
 | `i_wb_sel` | in | Byte select / write strobe (`WB_SEL_BITS` wide) |
 | `o_wb_stall` | out | Pipeline stall (do not issue new STB when high) |
-| `o_wb_ack` | out | Transfer acknowledge |
+| `o_wb_ack` | out | Transfer acknowledge (guaranteed in-order via shared ACK pipe) |
 | `o_wb_data` | out | Read data (`WB_DATA_BITS` wide) |
+
+ACKs are returned strictly in request order using a shared shift-register (`ack_pipe_q`). Reads are inserted at the far end (full CAS latency) while writes are inserted at a variable position closer to the output, ensuring writes ACK faster when no earlier read is pending. Read ACKs are gated by `i_dfi_rddata_valid` via a `read_data_pending` counter — the pipe stalls if data hasn't arrived from the PHY yet, making the design robust to PHYs with variable or larger `tphy_rdlat`.
 
 ### Debug CSR Wishbone B4 Port (Separate, Always Accessible)
 
@@ -208,7 +210,7 @@ CSR registers are 32-bit, accessed via the dedicated debug Wishbone port (`i_wb_
 | 0x7 | PHY Lane 1 | RO | `[8:0]` idelay_center, `[17:9]` wl_tap, `[20:18]` bitslip |
 | 0xA | Configuration | RO | `[1:0]` BIST_MODE, `[7:4]` BYTE_LANES |
 | 0xB | Version | RO | `[7:0]` minor, `[15:8]` major |
-| 0xC | Control | WO | Write bit[0]=1 to trigger BIST start |
+| 0xC | Control | R/W | `[0]` W1S: trigger BIST start, `[1]` W1S: soft reset (re-calibrate), `[2]` R/W: enable auto-reset on BIST fail (default 0) |
 
 ***
 

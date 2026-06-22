@@ -488,6 +488,14 @@ module ddr4_controller #(
     //
     localparam READ_DELAY = find_delay(CL_nCK, READ_SLOT, READ_SLOT);
     localparam RDDATA_EN_PIPE_WIDTH = READ_DELAY + 4;
+    // ACK ordering pipe: shared shift register for both read and write ACKs.
+    // Width sized so a read bit inserted at [MSB] exits [0] at the same cycle
+    // o_wb_data is valid:  W shifts (rddata_en pipe) + 1 (PHY rddata_valid reg)
+    // + 1 (controller o_wb_data latch) = W+2 cycles total from sched_read.
+    // Pipe bit travels MSB-to-[0] in (ACK_PIPE_WIDTH-1) shifts, so width = W+3.
+    // Reads: inserted at [ACK_PIPE_WIDTH-1] (far end, full latency).
+    // Writes: inserted at [write_ack_idx_q] (variable, min 1 = fast path).
+    localparam ACK_PIPE_WIDTH = RDDATA_EN_PIPE_WIDTH + 3;
     // Write analog: CWL -> controller cycles. No "+4", the write
     // path has no return pipeline; OSERDES DQ/DQS latency is
     // handled by the PHY's wrdata_en_shift register.
@@ -712,12 +720,20 @@ module ddr4_controller #(
     // issues, then shifts right each cycle until it falls out at bit 0.
     reg[RDDATA_EN_PIPE_WIDTH-1:0] rddata_en_pipe_q;
     reg[WRITE_DATA_DELAY:0]       wrdata_en_pipe_q;
-    reg                           write_ack_q;
-    reg                           read_ack_q;
+    reg[ACK_PIPE_WIDTH-1:0]       ack_pipe_q;
+    reg[ACK_PIPE_WIDTH-1:0]       ack_is_read_q;
+    reg[$clog2(ACK_PIPE_WIDTH)-1:0] write_ack_idx_q;
+    reg[$clog2(ACK_PIPE_WIDTH):0] read_data_pending_q;
+
+    // Pipe stalls when a read is at [0] but no read data has arrived yet.
+    // This ensures o_wb_ack never fires before o_wb_data is valid, making
+    // the design robust to PHYs with variable or larger tphy_rdlat.
+    wire pipe_stall = ack_pipe_q[0] && ack_is_read_q[0]
+                    && (read_data_pending_q == 0);
 
     // -- Static outputs --
     // WB B4 Rule 3.30 compliance handled by ddr4_top (CYC gating at top-level output)
-    assign o_wb_ack = i_rst_n && reset_done && (write_ack_q || read_ack_q);
+    assign o_wb_ack = i_rst_n && reset_done && ack_pipe_q[0] && !pipe_stall;
     assign o_dfi_init_start = ~reset_done; // request PHY init until ROM completes
 
     // =============================================================================================================
@@ -730,8 +746,9 @@ module ddr4_controller #(
     //
     //    STB+WE ──────► stage1_pending ───► stage2_pending ───► sched_write
     //                                                               │
-    //   o_wb_ack ◄────────────────────────── write_ack_q ◄──────────┤ 
-    //                 (+1 clk)                                      │
+    //                                                               ├─► ack_pipe_q[write_ack_idx_q] (variable pos)
+    //                                                               │        │  shift right ──► ack_pipe_q[0] ──► o_wb_ack
+    //                                                               │
     //                                                               └─► wrdata_en_pipe_q ──► o_dfi_wrdata_en
     //                                                                 (+WRITE_DATA_DELAY)
     //
@@ -739,15 +756,16 @@ module ddr4_controller #(
     //
     //    STB+!WE ─────► stage1_pending ───► stage2_pending ───► sched_read
     //                                                               │
+    //                                                               ├─► ack_pipe_q[ACK_PIPE_WIDTH-1] (far end)
+    //                                                               │        │  shift right ──► ack_pipe_q[0] ──► o_wb_ack
+    //                                                               │
     //                                                               └──► rddata_en_pipe_q ──► o_dfi_rddata_en
     //                                                                (+RDDATA_EN_PIPE_WIDTH)
-    //                                                                              
-    //   o_wb_ack ◄───────────────────────────────────────────────────────── read_ack_q ◄───── i_dfi_rddata_valid
     //
-    // Key differences:
-    //   - WRITE: ACK fires 1 cycle after sched_write (data already captured)
-    //   - READ:  ACK fires 1 cycle after PHY returns rddata_valid (variable latency)
-    //   - Both paths share Stage 1/2; direction selected by stage2_we
+    // ACK ordering: both reads and writes share ack_pipe_q. Reads always
+    // enter at the far end (full latency). Writes enter at write_ack_idx_q
+    // which is closer to [0] (fast) when no read is ahead, or reset to the
+    // far end after a read (ensuring the read exits first).
     // =============================================================================================================
 
     // =====================================================================
@@ -1120,7 +1138,7 @@ module ddr4_controller #(
                 //         (b) tCCD elapsed (ccd_counter per bank group).
                 // ODT (On-Die Termination) is enabled for writes — the
                 // DRAM switches its termination resistors to transmit mode.
-                if (stage2_we
+                if (stage2_we && !pipe_stall
                     && (delay_before_write_counter_q[stage2_bank] <= 1)
                     && (ccd_counter_q[stage2_bg] <= 1)) begin
                     sched_write = 1'b1;
@@ -1156,7 +1174,7 @@ module ddr4_controller #(
                 //             any prior WRITE's data to clear the bus
                 //             before driving a READ.
                 // ODT stays off for reads — DRAM is in receive mode.
-                else if (!stage2_we
+                else if (!stage2_we && !pipe_stall
                          && (delay_before_read_counter_q[stage2_bank] <= 1)
                          && (ccd_counter_q[stage2_bg] <= 1)
                          && (wtr_counter_q[stage2_bg] <= 1)) begin
@@ -1326,8 +1344,10 @@ module ddr4_controller #(
                 wr_data_pipe_q[bank_i] <= {WB_DATA_BITS{1'b0}};
                 wr_dm_pipe_q[bank_i]   <= {WB_SEL_BITS{1'b0}};
             end
-            write_ack_q <= 1'b0;
-            read_ack_q  <= 1'b0;
+            ack_pipe_q          <= {ACK_PIPE_WIDTH{1'b0}};
+            ack_is_read_q       <= {ACK_PIPE_WIDTH{1'b0}};
+            write_ack_idx_q     <= 1;
+            read_data_pending_q <= 0;
             stage1_pending <= 1'b0;
             stage1_we      <= 1'b0;
             stage1_data    <= {WB_DATA_BITS{1'b0}};
@@ -1601,11 +1621,40 @@ module ddr4_controller #(
                 o_wb_data <= i_dfi_rddata;
             end
 
-            // WB ACK generation
-            // Write ACK: 1 cycle after WR command issues
-            // Read ACK: 1 cycle after dfi_rddata_valid (data latch delay)
-            write_ack_q <= sched_write;
-            read_ack_q  <= |i_dfi_rddata_valid;
+            // WB ACK ordering pipe — shared shift register.
+            // Gated by pipe_stall: when a read is at [0] but data hasn't
+            // arrived from the PHY yet, the entire pipe freezes until
+            // i_dfi_rddata_valid fires and o_wb_data is latched.
+            if (!pipe_stall) begin
+                ack_pipe_q    <= {1'b0, ack_pipe_q[ACK_PIPE_WIDTH-1:1]};
+                ack_is_read_q <= {1'b0, ack_is_read_q[ACK_PIPE_WIDTH-1:1]};
+                write_ack_idx_q <= (write_ack_idx_q > 1)
+                                 ? write_ack_idx_q - 1'b1 : write_ack_idx_q;
+            end
+            if (sched_write) begin
+                ack_pipe_q[write_ack_idx_q]    <= 1'b1;
+                ack_is_read_q[write_ack_idx_q] <= 1'b0;
+                write_ack_idx_q <= write_ack_idx_q; // hold
+            end
+            if (sched_read) begin
+                ack_pipe_q[ACK_PIPE_WIDTH-1]    <= 1'b1;
+                ack_is_read_q[ACK_PIPE_WIDTH-1] <= 1'b1;
+                write_ack_idx_q <= ACK_PIPE_WIDTH[$clog2(ACK_PIPE_WIDTH)-1:0] - 1'b1;
+            end
+            // read_data_pending: tracks PHY read returns not yet consumed by ACK.
+            // Gated by reset_done: training rddata_valid (MPR reads) must not count.
+            if (reset_done) begin
+                if (|i_dfi_rddata_valid && !(ack_pipe_q[0] && ack_is_read_q[0] && !pipe_stall))
+                    read_data_pending_q <= read_data_pending_q + 1'b1;
+                else if (!(|i_dfi_rddata_valid) && (ack_pipe_q[0] && ack_is_read_q[0] && !pipe_stall))
+                    read_data_pending_q <= read_data_pending_q - 1'b1;
+            end
+            if (!i_wb_cyc) begin
+                ack_pipe_q          <= {ACK_PIPE_WIDTH{1'b0}};
+                ack_is_read_q       <= {ACK_PIPE_WIDTH{1'b0}};
+                write_ack_idx_q     <= 1;
+                read_data_pending_q <= 0;
+            end
 
             // ===========================================================
             // Training Command Pump (DFI 3.1 Full Training Mode)

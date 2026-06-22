@@ -94,7 +94,7 @@ always @(posedge i_controller_clk) f_past_valid <= 1'b1;
 always @* begin
     if (reset_done && i_rst_n
         && (stage1_pending || stage2_pending
-            || write_ack_q || |rddata_en_pipe_q || read_ack_q))
+            || |ack_pipe_q || |rddata_en_pipe_q))
         assume(i_wb_cyc);
 end
 
@@ -154,19 +154,15 @@ fwb_slave #(
 );
 
 // Prop 18: Pipeline occupancy equals fwb_slave's outstanding counter.
-// Both sides increment on wb_accept and decrement on o_wb_ack. Proven
-// correct from reset (base case passes). Used as assume because
-// read_ack_q is registered from the free PHY input i_dfi_rddata_valid;
-// at induction step 0 the solver sets read_ack_q without structural
-// justification. Upgrading to assert requires internalizing the read
-// return path in RTL (as UberDDR3 does).
+// A request lives in exactly one of: stage1, stage2, or ack_pipe.
+// Used as assume because fwb_slave's internal counters (f_nreqs, f_nacks)
+// are free at induction step 0 — no RTL invariant can constrain them.
+// Base case passes from reset; assume prevents unreachable induction states.
 always @* begin
     if (reset_done && i_wb_cyc && i_rst_n)
         assume(f_outstanding ==
                stage1_pending + stage2_pending
-               + write_ack_q
-               + $countones(rddata_en_pipe_q)
-               + read_ack_q);
+               + $countones(ack_pipe_q));
 end
 
 // ===================================================================
@@ -602,13 +598,13 @@ always @* begin
             && (rrd_counter_q[stage2_bg] <= 1)
             && !tfaw_blocked)
             assert(sched_activate);
-        if (stage2_we
+        if (stage2_we && !pipe_stall
             && bank_status_q[stage2_bank]
             && (bank_active_row_q[stage2_bank] == stage2_row)
             && (delay_before_write_counter_q[stage2_bank] <= 1)
             && (ccd_counter_q[stage2_bg] <= 1))
             assert(sched_write);
-        if (!stage2_we
+        if (!stage2_we && !pipe_stall
             && bank_status_q[stage2_bank]
             && (bank_active_row_q[stage2_bank] == stage2_row)
             && (delay_before_read_counter_q[stage2_bank] <= 1)
@@ -775,17 +771,70 @@ end
 // ===================================================================
 
 // ===================================================================
-// 16. Write ACK Correctness
-// write_ack_q is a 1-cycle registered version of sched_write.
-// Proves the WB ACK for writes fires at exactly the right time.
+// 16. ACK Pipe Ordering & Bounds
+// The ack_pipe_q shift register guarantees WB B4 in-order ACKs.
+// write_ack_idx_q must always stay in [1, ACK_PIPE_WIDTH-1].
 // ===================================================================
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n)) begin
-        assert(write_ack_q == $past(sched_write));
+        assert(write_ack_idx_q >= 1);
+        assert(write_ack_idx_q < ACK_PIPE_WIDTH);
     end
 end
 
 // o_wb_ack is gated by reset_done in the RTL, so no ACK leaks during init
+
+// Prop 16b: ACK pipe must be empty during init (before reset_done).
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && !reset_done) begin
+        assert(ack_pipe_q == {ACK_PIPE_WIDTH{1'b0}});
+        assert(ack_is_read_q == {ACK_PIPE_WIDTH{1'b0}});
+        assert(read_data_pending_q == 0);
+    end
+end
+
+// Prop 16c: After CYC drops, pipe clears on next cycle.
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && reset_done
+        && !$past(i_wb_cyc) && $past(reset_done)) begin
+        assert(ack_pipe_q == {ACK_PIPE_WIDTH{1'b0}});
+        assert(read_data_pending_q == 0);
+    end
+end
+
+// Prop 16d: o_wb_ack never fires when pipe_stall is active.
+always @* begin
+    if (reset_done && i_rst_n && pipe_stall)
+        assert(!o_wb_ack);
+end
+
+// ===================================================================
+// 16g. ACK Ordering Proof (Structural Invariant)
+// Proves ordering by showing that all occupied positions in the pipe
+// are at or below write_ack_idx_q. Since:
+//   - Writes insert at write_ack_idx_q (highest occupied position)
+//   - Reads insert at [MSB] and reset idx to MSB
+//   - The shift register moves all bits towards [0]
+// ...no newer request can ever be at a LOWER position than an older
+// one. Lower positions exit first → ACKs fire in acceptance order.
+// ===================================================================
+integer f_order_pos;
+always @* begin
+    if (reset_done && i_rst_n && i_wb_cyc) begin
+        for (f_order_pos = 0; f_order_pos < ACK_PIPE_WIDTH; f_order_pos = f_order_pos + 1) begin
+            if (ack_pipe_q[f_order_pos])
+                assert(f_order_pos[$clog2(ACK_PIPE_WIDTH)-1:0] <= write_ack_idx_q);
+        end
+    end
+end
+
+// No dispatch during pipe_stall — prevents position collisions
+always @(posedge i_controller_clk) begin
+    if (f_past_valid && $past(i_rst_n) && $past(pipe_stall)) begin
+        assert(!$past(sched_write));
+        assert(!$past(sched_read));
+    end
+end
 
 // ===================================================================
 // 17. rddata_en / wrdata_en Pipeline Correctness
@@ -915,6 +964,17 @@ always @* begin
                           + 1;
         end
     end
+end
+
+// PHY contract: rddata_valid arrives within the designed ACK pipe latency,
+// so pipe_stall never activates. Guaranteed when ACK_PIPE_WIDTH matches
+// the PHY's actual tphy_rdlat. The non-bounded tasks (prove_map0/1)
+// prove ordering correctness WITHOUT this assumption (i.e., even if the
+// PHY is slow). The bounded tasks additionally prove stall is bounded
+// given the PHY meets its timing contract.
+always @* begin
+    if (reset_done && i_rst_n)
+        assume(!pipe_stall);
 end
 
 always @* begin
@@ -1071,8 +1131,8 @@ end
 // Basic reachability: pipeline produces ACKs
 always @(posedge i_controller_clk) begin
     if (f_past_valid && reset_done) begin
-        cover(write_ack_q);
-        cover(read_ack_q);
+        cover(ack_pipe_q[0]);
+        cover(o_wb_ack);
     end
 end
 

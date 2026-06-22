@@ -46,53 +46,52 @@ module ddr4_prober #(
     parameter[1:0] BIST_MODE     = 2,
     // Debug CSR register file: 0=disabled (saves area), 1=enabled
     parameter      DEBUG_CSR_ENABLE = 1
-) ( // Q: add correct in-line commment to each ports
-    input  wire                     i_clk,
-    input  wire                     i_rst_n,
+) (
+    input  wire                     i_clk,              // System clock (same as controller clock)
+    input  wire                     i_rst_n,            // Active-low synchronous reset
     // Calibration status from controller
-    input  wire                     i_calib_complete,
-    input  wire                     i_calib_error,
+    input  wire                     i_calib_complete,   // Pulses high when DDR4 init + PHY training finishes successfully
+    input  wire                     i_calib_error,      // High if calibration retries exhausted (unrecoverable training failure)
     // Init status (sticky — set once after calibration + optional BIST)
-    output wire                     o_init_done,
-    output wire                     o_init_failed,
+    output wire                     o_init_done,        // Latches high once calibration passes AND BIST passes (or BIST disabled)
+    output wire                     o_init_failed,      // Latches high on calibration error OR BIST data mismatch; mutually exclusive with o_init_done
     // BIST status
-    output wire                     o_bist_busy,
-    output wire                     o_bist_pass,
-    output wire                     o_bist_fail,
-    output wire                     o_bist_reset_req, // Q: is it possible to make this writable via CSR to reset the ddr4 controller + phy? Is it safe? or i_rst_n (porb) is safer if user wants to reset and repeat calibration?
-    // Wishbone B4 Master
-    output wire                     o_wb_cyc,
-    output wire                     o_wb_stb,
-    output wire                     o_wb_we,
-    output wire [WB_ADDR_BITS-1:0]  o_wb_addr,
-    output wire [WB_DATA_BITS-1:0]  o_wb_data,
-    output wire [WB_SEL_BITS-1:0]   o_wb_sel,
-    input  wire                     i_wb_stall,
-    input  wire                     i_wb_ack,
-    input  wire [WB_DATA_BITS-1:0]  i_wb_data,
-    // Wishbone B4 — Debug CSR port (pipelined, zero-wait-state)
-    input  wire                     i_wb_dbg_cyc,
-    input  wire                     i_wb_dbg_stb,
-    input  wire                     i_wb_dbg_we,
-    input  wire [3:0]               i_wb_dbg_addr,
-    input  wire [31:0]              i_wb_dbg_data,
-    input  wire [3:0]               i_wb_dbg_sel,
-    output wire                     o_wb_dbg_stall,
-    output wire                     o_wb_dbg_ack,
-    output wire [31:0]              o_wb_dbg_data,
-    // Status from controller
-    input  wire [3:0]               i_calib_state,
-    input  wire                     i_stage1_pending,
-    input  wire                     i_stage2_pending,
-    input  wire                     i_stage2_we,
-    input  wire                     i_refresh_idle,
-    input  wire [NUM_BANKS-1:0]     i_bank_status,
-    // Status from PHY (flat packed)
-    input  wire [3:0]               i_phy_state,
-    input  wire [9*BYTE_LANES-1:0]  i_phy_idelay_center,
-    input  wire [9*BYTE_LANES-1:0]  i_phy_wl_tap,
-    input  wire [3*BYTE_LANES-1:0]  i_phy_bitslip,
-    input  wire [3*BYTE_LANES-1:0]  i_phy_train_fail
+    output wire                     o_bist_busy,        // High while BIST FSM is actively issuing/checking memory transactions
+    output wire                     o_bist_failed_reset_req,   // Auto-reset request: asserted after BIST fail when CSR auto_reset_en is set
+    output wire                     o_soft_reset_req,   // CSR-triggered one-shot: resets controller + PHY to re-run full calibration
+    // Wishbone B4 Master — BIST drives this to issue R/W to the DDR4 controller
+    output wire                     o_wb_cyc,           // Bus cycle active (held high for entire BIST transaction burst)
+    output wire                     o_wb_stb,           // Strobe: valid request on addr/data/we this cycle
+    output wire                     o_wb_we,            // Write enable: 1=write, 0=read
+    output wire [WB_ADDR_BITS-1:0]  o_wb_addr,          // DDR4 word address
+    output wire [WB_DATA_BITS-1:0]  o_wb_data,          // Write data (full cache-line width)
+    output wire [WB_SEL_BITS-1:0]   o_wb_sel,           // Byte-lane select (always all-ones for BIST)
+    input  wire                     i_wb_stall,         // Backpressure from controller: request not accepted this cycle
+    input  wire                     i_wb_ack,           // Acknowledge: read data valid or write committed
+    input  wire [WB_DATA_BITS-1:0]  i_wb_data,          // Read data returned by controller
+    // Wishbone B4 — Debug CSR port (pipelined, zero-wait-state, independent of DRAM path)
+    input  wire                     i_wb_dbg_cyc,       // CSR bus cycle
+    input  wire                     i_wb_dbg_stb,       // CSR strobe
+    input  wire                     i_wb_dbg_we,        // CSR write enable
+    input  wire [3:0]               i_wb_dbg_addr,      // CSR register address (selects 1 of 16 registers)
+    input  wire [31:0]              i_wb_dbg_data,      // CSR write data
+    input  wire [3:0]               i_wb_dbg_sel,       // CSR byte select (unused, always full-word)
+    output wire                     o_wb_dbg_stall,     // Always 0: CSR port never stalls
+    output wire                     o_wb_dbg_ack,       // Registered ACK (1-cycle latency)
+    output wire [31:0]              o_wb_dbg_data,      // CSR read data
+    // Status from controller (exposed via CSR for debug visibility)
+    input  wire [3:0]               i_calib_state,      // Controller calibration FSM state (0=IDLE..13=DONE, 14=ERROR)
+    input  wire                     i_stage1_pending,   // A new WB request is latched, waiting for stage 2
+    input  wire                     i_stage2_pending,   // A decoded request is being scheduled (issuing PRE/ACT/RD/WR)
+    input  wire                     i_stage2_we,        // Stage 2 request type: 1=write, 0=read
+    input  wire                     i_refresh_idle,     // Refresh timer in idle countdown — scheduler free to issue user commands
+    input  wire [NUM_BANKS-1:0]     i_bank_status,      // Per-bank status: 1=row open (active), 0=precharged (idle)
+    // Status from PHY (flat packed, exposed via CSR for training debug)
+    input  wire [3:0]               i_phy_state,        // PHY training FSM state (0=IDLE, 3=GATE_DONE, 7=EYE_DONE, 11=WL_DONE)
+    input  wire [9*BYTE_LANES-1:0]  i_phy_idelay_center, // 9b per lane: IDELAY tap at center of read data eye
+    input  wire [9*BYTE_LANES-1:0]  i_phy_wl_tap,       // 9b per lane: ODELAY tap where DQS aligns to CK at DRAM
+    input  wire [3*BYTE_LANES-1:0]  i_phy_bitslip,      // 3b per lane: ISERDES barrel-shift aligning capture to burst boundary
+    input  wire [3*BYTE_LANES-1:0]  i_phy_train_fail    // Per lane: {wl_fail, eye_fail, gate_fail} — sticky failure flags
 );
 
     // -----------------------------------------------------------------
@@ -146,6 +145,9 @@ module ddr4_prober #(
     wire [2:0] bist_state_w;
     wire [31:0] correct_count_w;
     wire [31:0] error_count_w;
+    wire auto_reset_en_w;
+    wire bist_pass_w;
+    wire bist_fail_w;
 
     // Module-scope CSR write-enable decode (visible to both gen_bist and gen_csr)
     wire csr_we = i_wb_dbg_cyc && i_wb_dbg_stb && i_wb_dbg_we;
@@ -153,12 +155,16 @@ module ddr4_prober #(
     // -----------------------------------------------------------------
     // BIST Auto-Start (rising edge of calib_complete when BIST enabled)
     // -----------------------------------------------------------------
+    wire prober_internal_reset = !i_rst_n || o_soft_reset_req || o_bist_failed_reset_req;
+
     reg calib_complete_q;
     always @(posedge i_clk) begin
-        if (!i_rst_n)
+        if (prober_internal_reset) begin // re-arm edge detector after soft/BIST reset
             calib_complete_q <= 1'b0;
-        else
+        end
+        else begin
             calib_complete_q <= i_calib_complete;
+        end
     end
     wire bist_auto_start = i_calib_complete && !calib_complete_q && (BIST_MODE != 0);
 
@@ -168,45 +174,58 @@ module ddr4_prober #(
     generate if (BIST_MODE != 0) begin : gen_bist
 
         reg bist_csr_start_r, bist_csr_start_d;
+        reg soft_reset_req_r;
+        reg auto_reset_en_r;
         always @(posedge i_clk) begin
-            if (!i_rst_n) begin
+            if (!i_rst_n) begin // i_rst_n only: these are reset sources/config, must survive soft reset
                 bist_csr_start_r <= 1'b0;
                 bist_csr_start_d <= 1'b0;
+                soft_reset_req_r <= 1'b0;
+                auto_reset_en_r  <= 1'b0;
             end else begin
                 bist_csr_start_d <= bist_csr_start_r;
-                if (csr_we && i_wb_dbg_addr == 4'hC && i_wb_dbg_data[0])
-                    bist_csr_start_r <= 1'b1;
-                else
-                    bist_csr_start_r <= 1'b0;
+                bist_csr_start_r <= 1'b0;
+                soft_reset_req_r <= 1'b0;
+                if (csr_we && i_wb_dbg_addr == 4'hC) begin
+                    if (i_wb_dbg_data[0])
+                        bist_csr_start_r <= 1'b1;
+                    if (i_wb_dbg_data[1])
+                        soft_reset_req_r <= 1'b1;
+                    auto_reset_en_r <= i_wb_dbg_data[2];
+                end
             end
         end
+
 
         // Start from auto-start (calib_complete edge) or CSR write.
         // Two-stage register catches a single-cycle CSR pulse reliably.
         wire bist_start_any = bist_auto_start || bist_csr_start_r || bist_csr_start_d;
 
         reg [2:0] bist_state;
-        reg [BIST_ADDR_BITS-1:0] write_addr;  // next address to write
-        reg [BIST_ADDR_BITS-1:0] read_addr;   // next address to issue read for
-        reg [BIST_ADDR_BITS-1:0] check_addr;  // next address whose ACK we expect to verify
-        reg [31:0] correct_count;              // total matching reads
-        reg [31:0] error_count;                // total mismatching reads
-        reg bist_fail_sticky;                  // latches on first mismatch, never clears until restart
-        reg bist_reset_req_r;                  // requests full DDR reset if BIST failed
-        reg alt_phase;             // 0=write phase, 1=read phase in ALT_WRITE_READ
-        reg last_read_scrambled;   // tracks which gen_pattern to use for late-arriving ACKs
+        reg [BIST_ADDR_BITS-1:0] write_addr;    // next address to write
+        reg [BIST_ADDR_BITS-1:0] read_addr;     // next address to issue read for
+        reg [BIST_ADDR_BITS-1:0] check_addr;    // next address whose ACK we expect to verify
+        reg [31:0] correct_count;   // total matching reads
+        reg [31:0] error_count;     // total mismatching reads
+        reg bist_fail_sticky;       // latches on first mismatch, never clears until restart
+        reg bist_failed_reset_req_r;    // requests full DDR reset if BIST failed
+        reg alt_phase;                  // 0=write phase, 1=read phase in ALT_WRITE_READ
+        reg last_read_scrambled;    // tracks which gen_pattern to use for late-arriving ACKs
 
         reg wb_cyc_r, wb_stb_r, wb_we_r;   // WB bus control (cyc=bus ownership, stb=valid xfer, we=write)
         reg [WB_ADDR_BITS-1:0] wb_addr_r;  // current WB address being driven
         reg [WB_DATA_BITS-1:0] wb_data_r;  // current WB write data being driven
 
         // Outstanding request tracking for WB pipelining.
-        // `outstanding` counts total in-flight requests (writes + reads).
-        // `wr_acks_pending` counts write ACKs not yet received.  WB B4
-        // returns ACKs in-order, so when wr_acks_pending==0 the next ACK
-        // is guaranteed to be a read -- that is when we compare data.
+        // Circular buffer FIFO tracks W/R type per outstanding request.
+        // ack_rd_ptr points to the oldest entry (next to be ACK'd).
+        // ack_wr_ptr points to the next free slot for new requests.
+        // 1=write, 0=read. Since WB B4 ACKs are in-order, the entry at
+        // ack_rd_ptr always identifies whether the next ACK is a write or read.
         reg [4:0] outstanding;
-        reg [8:0] wr_acks_pending;
+        reg [15:0] ack_type_q;
+        reg [3:0] ack_wr_ptr;
+        reg [3:0] ack_rd_ptr;
 
         // Pattern generation -- deterministic from address.
         // XOR-folds the address with a swapped copy and a constant to
@@ -226,16 +245,19 @@ module ddr4_prober #(
 
         // Bit-reversal address scramble -- forces row changes on sequential
         // counter values, maximizing precharge/activate stress.
+        // Q: evaluate is this really enough to cause "randomness" 
         function [BIST_ADDR_BITS-1:0] scramble_addr;
             input [BIST_ADDR_BITS-1:0] addr;
             integer i;
             begin
-                for (i = 0; i < BIST_ADDR_BITS; i = i + 1)
+                for (i = 0; i < BIST_ADDR_BITS; i = i + 1) begin
                     scramble_addr[i] = addr[BIST_ADDR_BITS-1-i];
+                end
             end
         endfunction
 
         // Expected data for read verification (covers trailing ACKs across phases)
+        // Q: I dont understand this, why do this
         wire uses_scramble = (bist_state == BIST_RANDOM_READ) ||
                              ((bist_state == BIST_RANDOM_WRITE ||
                                bist_state == BIST_ALT_WRITE_READ ||
@@ -245,7 +267,7 @@ module ddr4_prober #(
                                              : gen_pattern(check_addr);
 
         always @(posedge i_clk) begin
-            if (!i_rst_n) begin
+            if (prober_internal_reset) begin // full reset: clears BIST state on hard reset, soft reset, or auto-reset
                 bist_state      <= BIST_IDLE;
                 write_addr      <= {BIST_ADDR_BITS{1'b0}};
                 read_addr       <= {BIST_ADDR_BITS{1'b0}};
@@ -253,7 +275,7 @@ module ddr4_prober #(
                 correct_count   <= 32'd0;
                 error_count     <= 32'd0;
                 bist_fail_sticky <= 1'b0;
-                bist_reset_req_r <= 1'b0;
+                bist_failed_reset_req_r <= 1'b0;
                 alt_phase       <= 1'b0;
                 last_read_scrambled <= 1'b0;
                 wb_cyc_r        <= 1'b0;
@@ -261,44 +283,43 @@ module ddr4_prober #(
                 wb_we_r         <= 1'b0;
                 wb_addr_r       <= {WB_ADDR_BITS{1'b0}};
                 wb_data_r       <= {WB_DATA_BITS{1'b0}};
-                outstanding     <= 4'd0;
-                wr_acks_pending <= 9'd0;
+                outstanding     <= 5'd0;
+                ack_type_q      <= 16'd0;
+                ack_wr_ptr      <= 4'd0;
+                ack_rd_ptr      <= 4'd0;
             end else begin
 
-                // Track outstanding requests
-                if (wb_stb_r && !i_wb_stall && i_wb_ack)
-                    outstanding <= outstanding; // issued+acked same cycle
-                else if (wb_stb_r && !i_wb_stall)
+                // Track outstanding requests + type FIFO (circular buffer)
+                if (wb_stb_r && !i_wb_stall) begin
+                    ack_type_q[ack_wr_ptr] <= wb_we_r;
+                    ack_wr_ptr <= ack_wr_ptr + 1'b1;
                     outstanding <= outstanding + 1'b1;
-                else if (i_wb_ack)
+                end
+                if (i_wb_ack) begin
+                    ack_rd_ptr <= ack_rd_ptr + 1'b1;
                     outstanding <= outstanding - 1'b1;
+                end
+                if (wb_stb_r && !i_wb_stall && i_wb_ack) begin
+                    outstanding <= outstanding;
+                end
 
-                // Track outstanding write ACKs (WB B4 returns ACKs in order)
-                if (wb_stb_r && !i_wb_stall && wb_we_r && i_wb_ack && wr_acks_pending > 0)
-                    wr_acks_pending <= wr_acks_pending; // issued write + consumed write ack
-                else if (wb_stb_r && !i_wb_stall && wb_we_r)
-                    wr_acks_pending <= wr_acks_pending + 1'b1;
-                else if (i_wb_ack && wr_acks_pending > 0)
-                    wr_acks_pending <= wr_acks_pending - 1'b1;
-
-                // Data check on ACK (wr_acks_pending==0 guarantees it is a read ACK)
-                if (i_wb_ack && wr_acks_pending == 0 &&
+                // Data check on read ACK (head entry is read type)
+                if (i_wb_ack && !ack_type_q[ack_rd_ptr] &&
                     bist_state != BIST_IDLE &&
                     bist_state != BIST_DONE &&
                     bist_state != BIST_BURST_WRITE) begin
                     `ifndef YOSYS
-                    if (check_addr < 20)
-                        $display("[%0t] BIST CHK: addr=%0d exp=%0h got=%0h state=%0d",
-                            $realtime, check_addr, expected_data, i_wb_data, bist_state);
+                        if (check_addr < 20) begin
+                            $display("[%0t] BIST CHK: addr=%0d exp=%0h got=%0h state=%0d", $realtime, check_addr, expected_data, i_wb_data, bist_state);
+                        end
                     `endif
-                    if (i_wb_data == expected_data) begin
+                    if (i_wb_data == expected_data) begin // read data matches expected pattern
                         correct_count <= correct_count + 1'b1;
-                    end else begin
+                    end else begin // read data mismatch so increment error count and latch fail sticky
                         error_count <= error_count + 1'b1;
                         bist_fail_sticky <= 1'b1;
-                        `ifndef YOSYS
-                        $display("[%0t] BIST FAIL: addr=%0h expected=%0h got=%0h",
-                            $realtime, check_addr, expected_data, i_wb_data);
+                        `ifndef YOSYS 
+                            $display("[%0t] BIST FAIL: addr=%0h expected=%0h got=%0h", $realtime, check_addr, expected_data, i_wb_data);
                         `endif
                     end
                     check_addr <= check_addr + 1'b1;
@@ -306,7 +327,7 @@ module ddr4_prober #(
 
                 case (bist_state)
                     BIST_IDLE: begin
-                        bist_reset_req_r <= 1'b0;
+                        bist_failed_reset_req_r <= 1'b0;
                         if (bist_start_any && i_calib_complete) begin
                             `ifndef YOSYS
                             $display("[%0t] BIST START: first wr data=%0h",
@@ -324,7 +345,7 @@ module ddr4_prober #(
                             wb_we_r       <= 1'b1;
                             wb_addr_r     <= {WB_ADDR_BITS{1'b0}};
                             wb_data_r     <= gen_pattern({BIST_ADDR_BITS{1'b0}});
-                            outstanding   <= 4'd0;
+                            outstanding   <= 5'd0;
                         end
                     end
 
@@ -339,8 +360,8 @@ module ddr4_prober #(
                             wb_data_r  <= gen_pattern(write_addr + 1'b1);
                             if (write_addr == BURST_END) begin
                                 `ifndef YOSYS
-                                $display("[%0t] BIST W->R: wr_pend=%0d outstanding=%0d",
-                                    $realtime, wr_acks_pending, outstanding);
+                                $display("[%0t] BIST W->R: outstanding=%0d",
+                                    $realtime, outstanding);
                                 `endif
                                 bist_state <= BIST_BURST_READ;
                                 last_read_scrambled <= 1'b0;
@@ -368,10 +389,9 @@ module ddr4_prober #(
                     end
 
                     // -- Random-Order Write (bit-reversed addresses) --
-                    // Waits for all burst-read ACKs to drain (outstanding==0)
-                    // before starting. Uses bit-reversed addresses so sequential
-                    // counter values map to maximally different row addresses,
-                    // stressing precharge/activate timing in the controller.
+                    // Waits for burst-read ACKs to drain before starting, because
+                    // scrambled addresses hit different rows in the same banks,
+                    // which would force precharge on in-flight burst reads.
                     BIST_RANDOM_WRITE: begin
                         if (outstanding == 0 && !wb_stb_r) begin
                             wb_stb_r <= 1'b1;
@@ -417,34 +437,38 @@ module ddr4_prober #(
                         end
                     end
 
-                    // -- Alternating Write/Read (serialized per address) --
-                    // Write one address, wait for ACK, read it back, wait for
-                    // ACK, compare. Repeat for all addresses. Tests tight
-                    // write-to-read turnaround (tWTR) at the controller level.
-                    // Serialized: only 1 outstanding request at a time.
+                    // -- Alternating Write/Read (fully pipelined W-R-W-R) --
+                    // Issues W0-R0-W1-R1-W2-R2-... back-to-back every cycle
+                    // (when !stall). Exercises the controller's in-order ACK
+                    // guarantee with interleaved write/read traffic.
+                    // Drains prior-phase ACKs first so check_addr is aligned.
                     BIST_ALT_WRITE_READ: begin
-                        if (outstanding == 0 && !wb_stb_r) begin
-                            if (!alt_phase) begin
+                        if (!wb_stb_r) begin
+                            if (outstanding == 0) begin
                                 last_read_scrambled <= 1'b0;
+                                write_addr <= {BIST_ADDR_BITS{1'b0}};
+                                check_addr <= {BIST_ADDR_BITS{1'b0}};
                                 wb_stb_r  <= 1'b1;
                                 wb_we_r   <= 1'b1;
-                                wb_addr_r <= write_addr;
-                                wb_data_r <= gen_pattern(write_addr);
-                            end else begin
-                                wb_stb_r   <= 1'b1;
-                                wb_we_r    <= 1'b0;
-                                wb_addr_r  <= write_addr;
-                                check_addr <= write_addr;
+                                wb_addr_r <= {WB_ADDR_BITS{1'b0}};
+                                wb_data_r <= gen_pattern({BIST_ADDR_BITS{1'b0}});
+                                alt_phase <= 1'b0;
                             end
-                        end else if (wb_stb_r && !i_wb_stall) begin
-                            wb_stb_r <= 1'b0;
+                        end else if (!i_wb_stall) begin
                             if (!alt_phase) begin
                                 alt_phase <= 1'b1;
+                                wb_we_r   <= 1'b0;
+                                wb_addr_r <= write_addr;
                             end else begin
                                 alt_phase  <= 1'b0;
                                 write_addr <= write_addr + 1'b1;
-                                if (write_addr == ALT_END)
+                                wb_we_r    <= 1'b1;
+                                wb_addr_r  <= write_addr + 1'b1;
+                                wb_data_r  <= gen_pattern(write_addr + 1'b1);
+                                if (write_addr == ALT_END) begin
+                                    wb_stb_r   <= 1'b0;
                                     bist_state <= BIST_FINISH;
+                                end
                             end
                         end
                     end
@@ -457,8 +481,8 @@ module ddr4_prober #(
                         if (outstanding == 0) begin
                             wb_cyc_r   <= 1'b0;  // release WB bus ownership
                             bist_state <= BIST_DONE;
-                            if (bist_fail_sticky)
-                                bist_reset_req_r <= 1'b1;  // signal top to re-init DDR
+                            if (bist_fail_sticky && auto_reset_en_r)
+                                bist_failed_reset_req_r <= 1'b1;
                         end
                     end
 
@@ -466,7 +490,7 @@ module ddr4_prober #(
                     BIST_DONE: begin
                         if (bist_start_any) begin
                             bist_state <= BIST_IDLE;
-                            bist_reset_req_r <= 1'b0;
+                            bist_failed_reset_req_r <= 1'b0;
                         end
                     end
 
@@ -476,11 +500,13 @@ module ddr4_prober #(
         end
 
         assign o_bist_busy      = (bist_state != BIST_IDLE) && (bist_state != BIST_DONE); // high while BIST is running
-        assign o_bist_pass      = (bist_state == BIST_DONE) && !bist_fail_sticky;       // only valid after BIST completes
-        assign o_bist_fail      = bist_fail_sticky;  // sticky — stays high once any mismatch seen
+        assign bist_pass_w      = (bist_state == BIST_DONE) && !bist_fail_sticky;
+        assign bist_fail_w      = bist_fail_sticky;
         assign correct_count_w  = correct_count;
         assign error_count_w    = error_count;
-        assign o_bist_reset_req = bist_reset_req_r;
+        assign auto_reset_en_w  = auto_reset_en_r;
+        assign o_bist_failed_reset_req = bist_failed_reset_req_r;
+        assign o_soft_reset_req = soft_reset_req_r;
         assign o_wb_cyc  = wb_cyc_r;
         assign o_wb_stb  = wb_stb_r;
         assign o_wb_we   = wb_we_r;
@@ -492,11 +518,13 @@ module ddr4_prober #(
     end else begin : gen_no_bist
 
         assign o_bist_busy      = 1'b0;
-        assign o_bist_pass      = 1'b0;
-        assign o_bist_fail      = 1'b0;
+        assign bist_pass_w      = 1'b0;
+        assign bist_fail_w      = 1'b0;
         assign correct_count_w  = 32'd0;
         assign error_count_w    = 32'd0;
-        assign o_bist_reset_req = 1'b0;
+        assign o_bist_failed_reset_req = 1'b0;
+        assign o_soft_reset_req = 1'b0;
+        assign auto_reset_en_w  = 1'b0;
         assign bist_state_w = 3'd0;
         assign o_wb_cyc  = 1'b0;
         assign o_wb_stb  = 1'b0;
@@ -524,7 +552,8 @@ module ddr4_prober #(
     //   0x7 -- PHY lane 1 (same fields, if BYTE_LANES > 1)
     //   0xA -- Configuration readback (BYTE_LANES, BIST_MODE)
     //   0xB -- IP version (currently 1.0)
-    //   0xC -- Write-only: bit[0] triggers BIST start
+    //   0xC -- Control: bit[0] BIST re-start (W1S), bit[1] soft reset (W1S),
+    //                   bit[2] auto-reset on BIST fail enable (R/W, default 0)
     //
     generate if (DEBUG_CSR_ENABLE) begin : gen_csr
 
@@ -534,7 +563,7 @@ module ddr4_prober #(
         reg wb_dbg_ack_r;
         reg [31:0] wb_dbg_data_r;
         always @(posedge i_clk) begin
-            if (!i_rst_n) begin
+            if (!i_rst_n) begin // i_rst_n only: CSR port must stay responsive during soft reset
                 wb_dbg_ack_r  <= 1'b0;
                 wb_dbg_data_r <= 32'd0;
             end else begin
@@ -570,8 +599,8 @@ module ddr4_prober #(
                     if (BIST_MODE != 0) begin
                         csr_data_r[2:0] = bist_state_w;
                         csr_data_r[3]   = o_bist_busy;
-                        csr_data_r[4]   = o_bist_pass;
-                        csr_data_r[5]   = o_bist_fail;
+                        csr_data_r[4]   = bist_pass_w;
+                        csr_data_r[5]   = bist_fail_w;
                     end
                 end
                 // Lane 0: [3:0]=PHY state, [12:4]=IDELAY center tap,
@@ -594,7 +623,7 @@ module ddr4_prober #(
                 // [1:0]=BIST_MODE, [7:4]=BYTE_LANES — static config readback
                 4'hA: csr_data_r = {24'd0, BYTE_LANES[3:0], 2'd0, BIST_MODE};
                 4'hB: csr_data_r = {16'd0, 8'd0, 8'd1}; // IP version: major=0, minor=1
-                4'hC: csr_data_r = 32'd0; // write-only: bit[0] triggers BIST re-run
+                4'hC: csr_data_r = {29'd0, auto_reset_en_w, 2'b00};
                 default: csr_data_r = 32'd0;
             endcase
         end
@@ -615,7 +644,7 @@ module ddr4_prober #(
     // init_failed: calibration error OR BIST failure
     reg init_done_q, init_failed_q;
     always @(posedge i_clk) begin
-        if (!i_rst_n) begin
+        if (prober_internal_reset) begin // full reset: re-evaluate init status after re-calibration
             init_done_q   <= 1'b0;
             init_failed_q <= 1'b0;
         end else begin
@@ -624,9 +653,9 @@ module ddr4_prober #(
             if (!init_done_q && !init_failed_q && !i_calib_error) begin
                 if (i_calib_complete && (BIST_MODE == 0))
                     init_done_q <= 1'b1;
-                if (i_calib_complete && BIST_MODE != 0 && o_bist_pass)
+                if (i_calib_complete && BIST_MODE != 0 && bist_pass_w)
                     init_done_q <= 1'b1;
-                if (i_calib_complete && BIST_MODE != 0 && o_bist_fail)
+                if (i_calib_complete && BIST_MODE != 0 && bist_fail_w)
                     init_failed_q <= 1'b1;
             end
         end

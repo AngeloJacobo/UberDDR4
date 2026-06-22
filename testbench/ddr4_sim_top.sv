@@ -310,7 +310,7 @@ module ddr4_sim_top;
     // ===================================================================
     wire calib_complete_int = u_dut.calib_complete;
     wire bist_busy_int      = u_dut.prober_bist_busy;
-    wire bist_fail_int      = u_dut.u_prober.o_bist_fail;
+    wire bist_fail_int      = u_dut.u_prober.bist_fail_w;
     wire [31:0] bist_correct_int = u_dut.u_prober.correct_count_w;
     wire [31:0] bist_error_int   = u_dut.u_prober.error_count_w;
 
@@ -1268,6 +1268,209 @@ module ddr4_sim_top;
             $finish;
         end
     `endif
+
+    `ifdef SIM_CSR_RESET_TEST
+        // =============================================================
+        // CSR 0xC Reset Test — exercises soft reset, auto-reset, BIST restart
+        // =============================================================
+        $display("[%0t] === CSR Reset Test: Phase 1 — Soft Reset ===", $realtime);
+        begin : csr_soft_reset_test
+            reg [31:0] csr0_val, csr5_val;
+            integer sr_timeout;
+
+            // 1a. Verify init_done is high (initial calibration + BIST passed)
+            if (!init_done) begin
+                $display("[%0t] FAIL: init_done not asserted before soft reset test", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end
+
+            // 1b. Read CSR[0xC] — verify auto_reset_en is 0 (default)
+            wb_dbg_read(4'hC);
+            if (wb_dbg_rdata[2] !== 1'b0) begin
+                $display("[%0t] FAIL: auto_reset_en not 0 at default (CSR[C]=0x%0h)", $realtime, wb_dbg_rdata);
+                rd_err_count = rd_err_count + 1;
+            end
+            wb_dbg_idle;
+
+            // 1c. Issue soft reset: write bit[1] of CSR 0xC
+            $display("[%0t]   Writing CSR 0xC bit[1] (soft reset)", $realtime);
+            wb_dbg_write(4'hC, 32'h2);
+            wb_dbg_idle;
+            repeat (5) @(posedge controller_clk);
+
+            // 1d. Verify init_done drops (prober cleared status)
+            if (init_done) begin
+                $display("[%0t] FAIL: init_done still high after soft reset", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end
+
+            // 1e. Wait for controller to re-calibrate (reset_done re-asserts)
+            sr_timeout = 0;
+            while (!init_done && sr_timeout < 300000) begin
+                @(posedge controller_clk);
+                sr_timeout = sr_timeout + 1;
+            end
+
+            if (sr_timeout >= 300000) begin
+                $display("[%0t] FAIL: soft reset — init_done never re-asserted (timeout)", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end else begin
+                $display("[%0t]   Soft reset: init_done re-asserted after %0d cycles", $realtime, sr_timeout);
+            end
+
+            // 1f. Verify BIST passed after re-calibration
+            wb_dbg_read(4'h5);
+            csr5_val = wb_dbg_rdata;
+            wb_dbg_idle;
+            if (csr5_val[4] !== 1'b1 || csr5_val[5] !== 1'b0) begin
+                $display("[%0t] FAIL: soft reset — BIST did not pass after re-calib (CSR[5]=0x%0h)", $realtime, csr5_val);
+                rd_err_count = rd_err_count + 1;
+            end else begin
+                $display("[%0t]   Soft reset: BIST re-passed after re-calibration", $realtime);
+            end
+
+            // 1g. Verify init_failed is NOT set
+            if (init_failed) begin
+                $display("[%0t] FAIL: init_failed asserted after successful soft reset", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end
+        end
+        $display("[%0t]   Phase 1 (soft reset) complete", $realtime);
+
+        // Phase 2: Auto-reset on BIST failure
+        $display("[%0t] === CSR Reset Test: Phase 2 — Auto-Reset on BIST Fail ===", $realtime);
+        begin : csr_auto_reset_test
+            reg [31:0] csr5_val;
+            integer ar_timeout;
+
+            // 2a. Enable auto-reset: write bit[2]=1 to CSR 0xC
+            $display("[%0t]   Enabling auto_reset_en (CSR 0xC bit[2])", $realtime);
+            wb_dbg_write(4'hC, 32'h4);
+            wb_dbg_idle;
+            repeat (2) @(posedge controller_clk);
+
+            // 2b. Verify readback
+            wb_dbg_read(4'hC);
+            if (wb_dbg_rdata[2] !== 1'b1) begin
+                $display("[%0t] FAIL: auto_reset_en not set (CSR[C]=0x%0h)", $realtime, wb_dbg_rdata);
+                rd_err_count = rd_err_count + 1;
+            end
+            wb_dbg_idle;
+
+            // 2c. Trigger BIST, then force DFI cs_n=1 briefly during write phase
+            //     to make the DRAM ignore some write commands. When BIST reads
+            //     back those addresses, it gets stale data → mismatch → fail.
+            wb_dbg_write(4'hC, 32'h5); // bit[0]=1 (BIST start) + bit[2]=1 (keep auto_reset_en)
+            wb_dbg_idle;
+            // Wait into BIST write phase (~200 cycles in)
+            repeat (200) @(posedge controller_clk);
+            $display("[%0t]   Forcing dfi_cs_n=1 to make DRAM ignore writes", $realtime);
+            force u_dut.dfi_cs_n = {4{1'b1}};
+            repeat (100) @(posedge controller_clk);
+            release u_dut.dfi_cs_n;
+            $display("[%0t]   Released dfi_cs_n — some writes were dropped", $realtime);
+
+            // 2d. Wait for init_done to drop (BIST finishes → auto-reset fires)
+            ar_timeout = 0;
+            while (init_done && ar_timeout < 200000) begin
+                @(posedge controller_clk);
+                ar_timeout = ar_timeout + 1;
+            end
+            if (ar_timeout >= 200000) begin
+                $display("[%0t] FAIL: auto-reset — init_done never dropped", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end else begin
+                $display("[%0t]   Auto-reset triggered: init_done dropped", $realtime);
+            end
+
+            // 2g. Wait for init_done to re-assert (re-calib + BIST pass)
+            ar_timeout = 0;
+            while (!init_done && ar_timeout < 300000) begin
+                @(posedge controller_clk);
+                ar_timeout = ar_timeout + 1;
+            end
+            if (ar_timeout >= 300000) begin
+                $display("[%0t] FAIL: auto-reset — init_done never re-asserted after recovery", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end else begin
+                $display("[%0t]   Auto-reset recovery: init_done re-asserted after %0d cycles", $realtime, ar_timeout);
+            end
+
+            // 2h. Verify BIST passed
+            wb_dbg_read(4'h5);
+            csr5_val = wb_dbg_rdata;
+            wb_dbg_idle;
+            if (csr5_val[4] !== 1'b1 || csr5_val[5] !== 1'b0) begin
+                $display("[%0t] FAIL: auto-reset — BIST did not pass after recovery (CSR[5]=0x%0h)", $realtime, csr5_val);
+                rd_err_count = rd_err_count + 1;
+            end else begin
+                $display("[%0t]   Auto-reset: BIST passed after recovery", $realtime);
+            end
+
+            // 2i. Verify init_failed is NOT set
+            if (init_failed) begin
+                $display("[%0t] FAIL: init_failed asserted after successful auto-reset recovery", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end
+        end
+        $display("[%0t]   Phase 2 (auto-reset) complete", $realtime);
+
+        // Phase 3: BIST restart without reset (verify no re-calibration)
+        $display("[%0t] === CSR Reset Test: Phase 3 — BIST Restart (no reset) ===", $realtime);
+        begin : csr_bist_restart_test
+            reg [31:0] csr5_val;
+            integer br_timeout;
+
+            // 3a. Disable auto-reset first
+            wb_dbg_write(4'hC, 32'h0); // bit[2]=0
+            wb_dbg_idle;
+
+            // 3b. Trigger BIST only (bit[0])
+            $display("[%0t]   Triggering BIST restart (CSR 0xC bit[0])", $realtime);
+            wb_dbg_write(4'hC, 32'h1);
+            wb_dbg_idle;
+
+            // 3c. init_done should stay high (no reset occurred)
+            repeat (10) @(posedge controller_clk);
+            if (!init_done) begin
+                $display("[%0t] FAIL: init_done dropped on BIST-only restart", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end
+
+            // 3d. Wait for BIST to complete
+            br_timeout = 0;
+            repeat (100) @(posedge controller_clk);
+            wb_dbg_read(4'h5);
+            while (wb_dbg_rdata[3] && br_timeout < 200000) begin
+                wb_dbg_idle;
+                repeat (1000) @(posedge controller_clk);
+                wb_dbg_read(4'h5);
+                br_timeout = br_timeout + 1000;
+            end
+            csr5_val = wb_dbg_rdata;
+            wb_dbg_idle;
+
+            if (br_timeout >= 200000) begin
+                $display("[%0t] FAIL: BIST restart timed out", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end else if (csr5_val[4] !== 1'b1) begin
+                $display("[%0t] FAIL: BIST restart did not pass (CSR[5]=0x%0h)", $realtime, csr5_val);
+                rd_err_count = rd_err_count + 1;
+            end else begin
+                $display("[%0t]   BIST restart: passed without re-calibration", $realtime);
+            end
+        end
+        $display("[%0t]   Phase 3 (BIST restart) complete", $realtime);
+
+        // Final verdict
+        if (rd_err_count == 0)
+            $display("[%0t] PASS: CSR reset test — all phases passed", $realtime);
+        else
+            $display("[%0t] FAIL: CSR reset test — %0d errors", $realtime, rd_err_count);
+
+        test_phase = "DONE";
+        all_tests_done = 1'b1;
+    `else
         repeat (10) @(posedge controller_clk);
         while (wb_stall) @(posedge controller_clk);
 
@@ -1876,6 +2079,7 @@ module ddr4_sim_top;
         test_phase = "DONE";
         $display("[%0t] === All test phases complete ===", $realtime);
         all_tests_done = 1'b1;
+    `endif
     end
 
     // ===================================================================

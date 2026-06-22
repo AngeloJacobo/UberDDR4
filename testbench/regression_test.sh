@@ -70,6 +70,8 @@ ALL_TESTS=(
     "row_bits_17       834  8   2  0    1  1  8  17  DDR4_8G_X8   FIXED_2400  -"
     # Error path
     "train_fail        834  8   2  0    1  1  8  16  DDR4_8G_X8   FIXED_2400  TRAIN_FAIL"
+    # CSR reset test
+    "csr_reset         834  8   2  0    1  1  8  16  DDR4_8G_X8   FIXED_2400  CSR_RESET"
 )
 
 if [[ -z "${XILINX_VIVADO:-}" ]]; then
@@ -120,6 +122,7 @@ for entry in "${TESTS[@]}"; do
     [[ "$DENS" == "4" ]]    && DEFINES="$DEFINES -d SIM_DENSITY_4G"
     [[ "$ROWS" != "16" ]]   && DEFINES="$DEFINES -d SIM_ROW_BITS=$ROWS"
     [[ "$SPECIAL" == "TRAIN_FAIL" ]] && DEFINES="$DEFINES -d SIM_FORCE_TRAIN_FAIL"
+    [[ "$SPECIAL" == "CSR_RESET" ]] && DEFINES="$DEFINES -d SIM_CSR_RESET_TEST"
 
     export EXTRA_DEFINES="$DEFINES"
     export MICRON_DENSITY="$MICRON_DEF"
@@ -153,7 +156,7 @@ for entry in "${TESTS[@]}"; do
     violation_count=$(grep -c "VIOLATION" "$LOG" 2>/dev/null)
     violation_count=${violation_count:-0}
 
-    if $sim_ok && grep -q "PASS: All test phases + BIST\|PASS: init_failed asserted as expected" "$LOG" \
+    if $sim_ok && grep -q "PASS: All test phases + BIST\|PASS: init_failed asserted as expected\|PASS: CSR reset test" "$LOG" \
               && ! grep -q "Simulation FAILED\|FAIL: rd_err\|FAIL: bist" "$LOG" \
               && [[ "$violation_count" -eq 0 ]]; then
         RESULTS+=("PASS")

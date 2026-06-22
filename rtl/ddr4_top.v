@@ -184,7 +184,8 @@ module ddr4_top #(
     // Prober (BIST + CSR) Wires
     // -----------------------------------------------------------------
     wire                     prober_bist_busy;
-    wire                     prober_reset_req; // V2: connect to reset path for auto-recovery
+    wire                     prober_bist_failed_reset_req;
+    wire                     prober_soft_reset_req;
     wire                     prober_wb_cyc;
     wire                     prober_wb_stb;
     wire                     prober_wb_we;
@@ -200,6 +201,9 @@ module ddr4_top #(
     // transactions see stall=1, ack=0.  When idle, the user port
     // passes through directly.
     wire bist_active = prober_bist_busy;
+
+    // external reset + CSR-triggered  soft reset + BIST-failure-triggered soft-reset (if enabled in AUTO_RESET_EN)
+    wire internal_rst_n = i_rst_n && !prober_soft_reset_req && !prober_bist_failed_reset_req;
 
     wire                     ctrl_wb_cyc;
     wire                     ctrl_wb_stb;
@@ -252,7 +256,7 @@ module ddr4_top #(
         .CWL(CWL)
     ) u_controller (
         .i_controller_clk(i_controller_clk),
-        .i_rst_n(i_rst_n),
+        .i_rst_n(internal_rst_n),
         // Wishbone (muxed)
         .i_wb_cyc(ctrl_wb_cyc),
         .i_wb_stb(ctrl_wb_stb),
@@ -324,7 +328,7 @@ module ddr4_top #(
         .i_controller_clk(i_controller_clk),
         .i_ddr4_clk(i_ddr4_clk),
         .i_ref_clk(i_ref_clk),
-        .i_rst_n(i_rst_n),
+        .i_rst_n(internal_rst_n),
         // DFI Control
         .i_dfi_address(dfi_address),
         .i_dfi_bank(dfi_bank),
@@ -408,9 +412,8 @@ module ddr4_top #(
         .o_init_done(o_init_done),
         .o_init_failed(o_init_failed),
         .o_bist_busy(prober_bist_busy),
-        .o_bist_pass(),
-        .o_bist_fail(),
-        .o_bist_reset_req(prober_reset_req),
+        .o_bist_failed_reset_req(prober_bist_failed_reset_req),
+        .o_soft_reset_req(prober_soft_reset_req),
         .o_wb_cyc(prober_wb_cyc),
         .o_wb_stb(prober_wb_stb),
         .o_wb_we(prober_wb_we),

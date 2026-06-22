@@ -1,0 +1,13 @@
+prober: add CSR soft-reset, pipelined ALT phase, type FIFO
+
+- CSR 0xC: bit[1] soft reset (W1S), bit[2] auto-reset-on-BIST-fail
+- Remove o_bist_pass/o_bist_fail ports (internal wires now)
+- Add o_soft_reset_req; top uses internal_rst_n for controller+PHY
+- Use prober_internal_reset for BIST FSM and init status registers
+- Replace wr_acks_pending counter with circular-buffer type FIFO
+  (correctly tracks W/R type for interleaved traffic)
+- Rewrite ALT_WRITE_READ as fully pipelined W-R-W-R (no drain
+  between requests, issues every cycle when not stalled)
+- Add SIM_CSR_RESET_TEST testbench coverage (soft reset, auto-reset,
+  BIST restart after failure injection)
+- Formal: add PHY bounded-stall assume for pipe_stall tasks
