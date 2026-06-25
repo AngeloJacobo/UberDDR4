@@ -438,8 +438,17 @@ module ddr4_controller #(
         find_delay(ps_to_nCK(tRP_ps), PRECHARGE_SLOT, ACTIVATE_SLOT); // tRP (see JESD79-4D Figure 67)
     localparam ACTIVATE_TO_PRECHARGE_DELAY =
         find_delay(ps_to_nCK(tRAS_ps), ACTIVATE_SLOT, PRECHARGE_SLOT); // tRAS (see JESD79-4D Figure 67)
-    localparam READ_TO_WRITE_DELAY =
-        find_delay(CL_nCK + 4 + 2 - CWL_nCK, READ_SLOT, WRITE_SLOT); // CL + (BL/2) + (tRPST+tWPRE) - CWL (see JESD79-4D Figure 98)
+    // READ-to-WRITE delay: must satisfy TWO constraints:
+    //  1) JEDEC bus turnaround: RL + BL/2 + 2 - WL (Figure 98)
+    //  2) PHY pipeline: wrdata_en must not fire before rddata_en of the
+    //     preceding read, otherwise output_enable drives DQ while the
+    //     PHY is still capturing read data (causes bus contention).
+    //     Gap = rddata_en_latency - wrdata_en_latency = (READ_DELAY+4) - WRITE_DATA_DELAY
+    localparam READ_TO_WRITE_DELAY = max_fn(
+        find_delay(CL_nCK + 4 + 2 - CWL_nCK, READ_SLOT, WRITE_SLOT),
+        find_delay(CL_nCK, READ_SLOT, READ_SLOT) + 4
+            - find_delay(CWL_nCK, WRITE_SLOT, WRITE_SLOT) + 1
+    );
 
     // Bank-group-dependent delays (new for DDR4)
     localparam CAS_TO_CAS_DELAY_SAME_BG =
