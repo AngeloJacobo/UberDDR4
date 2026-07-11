@@ -21,7 +21,7 @@
 //  PHY's write-leveling and gate-training FSMs must compensate for this.
 //  DQ/DQS are point-to-point so they stay zero-delay.
 //
-//  Wave dumping: VCD when `VCD_DUMP is defined (xsim), SHM otherwise.
+//  Wave dumping: VCD when `VCD_DUMP is defined (xsim), SHM otherwise. // Q: is SHM even used in vivado????
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -310,9 +310,9 @@ module ddr4_sim_top;
     // ===================================================================
     wire calib_complete_int = u_dut.calib_complete;
     wire bist_busy_int      = u_dut.prober_bist_busy;
-    wire bist_fail_int      = u_dut.u_prober.bist_fail_w;
-    wire [31:0] bist_correct_int = u_dut.u_prober.correct_count_w;
-    wire [31:0] bist_error_int   = u_dut.u_prober.error_count_w;
+    wire bist_fail_int      = u_dut.u_prober.bist_fail_sticky;
+    wire [31:0] bist_correct_int = u_dut.u_prober.correct_count;
+    wire [31:0] bist_error_int   = u_dut.u_prober.error_count;
 
     // ===================================================================
     // Micron DDR4 Models  -  direct instantiation (no wrapper module)
@@ -1071,47 +1071,177 @@ module ddr4_sim_top;
                                     ROW0_BG3_BA3 = BA3_OFF | ADDR_BG3;
 
     // -----------------------------------------------------------------
-    // Wishbone helper tasks
+    // =================================================================
+    // Pipelined Wishbone B4 Master Infrastructure
     //
-    // wb_write_one   - single-beat write: waits for !stall, asserts STB
-    //                  for one cycle, all byte-lanes enabled
-    // wb_read_one    - single-beat read: same handshake, WE=0
-    // wb_idle        - de-assert CYC/STB/WE (bus idle)
-    // drain_pipeline - idle + 39 clocks, long enough for the controller
-    //                  to flush any pending WR/RD through the PHY
-    // gen_pattern_tb - deterministic 128-bit pattern from 8-bit address
-    // wb_write_read_check - write, drain, read-back, compare
-    // wb_read_check  - read-only compare (data must already be in DRAM)
-    // wb_write_masked- write with partial wb_sel (byte-lane mask for DM)
+    // HOW IT WORKS (big picture):
+    //   1. Test phases "push" transactions (writes/reads) into a queue.
+    //   2. wb_pump_all() fires them onto the bus as fast as the slave
+    //      allows — one per clock cycle unless STALL is asserted.
+    //   3. Read responses are verified automatically as ACKs come back.
     //
-    // wb_dbg_read       - read a CSR register via the debug port
-    // wb_dbg_write      - write a CSR register via the debug port
+    // WHY: A real WB B4 pipelined master never inserts idle cycles
+    // between requests. It keeps STB=1 and only pauses when STALL=1.
+    // This is how the BIST engine (ddr4_prober) works. The testbench
+    // must behave the same way to properly stress the controller's
+    // bank-state machine, refresh interleaving, and WR/RD scheduling.
+    //
+    // PROTOCOL SUMMARY (Wishbone B4 Pipelined Mode):
+    //   - Master asserts CYC for the entire burst.
+    //   - Master asserts STB each cycle with addr/data/we/sel.
+    //   - If STALL=0 at the clock edge → request ACCEPTED.
+    //   - If STALL=1 at the clock edge → HOLD same request, try again.
+    //   - Each accepted request produces exactly one ACK later (in order).
+    //   - Master deasserts STB when no more requests to send.
+    //   - Master keeps CYC high until the last ACK is received.
+    //
+    // DATA FLOW:
+    //
+    //   wb_push_write/read()    wb_pump_all()          ACK checker
+    //         │                      │                      │
+    //         ▼                      │                      │
+    //   ┌──────────┐   pop front    │     on ACK: pop      │
+    //   │  txn_q   │ ────────────► bus ────────────► ┌─────────────┐
+    //   │ (pending)│  when !STALL   │                │ inflight_q  │
+    //   └──────────┘                │                │(waiting ACK)│
+    //                               │                └─────────────┘
+    //                               │                      │
+    //                               │               if read: compare
+    //                               │               wb_rdata vs expected
+    // =================================================================
+
+    // Transaction descriptor — one entry per WB request.
+    // For writes: 'data' = write data to put on the bus.
+    // For reads:  'data' = expected read-back value (used for verification).
+    typedef struct {
+        logic [WB_ADDR_BITS-1:0] addr;
+        logic [WB_DATA_BITS-1:0] data;
+        logic                     we;   // 1=write, 0=read
+        logic [WB_SEL_BITS-1:0]  sel;   // byte-lane enables (all-1 = full word)
+    } wb_txn_t;
+
+    // txn_q:      Requests waiting to be sent (not yet on the bus).
+    // inflight_q: Requests already accepted by the slave (STALL was 0),
+    //             but we haven't received their ACK yet.
+    wb_txn_t txn_q[$];
+    wb_txn_t inflight_q[$];
+
+    // Running count of read-data mismatches across all test phases.
+    integer rd_err_count;
+    initial rd_err_count = 0;
+
+    // -----------------------------------------------------------------
+    // Push tasks — add transactions to the pending queue.
+    // These are NON-BLOCKING: they just enqueue and return immediately.
+    // Nothing happens on the bus until wb_pump_all() is called.
     // -----------------------------------------------------------------
 
-    task wb_write_one(input [WB_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data);
+    // Queue a full-word write (all byte lanes enabled).
+    task wb_push_write(input [WB_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data);
         begin
-            wb_cyc  = 1'b1;
-            wb_stb  = 1'b1;
-            wb_we   = 1'b1;
-            wb_addr = addr;
-            wb_data = data;
-            wb_sel  = {WB_SEL_BITS{1'b1}};
-            @(posedge controller_clk);
-            while (wb_stall) @(posedge controller_clk);
-            wb_stb = 1'b0;
+            automatic wb_txn_t t;
+            t.addr = addr; t.data = data; t.we = 1'b1; t.sel = {WB_SEL_BITS{1'b1}};
+            txn_q.push_back(t);
         end
     endtask
 
-    task wb_read_one(input [WB_ADDR_BITS-1:0] addr);
+    // Queue a partial write (only bytes where sel=1 are written to DRAM;
+    // bytes where sel=0 keep their old value — this exercises DDR4 DM_n).
+    task wb_push_write_masked(input [WB_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data, input [WB_SEL_BITS-1:0] sel);
         begin
+            automatic wb_txn_t t;
+            t.addr = addr; t.data = data; t.we = 1'b1; t.sel = sel;
+            txn_q.push_back(t);
+        end
+    endtask
+
+    // Queue a read with expected data. When the ACK arrives, the
+    // checker compares wb_rdata against exp_data and reports PASS/FAIL.
+    task wb_push_read(input [WB_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] exp_data);
+        begin
+            automatic wb_txn_t t;
+            t.addr = addr; t.data = exp_data; t.we = 1'b0; t.sel = {WB_SEL_BITS{1'b1}};
+            txn_q.push_back(t);
+        end
+    endtask
+
+    // -----------------------------------------------------------------
+    // wb_pump_all — The core pipelined driver.
+    //
+    // Sends ALL queued transactions onto the WB bus at full speed,
+    // then waits until every ACK has been received.
+    //
+    // Timing diagram (no stalls):
+    //
+    //   CLK   ─┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐
+    //   CYC   ─────────────────────────────────────────── (high entire time)
+    //   STB   ─────────────────────────────── (drops when queue empty)
+    //   STALL  _____________________________________ (slave not stalling)
+    //   ADDR   [A0][A1][A2][A3]                      (advances each cycle)
+    //   ACK    ___________[1][1][1][1]               (arrives later, in order)
+    //
+    // When STALL=1: addr/data/we/sel FREEZE until stall drops.
+    // -----------------------------------------------------------------
+    task wb_pump_all;
+        begin
+            if (txn_q.size() == 0) return;
+
+            // --- Start of burst: assert CYC, present first transaction ---
             wb_cyc  = 1'b1;
             wb_stb  = 1'b1;
-            wb_we   = 1'b0;
-            wb_addr = addr;
-            wb_sel  = {WB_SEL_BITS{1'b1}};
-            @(posedge controller_clk);
-            while (wb_stall) @(posedge controller_clk);
+            wb_we   = txn_q[0].we;
+            wb_addr = txn_q[0].addr;
+            wb_data = txn_q[0].data;
+            wb_sel  = txn_q[0].sel;
+
+            // Loop until all requests sent AND all ACKs received.
+            while (txn_q.size() > 0 || inflight_q.size() > 0) begin
+                @(posedge controller_clk);
+
+                // --- ACK processing (response side) ---
+                // When the slave asserts ACK, it means the oldest in-flight
+                // request has completed. For writes we just consume it.
+                // For reads we compare the returned data to what we expected.
+                if (wb_ack && inflight_q.size() > 0) begin
+                    automatic wb_txn_t done = inflight_q.pop_front();
+                    if (!done.we) begin
+                        if (wb_rdata !== done.data) begin
+                            $display("[%0t]   FAIL: addr=0x%0h exp=0x%0h got=0x%0h",
+                                $realtime, done.addr, done.data, wb_rdata);
+                            rd_err_count = rd_err_count + 1;
+                        end else begin
+                            $display("[%0t]   PASS: addr=0x%0h data=0x%0h", $realtime, done.addr, wb_rdata);
+                        end
+                    end
+                end
+
+                // --- Request acceptance (request side) ---
+                // If STB=1 and STALL=0, the slave accepted our current request.
+                // Move it from txn_q → inflight_q, then present the next one.
+                // If no more requests: drop STB (but keep CYC for remaining ACKs).
+                if (wb_stb && !wb_stall) begin
+                    if (txn_q.size() > 0) begin
+                        inflight_q.push_back(txn_q.pop_front());
+                        if (txn_q.size() > 0) begin
+                            // Present next transaction immediately (no idle gap!)
+                            wb_we   = txn_q[0].we;
+                            wb_addr = txn_q[0].addr;
+                            wb_data = txn_q[0].data;
+                            wb_sel  = txn_q[0].sel;
+                        end else begin
+                            // All requests sent — stop strobing
+                            wb_stb = 1'b0;
+                        end
+                    end
+                end
+                // If STALL=1: do nothing — hold current signals unchanged.
+                // The slave will see the same request again next cycle.
+            end
+
+            // --- End of burst: all ACKs received, release bus ---
+            wb_cyc = 1'b0;
             wb_stb = 1'b0;
+            wb_we  = 1'b0;
         end
     endtask
 
@@ -1162,14 +1292,6 @@ module ddr4_sim_top;
         end
     endtask
 
-    task drain_pipeline;
-        begin
-            @(posedge controller_clk);
-            wb_idle;
-            repeat (39) @(posedge controller_clk);
-        end
-    endtask
-
     function automatic [WB_DATA_BITS-1:0] gen_pattern_tb;
         input [7:0] addr;
         reg [31:0] seed;
@@ -1178,76 +1300,6 @@ module ddr4_sim_top;
             gen_pattern_tb = {4{seed}};
         end
     endfunction
-
-    integer rd_err_count;
-    initial rd_err_count = 0;
-
-    task wb_write_read_check(
-        input [WB_ADDR_BITS-1:0] addr,
-        input [WB_DATA_BITS-1:0]  wdata
-    );
-        reg [WB_DATA_BITS-1:0] captured;
-        begin
-            wb_write_one(addr, wdata);
-            while (!wb_ack) @(posedge controller_clk);
-            drain_pipeline;
-            wb_read_one(addr);
-            wb_stb = 1'b0;
-            while (!wb_ack) @(posedge controller_clk);
-            captured = wb_rdata;
-            wb_idle;
-            repeat (5) @(posedge controller_clk);
-            if (captured === wdata) begin
-                $display("[%0t]   PASS: addr=0x%0h data=0x%0h", $realtime, addr, captured);
-            end else begin
-                $display("[%0t]   FAIL: addr=0x%0h expected=0x%0h got=0x%0h",
-                         $realtime, addr, wdata, captured);
-                rd_err_count = rd_err_count + 1;
-            end
-        end
-    endtask
-
-    task wb_read_check(
-        input [WB_ADDR_BITS-1:0] addr,
-        input [WB_DATA_BITS-1:0]  expected
-    );
-        reg [WB_DATA_BITS-1:0] captured;
-        begin
-            wb_read_one(addr);
-            wb_stb = 1'b0;
-            while (!wb_ack) @(posedge controller_clk);
-            captured = wb_rdata;
-            wb_idle;
-            repeat (5) @(posedge controller_clk);
-            if (captured === expected) begin
-                $display("[%0t]   RD_CHK PASS: addr=0x%0h", $realtime, addr);
-            end else begin
-                $display("[%0t]   RD_CHK FAIL: addr=0x%0h exp=0x%0h got=0x%0h",
-                         $realtime, addr, expected, captured);
-                rd_err_count = rd_err_count + 1;
-            end
-        end
-    endtask
-
-    task wb_write_masked(
-        input [WB_ADDR_BITS-1:0] addr,
-        input [WB_DATA_BITS-1:0]  data,
-        input [WB_SEL_BITS-1:0]   sel
-    );
-        begin
-            wb_stb = 1'b0;
-            @(posedge controller_clk);
-            while (wb_stall) @(posedge controller_clk);
-            wb_cyc  = 1'b1;
-            wb_stb  = 1'b1;
-            wb_we   = 1'b1;
-            wb_addr = addr;
-            wb_data = data;
-            wb_sel  = sel;
-            @(posedge controller_clk);
-            wb_stb = 1'b0;
-        end
-    endtask
 
     integer wb_write_count;
     initial wb_write_count = 0;
@@ -1471,10 +1523,16 @@ module ddr4_sim_top;
         test_phase = "DONE";
         all_tests_done = 1'b1;
     `else
+        // Wait for stall to clear before starting user traffic.
         repeat (10) @(posedge controller_clk);
         while (wb_stall) @(posedge controller_clk);
 
-        // === Row-offset loop: run corner-case phases at first/middle/last row ===
+        // =============================================================
+        // Row-offset loop: exercises the same test patterns at three
+        // different row addresses: first row (0), middle row, last row.
+        // This catches bugs in row-address bit routing and edge cases
+        // in the controller's bank-state tracking at address extremes.
+        // =============================================================
         begin : row_loop_blk
             integer row_iter;
             reg [WB_ADDR_BITS-1:0] row_base;
@@ -1487,76 +1545,70 @@ module ddr4_sim_top;
                 $display("[%0t] ===== ROW ITERATION %0d (row_base=0x%0h) =====",
                          $realtime, row_iter, row_base);
 
-        // -- Phase A: Cold writes to 4 idle banks (ACT -> WR) --
+        // =============================================================
+        // PATTERN USED IN PHASES A-H:
+        //   1. Push N writes (to different bank groups / banks / rows)
+        //   2. Push N reads to same addresses with expected data
+        //   3. Call wb_pump_all — fires ALL of them back-to-back
+        //
+        // The controller must handle the write→read transitions
+        // internally (ACT, PRE, tWTR delays, etc.) using STALL to
+        // throttle the master. We never manually wait between ops.
+        // =============================================================
+
+        // -- Phase A: Cold writes to 4 idle banks --
+        // All banks are closed → controller must issue ACT before each WR.
+        // Tests: basic ACT→WR path for 4 different bank groups.
         test_phase = "PHASE_A";
         $display("[%0t] === Phase A: Cold writes to idle banks (ACT->WR) ===", $realtime);
-        wb_write_one(ROW0_BG0 + row_base, 128'h0A);
-        $display("[%0t]   write BG0/BA0/row0", $realtime);
-        wb_write_one(ROW0_BG1 + row_base, 128'h0B);
-        $display("[%0t]   write BG1/BA0/row0", $realtime);
-        wb_write_one(ROW0_BG2 + row_base, 128'h0C);
-        $display("[%0t]   write BG2/BA0/row0", $realtime);
-        wb_write_one(ROW0_BG3 + row_base, 128'h0D);
-        $display("[%0t]   write BG3/BA0/row0", $realtime);
-        drain_pipeline;
-        $display("[%0t]   Readback Phase A:", $realtime);
-        wb_read_check(ROW0_BG0 + row_base, 128'h0A);
-        wb_read_check(ROW0_BG1 + row_base, 128'h0B);
-        wb_read_check(ROW0_BG2 + row_base, 128'h0C);
-        wb_read_check(ROW0_BG3 + row_base, 128'h0D);
+        wb_push_write(ROW0_BG0 + row_base, 128'h0A);
+        wb_push_write(ROW0_BG1 + row_base, 128'h0B);
+        wb_push_write(ROW0_BG2 + row_base, 128'h0C);
+        wb_push_write(ROW0_BG3 + row_base, 128'h0D);
+        wb_push_read(ROW0_BG0 + row_base, 128'h0A);
+        wb_push_read(ROW0_BG1 + row_base, 128'h0B);
+        wb_push_read(ROW0_BG2 + row_base, 128'h0C);
+        wb_push_read(ROW0_BG3 + row_base, 128'h0D);
+        wb_pump_all;
 
-        // -- Phase B: Bank hits  -  same bank, same row still open (WR only) --
+        // -- Phase B: Bank hits — same bank, same row already open --
+        // The row is still open from Phase A → controller skips ACT,
+        // issues WR directly (bank "hit"). Tests: hit path with no
+        // ACT/PRE overhead — maximum throughput scenario.
         test_phase = "PHASE_B";
         $display("[%0t] === Phase B: Bank hits  -  same row open (WR only) ===", $realtime);
-        wb_write_one(ROW0_BG0 + row_base, 128'h1A);
-        $display("[%0t]   write BG0/BA0/row0 (hit)", $realtime);
-        wb_write_one(ROW0_BG1 + row_base, 128'h1B);
-        $display("[%0t]   write BG1/BA0/row0 (hit)", $realtime);
-        wb_write_one(ROW0_BG2 + row_base, 128'h1C);
-        $display("[%0t]   write BG2/BA0/row0 (hit)", $realtime);
-        wb_write_one(ROW0_BG3 + row_base, 128'h1D);
-        $display("[%0t]   write BG3/BA0/row0 (hit)", $realtime);
-        drain_pipeline;
-        $display("[%0t]   Readback Phase B:", $realtime);
-        wb_read_check(ROW0_BG0 + row_base, 128'h1A);
-        wb_read_check(ROW0_BG1 + row_base, 128'h1B);
-        wb_read_check(ROW0_BG2 + row_base, 128'h1C);
-        wb_read_check(ROW0_BG3 + row_base, 128'h1D);
+        wb_push_write(ROW0_BG0 + row_base, 128'h1A);
+        wb_push_write(ROW0_BG1 + row_base, 128'h1B);
+        wb_push_write(ROW0_BG2 + row_base, 128'h1C);
+        wb_push_write(ROW0_BG3 + row_base, 128'h1D);
+        wb_push_read(ROW0_BG0 + row_base, 128'h1A);
+        wb_push_read(ROW0_BG1 + row_base, 128'h1B);
+        wb_push_read(ROW0_BG2 + row_base, 128'h1C);
+        wb_push_read(ROW0_BG3 + row_base, 128'h1D);
+        wb_pump_all;
 
-        // -- Phase C: Row miss  -  same bank, different row (PRE -> ACT -> WR) --
+        // -- Phase C: Row miss — same bank, DIFFERENT row --
+        // Row0 is open but we write to Row1 → controller must:
+        //   PRE (close Row0) → ACT (open Row1) → WR
+        // This is the most expensive path. The controller stalls us
+        // while it sequences PRE+ACT timing (tRP + tRCD).
         test_phase = "PHASE_C";
         $display("[%0t] === Phase C: Row miss  -  different row (PRE->ACT->WR) ===", $realtime);
-        if (TB_BIST_MODE == 2) begin
-            wb_write_one(ROW1_BG0 + row_base, 128'h2A);
-            $display("[%0t]   write BG0/BA0/row1 (miss)", $realtime);
-            drain_pipeline;
-            wb_write_one(ROW1_BG1 + row_base, 128'h2B);
-            $display("[%0t]   write BG1/BA0/row1 (miss)", $realtime);
-            drain_pipeline;
-            wb_write_one(ROW1_BG2 + row_base, 128'h2C);
-            $display("[%0t]   write BG2/BA0/row1 (miss)", $realtime);
-            drain_pipeline;
-            wb_write_one(ROW1_BG3 + row_base, 128'h2D);
-            $display("[%0t]   write BG3/BA0/row1 (miss)", $realtime);
-            drain_pipeline;
-        end else begin
-            wb_write_one(ROW1_BG0 + row_base, 128'h2A);
-            $display("[%0t]   write BG0/BA0/row1 (miss)", $realtime);
-            wb_write_one(ROW1_BG1 + row_base, 128'h2B);
-            $display("[%0t]   write BG1/BA0/row1 (miss)", $realtime);
-            wb_write_one(ROW1_BG2 + row_base, 128'h2C);
-            $display("[%0t]   write BG2/BA0/row1 (miss)", $realtime);
-            wb_write_one(ROW1_BG3 + row_base, 128'h2D);
-            $display("[%0t]   write BG3/BA0/row1 (miss)", $realtime);
-            drain_pipeline;
-        end
-        $display("[%0t]   Readback Phase C:", $realtime);
-        wb_read_check(ROW1_BG0 + row_base, 128'h2A);
-        wb_read_check(ROW1_BG1 + row_base, 128'h2B);
-        wb_read_check(ROW1_BG2 + row_base, 128'h2C);
-        wb_read_check(ROW1_BG3 + row_base, 128'h2D);
+        wb_push_write(ROW1_BG0 + row_base, 128'h2A);
+        wb_push_write(ROW1_BG1 + row_base, 128'h2B);
+        wb_push_write(ROW1_BG2 + row_base, 128'h2C);
+        wb_push_write(ROW1_BG3 + row_base, 128'h2D);
+        wb_push_read(ROW1_BG0 + row_base, 128'h2A);
+        wb_push_read(ROW1_BG1 + row_base, 128'h2B);
+        wb_push_read(ROW1_BG2 + row_base, 128'h2C);
+        wb_push_read(ROW1_BG3 + row_base, 128'h2D);
+        wb_pump_all;
 
-        // -- Phase D: Wait for refresh (PRE ALL closes all banks), then re-access --
+        // -- Phase D: Post-refresh access --
+        // We idle the bus and wait for the controller to issue a periodic
+        // REF command (which closes all banks via PRE ALL). Then we write
+        // again — verifying that the controller correctly re-opens banks
+        // after a refresh event.
         test_phase = "WAIT_REF";
         $display("[%0t] === Waiting for refresh to close all banks... ===", $realtime);
         wb_idle;
@@ -1566,99 +1618,113 @@ module ddr4_sim_top;
 
         test_phase = "PHASE_D";
         $display("[%0t] === Phase D: Post-refresh writes (ACT->WR) ===", $realtime);
-        wb_write_one(ROW0_BG0 + row_base, 128'h3A);
-        $display("[%0t]   write BG0/BA0/row0 (post-refresh)", $realtime);
-        wb_write_one(ROW0_BG1 + row_base, 128'h3B);
-        $display("[%0t]   write BG1/BA0/row0 (post-refresh)", $realtime);
-        wb_write_one(ROW0_BG2 + row_base, 128'h3C);
-        $display("[%0t]   write BG2/BA0/row0 (post-refresh)", $realtime);
-        wb_write_one(ROW0_BG3 + row_base, 128'h3D);
-        $display("[%0t]   write BG3/BA0/row0 (post-refresh)", $realtime);
-        drain_pipeline;
-        $display("[%0t]   Readback Phase D:", $realtime);
-        wb_read_check(ROW0_BG0 + row_base, 128'h3A);
-        wb_read_check(ROW0_BG1 + row_base, 128'h3B);
-        wb_read_check(ROW0_BG2 + row_base, 128'h3C);
-        wb_read_check(ROW0_BG3 + row_base, 128'h3D);
+        wb_push_write(ROW0_BG0 + row_base, 128'h3A);
+        wb_push_write(ROW0_BG1 + row_base, 128'h3B);
+        wb_push_write(ROW0_BG2 + row_base, 128'h3C);
+        wb_push_write(ROW0_BG3 + row_base, 128'h3D);
+        wb_push_read(ROW0_BG0 + row_base, 128'h3A);
+        wb_push_read(ROW0_BG1 + row_base, 128'h3B);
+        wb_push_read(ROW0_BG2 + row_base, 128'h3C);
+        wb_push_read(ROW0_BG3 + row_base, 128'h3D);
+        wb_pump_all;
 
-        // -- Phase E: Same-BG different-bank writes (tRRD_L / tCCD_L stress) --
+        // -- Phase E: Same bank-group, different banks --
+        // All 3 writes target BG0 but different bank addresses (BA0, BA1, BA2).
+        // Within the SAME bank group, the controller must respect tRRD_L
+        // (ACT-to-ACT) and tCCD_L (CAS-to-CAS) which are LONGER than the
+        // cross-BG variants (tRRD_S / tCCD_S). Stresses the scheduler's
+        // same-BG timing enforcement.
         test_phase = "PHASE_E";
         $display("[%0t] === Phase E: Same-BG different-bank writes (tRRD/tCCD_L) ===", $realtime);
-        wb_write_one(ROW0_BG0 + row_base,     128'h4A);
-        $display("[%0t]   write BG0/BA0/row0", $realtime);
-        wb_write_one(ROW0_BG0_BA1 + row_base, 128'h4B);
-        $display("[%0t]   write BG0/BA1/row0 (same BG, diff bank)", $realtime);
-        wb_write_one(ROW0_BG0_BA2 + row_base, 128'h4C);
-        $display("[%0t]   write BG0/BA2/row0 (same BG, diff bank)", $realtime);
-        drain_pipeline;
-        $display("[%0t]   Readback Phase E:", $realtime);
-        wb_read_check(ROW0_BG0 + row_base,     128'h4A);
-        wb_read_check(ROW0_BG0_BA1 + row_base, 128'h4B);
-        wb_read_check(ROW0_BG0_BA2 + row_base, 128'h4C);
+        wb_push_write(ROW0_BG0 + row_base,     128'h4A);
+        wb_push_write(ROW0_BG0_BA1 + row_base, 128'h4B);
+        wb_push_write(ROW0_BG0_BA2 + row_base, 128'h4C);
+        wb_push_read(ROW0_BG0 + row_base,     128'h4A);
+        wb_push_read(ROW0_BG0_BA1 + row_base, 128'h4B);
+        wb_push_read(ROW0_BG0_BA2 + row_base, 128'h4C);
+        wb_pump_all;
 
-        // -- Phase F: Read + data verify (exercises sched_read path) --
+        // -- Phase F: Mixed write+read in one burst --
+        // Writes to BG0/BG1, then reads from BG0/BG1 (bank hits) and
+        // BG2/BG3 (still hold Phase D data=0x3C/3D). This tests the
+        // controller's ability to interleave writes and reads within a
+        // single pipelined burst — no idle gap between the last write
+        // and the first read.
         test_phase = "PHASE_F";
         $display("[%0t] === Phase F: Read requests (ACT->RD, bank hit RD) ===", $realtime);
-        wb_write_one(ROW0_BG0 + row_base, 128'h5A);
-        $display("[%0t]   write BG0/BA0/row0 (open bank)", $realtime);
-        wb_write_one(ROW0_BG1 + row_base, 128'h5B);
-        $display("[%0t]   write BG1/BA0/row0 (open bank)", $realtime);
-        drain_pipeline;
-        $display("[%0t]   Readback Phase F (BG0/BG1=hit, BG2/BG3=cold ACT->RD):", $realtime);
-        wb_read_check(ROW0_BG0 + row_base, 128'h5A);
-        wb_read_check(ROW0_BG1 + row_base, 128'h5B);
-        wb_read_check(ROW0_BG2 + row_base, 128'h3C);
-        wb_read_check(ROW0_BG3 + row_base, 128'h3D);
+        wb_push_write(ROW0_BG0 + row_base, 128'h5A);
+        wb_push_write(ROW0_BG1 + row_base, 128'h5B);
+        wb_push_read(ROW0_BG0 + row_base, 128'h5A);
+        wb_push_read(ROW0_BG1 + row_base, 128'h5B);
+        wb_push_read(ROW0_BG2 + row_base, 128'h3C);  // still has Phase D data
+        wb_push_read(ROW0_BG3 + row_base, 128'h3D);  // still has Phase D data
+        wb_pump_all;
 
-        // -- Phase G: Same-bank rapid re-access (tRC stress: ACT->ACT same bank) --
+        // -- Phase G: Same-bank row thrashing (tRC stress) --
+        // Three writes to the SAME bank (BG0/BA0) but alternating rows:
+        //   Row0 → Row1 → Row0 (each causes PRE+ACT = row miss)
+        // The minimum time between two ACTs to the same bank is tRC.
+        // The controller must stall long enough to satisfy tRC.
         test_phase = "PHASE_G";
         $display("[%0t] === Phase G: Same-bank rapid re-access (tRC stress) ===", $realtime);
-        wb_write_one(ROW0_BG0 + row_base, 128'h6A);
-        $display("[%0t]   write BG0/BA0/row0", $realtime);
-        drain_pipeline;
-        wb_write_one(ROW1_BG0 + row_base, 128'h6B);
-        $display("[%0t]   write BG0/BA0/row1 (miss -> PRE+ACT+WR same bank)", $realtime);
-        drain_pipeline;
-        wb_write_one(ROW0_BG0 + row_base, 128'h6C);
-        $display("[%0t]   write BG0/BA0/row0 (miss -> PRE+ACT+WR same bank again)", $realtime);
-        drain_pipeline;
-        $display("[%0t]   Readback Phase G:", $realtime);
-        wb_read_check(ROW0_BG0 + row_base, 128'h6C);
-        wb_read_check(ROW1_BG0 + row_base, 128'h6B);
+        wb_push_write(ROW0_BG0 + row_base, 128'h6A);  // open Row0
+        wb_push_write(ROW1_BG0 + row_base, 128'h6B);  // miss: PRE Row0 → ACT Row1
+        wb_push_write(ROW0_BG0 + row_base, 128'h6C);  // miss: PRE Row1 → ACT Row0
+        wb_push_read(ROW0_BG0 + row_base, 128'h6C);   // last write wins
+        wb_push_read(ROW1_BG0 + row_base, 128'h6B);
+        wb_pump_all;
 
         // -- Phase H: Write-then-read same BG (tWTR stress) --
+        // After a write, the controller must wait tWTR_L (same BG) or
+        // tWTR_S (different BG) before issuing a read. We interleave
+        // W-R-W-R-R-R in a single pipelined burst to stress this path.
+        // The master pumps all 6 requests without gaps; the controller
+        // uses STALL to enforce tWTR timing internally.
         test_phase = "PHASE_H";
         $display("[%0t] === Phase H: Write-then-read same BG (tWTR stress) ===", $realtime);
-        wb_write_one(ROW0_BG0 + row_base, 128'h7A);
-        $display("[%0t]   write BG0/BA0/row0", $realtime);
-        wb_read_one(ROW0_BG0 + row_base);
-        $display("[%0t]   read BG0/BA0/row0 (same BG -> tWTR_L)", $realtime);
-        wb_write_one(ROW0_BG1 + row_base, 128'h7B);
-        $display("[%0t]   write BG1/BA0/row0", $realtime);
-        wb_read_one(ROW0_BG0 + row_base);
-        $display("[%0t]   read BG0/BA0/row0 (diff BG -> tWTR_S applies to BG1)", $realtime);
-        drain_pipeline;
-        $display("[%0t]   Readback Phase H:", $realtime);
-        wb_read_check(ROW0_BG0 + row_base, 128'h7A);
-        wb_read_check(ROW0_BG1 + row_base, 128'h7B);
+        wb_push_write(ROW0_BG0 + row_base, 128'h7A);  // WR to BG0
+        wb_push_read(ROW0_BG0 + row_base, 128'h7A);   // RD from BG0 (tWTR_L applies)
+        wb_push_write(ROW0_BG1 + row_base, 128'h7B);  // WR to BG1
+        wb_push_read(ROW0_BG0 + row_base, 128'h7A);   // RD from BG0 (tWTR_S from BG1's WR)
+        wb_push_read(ROW0_BG0 + row_base, 128'h7A);   // back-to-back RD
+        wb_push_read(ROW0_BG1 + row_base, 128'h7B);   // RD from BG1
+        wb_pump_all;
 
-        // -- Phase I: Write->Read data round-trip verification --
+        // -- Phase I: Write→Read data round-trip verification --
         // Each pattern targets a different failure mode:
-        //   all-F / all-0 catch stuck-at faults, A5/5A catch lane swaps,
-        //   DEAD_BEEF is a sanity check, half-bus patterns catch byte-lane
-        //   crossbar bugs, walking-1 catches single-bit shorts.
+        //   all-F / all-0  → stuck-at faults in DQ lines
+        //   A5/5A          → byte-lane swap (adjacent lanes swapped)
+        //   DEAD_BEEF      → general sanity (mixed nibbles)
+        //   half-bus F/0   → upper vs lower 64-bit crossbar bugs
+        //   walking-1      → single-bit shorts between DQ lines
+        //
+        // NOTE: write and read to the SAME address are queued
+        // back-to-back (W0-R0-W1-R1-...). The WB B4 in-order guarantee
+        // means the controller processes the write BEFORE the read,
+        // so the read always returns the freshly-written value.
         test_phase = "PHASE_I";
         $display("[%0t] === Phase I: Write->Read round-trip verification ===", $realtime);
-        wb_write_read_check(ROW2_BG0 + row_base,    128'hDEAD_BEEF_CAFE_BABE_0123_4567_89AB_CDEF);
-        wb_write_read_check(ROW2_BG1 + row_base,    128'hFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF);
-        wb_write_read_check(ROW2_BG2 + row_base,    128'h0000_0000_0000_0000_0000_0000_0000_0000);
-        wb_write_read_check(ROW2_BG3 + row_base,    128'hA5A5_A5A5_5A5A_5A5A_A5A5_A5A5_5A5A_5A5A);
-        wb_write_read_check(ROW2_BG0_C1 + row_base, 128'h0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF);
-        wb_write_read_check(ROW2_BG1_C1 + row_base, 128'hFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000);
-        wb_write_read_check(ROW2_BG0 + row_base,    128'h1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210);
-        wb_write_read_check(ROW2_BG1 + row_base,    128'h0F0F_0F0F_F0F0_F0F0_0F0F_0F0F_F0F0_F0F0);
-        wb_write_read_check(ROW2_BG2 + row_base,    128'h0000_0000_0000_0001_8000_0000_0000_0000);
-        wb_write_read_check(ROW2_BG3 + row_base,    128'hAAAA_AAAA_5555_5555_AAAA_AAAA_5555_5555);
+        wb_push_write(ROW2_BG0 + row_base,    128'hDEAD_BEEF_CAFE_BABE_0123_4567_89AB_CDEF);
+        wb_push_read(ROW2_BG0 + row_base,     128'hDEAD_BEEF_CAFE_BABE_0123_4567_89AB_CDEF);
+        wb_push_write(ROW2_BG1 + row_base,    128'hFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF);
+        wb_push_read(ROW2_BG1 + row_base,     128'hFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF);
+        wb_push_write(ROW2_BG2 + row_base,    128'h0000_0000_0000_0000_0000_0000_0000_0000);
+        wb_push_read(ROW2_BG2 + row_base,     128'h0000_0000_0000_0000_0000_0000_0000_0000);
+        wb_push_write(ROW2_BG3 + row_base,    128'hA5A5_A5A5_5A5A_5A5A_A5A5_A5A5_5A5A_5A5A);
+        wb_push_read(ROW2_BG3 + row_base,     128'hA5A5_A5A5_5A5A_5A5A_A5A5_A5A5_5A5A_5A5A);
+        wb_push_write(ROW2_BG0_C1 + row_base, 128'h0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF);
+        wb_push_read(ROW2_BG0_C1 + row_base,  128'h0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF);
+        wb_push_write(ROW2_BG1_C1 + row_base, 128'hFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000);
+        wb_push_read(ROW2_BG1_C1 + row_base,  128'hFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000);
+        wb_push_write(ROW2_BG0 + row_base,    128'h1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210);
+        wb_push_read(ROW2_BG0 + row_base,     128'h1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210);
+        wb_push_write(ROW2_BG1 + row_base,    128'h0F0F_0F0F_F0F0_F0F0_0F0F_0F0F_F0F0_F0F0);
+        wb_push_read(ROW2_BG1 + row_base,     128'h0F0F_0F0F_F0F0_F0F0_0F0F_0F0F_F0F0_F0F0);
+        wb_push_write(ROW2_BG2 + row_base,    128'h0000_0000_0000_0001_8000_0000_0000_0000);
+        wb_push_read(ROW2_BG2 + row_base,     128'h0000_0000_0000_0001_8000_0000_0000_0000);
+        wb_push_write(ROW2_BG3 + row_base,    128'hAAAA_AAAA_5555_5555_AAAA_AAAA_5555_5555);
+        wb_push_read(ROW2_BG3 + row_base,     128'hAAAA_AAAA_5555_5555_AAAA_AAAA_5555_5555);
+        wb_pump_all;
 
         if (rd_err_count == 0)
             $display("[%0t] PASS: All 10 write->read checks passed", $realtime);
@@ -1668,85 +1734,66 @@ module ddr4_sim_top;
             end // for row_iter
         end // row_loop_blk
 
-        // -- Phase J: True pipelined writes  -  STB stays high, no gaps --
+        // -- Phase J: Bulk pipelined write then bulk read --
+        // Queues TB_DEPTH/2 (16) writes to consecutive addresses, then
+        // 16 reads to the same addresses. All 32 transactions fire in
+        // one wb_pump_all call — the bus never goes idle between them.
+        // gen_pattern_tb(idx) generates a deterministic 128-bit pattern
+        // from the address index so we can verify each word independently.
         test_phase = "PHASE_J";
-        $display("[%0t] === Phase J: Pipelined write->drain->read (%0d addr) ===", $realtime, TB_DEPTH/2);
+        $display("[%0t] === Phase J: Pipelined write->read (%0d addr) ===", $realtime, TB_DEPTH/2);
         begin : phase_j_blk
             integer pj_idx;
             integer pj_err;
-            reg [WB_DATA_BITS-1:0] pj_exp;
-            reg [WB_DATA_BITS-1:0] pj_captured;
             pj_err = 0;
 
-            wb_cyc = 1'b1;
-            wb_stb = 1'b1;
-            wb_we  = 1'b1;
-            wb_sel = {WB_SEL_BITS{1'b1}};
-            wb_addr = 27'h1000;
-            wb_data = gen_pattern_tb(8'd0);
-
             for (pj_idx = 0; pj_idx < (TB_DEPTH/2); pj_idx = pj_idx + 1) begin
-                @(posedge controller_clk);
-                while (wb_stall) @(posedge controller_clk);
-                if (pj_idx < (TB_DEPTH/2) - 1) begin
-                    wb_addr = 27'h1000 + pj_idx + 1;
-                    wb_data = gen_pattern_tb(pj_idx[7:0] + 8'd1);
-                end else begin
-                    wb_stb = 1'b0;
-                end
+                wb_push_write(27'h1000 + pj_idx, gen_pattern_tb(pj_idx[7:0]));
             end
-            wb_we = 1'b0;
-
-            drain_pipeline;
-
             for (pj_idx = 0; pj_idx < (TB_DEPTH/2); pj_idx = pj_idx + 1) begin
-                wb_read_one(27'h1000 + pj_idx);
-                wb_stb = 1'b0;
-                while (!wb_ack) @(posedge controller_clk);
-                pj_captured = wb_rdata;
-                wb_idle;
-                repeat (5) @(posedge controller_clk);
-                pj_exp = gen_pattern_tb(pj_idx[7:0]);
-                if (pj_captured !== pj_exp) begin
-                    $display("[%0t]   PHASE_J FAIL: addr=%0d exp=%0h got=%0h",
-                        $realtime, pj_idx, pj_exp, pj_captured);
-                    pj_err = pj_err + 1;
-                end else begin
-                    $display("[%0t]   PHASE_J PASS: addr=%0d", $realtime, pj_idx);
-                end
+                wb_push_read(27'h1000 + pj_idx, gen_pattern_tb(pj_idx[7:0]));
             end
-            wb_idle;
+            wb_pump_all;
 
-            if (pj_err == 0)
-                $display("[%0t] PASS: Phase J  -  all 16 pipelined write->read checks passed", $realtime);
+            if (rd_err_count == pj_err)
+                $display("[%0t] PASS: Phase J  -  all %0d pipelined write->read checks passed", $realtime, TB_DEPTH/2);
             else begin
-                $display("[%0t] FAIL: Phase J  -  %0d of 16 checks failed", $realtime, pj_err);
-                rd_err_count = rd_err_count + pj_err;
+                $display("[%0t] FAIL: Phase J  -  %0d of %0d checks failed", $realtime, rd_err_count - pj_err, TB_DEPTH/2);
             end
         end
 
-        // -- Phase K: Read->Write turnaround stress (RD->WR delay) --
+        // -- Phase K: Read→Write turnaround (bus contention stress) --
+        // After the DQ bus is used for a read, the PHY must turn around
+        // the I/O direction before driving write data. The controller
+        // enforces a RD→WR delay for this. We queue: WR-WR-RD-WR-WR-RD-RD
+        // so the controller sees a read immediately followed by writes —
+        // it must stall the writes long enough for the PHY turnaround.
         test_phase = "PHASE_K";
         $display("[%0t] === Phase K: Read->Write turnaround (RD->WR delay) ===", $realtime);
-        wb_write_one(ROW0_BG0, 128'hA0A0_A0A0_A0A0_A0A0_A0A0_A0A0_A0A0_A0A0);
-        wb_write_one(ROW0_BG1, 128'hB0B0_B0B0_B0B0_B0B0_B0B0_B0B0_B0B0_B0B0);
-        drain_pipeline;
-        wb_read_one(ROW0_BG0);
-        $display("[%0t]   read BG0 (loads RD->WR delay on all banks)", $realtime);
-        wb_write_one(ROW0_BG0, 128'hA1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1);
-        $display("[%0t]   write BG0 immediately after read (same BG)", $realtime);
-        wb_write_one(ROW0_BG1, 128'hB1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1);
-        $display("[%0t]   write BG1 immediately after read (diff BG)", $realtime);
-        drain_pipeline;
-        $display("[%0t]   Readback Phase K:", $realtime);
-        wb_read_check(ROW0_BG0, 128'hA1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1);
-        wb_read_check(ROW0_BG1, 128'hB1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1);
+        wb_push_write(ROW0_BG0, 128'hA0A0_A0A0_A0A0_A0A0_A0A0_A0A0_A0A0_A0A0);
+        wb_push_write(ROW0_BG1, 128'hB0B0_B0B0_B0B0_B0B0_B0B0_B0B0_B0B0_B0B0);
+        wb_push_read(ROW0_BG0, 128'hA0A0_A0A0_A0A0_A0A0_A0A0_A0A0_A0A0_A0A0);  // RD
+        wb_push_write(ROW0_BG0, 128'hA1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1);  // WR right after RD!
+        wb_push_write(ROW0_BG1, 128'hB1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1);
+        wb_push_read(ROW0_BG0, 128'hA1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1_A1A1);  // verify new data
+        wb_push_read(ROW0_BG1, 128'hB1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1_B1B1);
+        wb_pump_all;
 
         // -- Phase L: Byte-lane masking (DM verification) --
-        // Exercises the DDR4 data-mask (DM_n) pin by issuing partial writes
-        // via wb_sel. The controller maps wb_sel bits to DM_n to protect
-        // the unselected bytes. We verify that masked bytes retain their
-        // original value while unmasked bytes get the new data.
+        // DDR4 has a data-mask pin (DM_n) that allows per-byte write
+        // protection. When wb_sel has a bit=0, the corresponding byte
+        // is NOT written — it retains its previous value in DRAM.
+        //
+        // Test approach (each sub-test):
+        //   1. Write a known background value (all-A, all-C, all-F)
+        //   2. Issue a MASKED write with different data + partial sel
+        //   3. Read back: unmasked bytes = new data, masked bytes = old
+        //
+        // NOTE: We must pump the background write FIRST (separate
+        // wb_pump_all) so it's committed to DRAM before the masked write
+        // arrives. Otherwise the in-order pipeline would just see both
+        // writes queued together and the second overwrites the first.
+        //
         // Skipped for x4 devices which have no DM pin (JESD79-4D Table 28).
         test_phase = "PHASE_L";
         if (DEVICE_WIDTH == 4) begin
@@ -1758,29 +1805,36 @@ module ddr4_sim_top;
             localparam [WB_ADDR_BITS-1:0] PL_ADDR0 = (5 << 10) | 0;
             localparam [WB_ADDR_BITS-1:0] PL_ADDR1 = (5 << 10) | 1;
 
-            wb_write_one(PL_ADDR0, 128'hAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
-            drain_pipeline;
-            wb_write_masked(PL_ADDR0, 128'h5555_5555_5555_5555_5555_5555_5555_5555, 16'h00FF);
-            drain_pipeline;
+            // Sub-test 1: write 0x55 to lower 8 bytes, upper 8 bytes keep 0xAA
+            wb_push_write(PL_ADDR0, 128'hAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
+            wb_pump_all;  // commit background
+            wb_push_write_masked(PL_ADDR0, 128'h5555_5555_5555_5555_5555_5555_5555_5555, 16'h00FF);
+            wb_push_read(PL_ADDR0, 128'hAAAA_AAAA_AAAA_AAAA_5555_5555_5555_5555);
+            wb_pump_all;
             $display("[%0t]   Sub-test 1: sel=0x00FF (lower 8 bytes written)", $realtime);
-            wb_read_check(PL_ADDR0, 128'hAAAA_AAAA_AAAA_AAAA_5555_5555_5555_5555);
 
-            wb_write_one(PL_ADDR1, 128'hCCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC);
-            drain_pipeline;
-            wb_write_masked(PL_ADDR1, 128'h3333_3333_3333_3333_3333_3333_3333_3333, 16'hFF00);
-            drain_pipeline;
+            // Sub-test 2: write 0x33 to upper 8 bytes, lower 8 bytes keep 0xCC
+            wb_push_write(PL_ADDR1, 128'hCCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC);
+            wb_pump_all;  // commit background
+            wb_push_write_masked(PL_ADDR1, 128'h3333_3333_3333_3333_3333_3333_3333_3333, 16'hFF00);
+            wb_push_read(PL_ADDR1, 128'h3333_3333_3333_3333_CCCC_CCCC_CCCC_CCCC);
+            wb_pump_all;
             $display("[%0t]   Sub-test 2: sel=0xFF00 (upper 8 bytes written)", $realtime);
-            wb_read_check(PL_ADDR1, 128'h3333_3333_3333_3333_CCCC_CCCC_CCCC_CCCC);
 
-            wb_write_one(PL_ADDR0, {128{1'b1}});
-            drain_pipeline;
-            wb_write_masked(PL_ADDR0, {128{1'b0}}, 16'h0001);
-            drain_pipeline;
+            // Sub-test 3: write 0x00 to ONLY byte[0], all other 15 bytes keep 0xFF
+            wb_push_write(PL_ADDR0, {128{1'b1}});
+            wb_pump_all;  // commit background
+            wb_push_write_masked(PL_ADDR0, {128{1'b0}}, 16'h0001);
+            wb_push_read(PL_ADDR0, 128'hFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FF00);
+            wb_pump_all;
             $display("[%0t]   Sub-test 3: sel=0x0001 (only byte 0 written)", $realtime);
-            wb_read_check(PL_ADDR0, 128'hFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FF00);
         end
 
         // -- Phase M: tFAW stress (5 rapid activates) --
+        // DDR4 limits the number of row-activates in a time window:
+        // tFAW = "Four Activate Window" — max 4 ACTs in any tFAW period.
+        // We force 5 ACTs back-to-back (all banks cold after refresh)
+        // to verify the controller correctly delays the 5th ACT.
         test_phase = "PHASE_M";
         $display("[%0t] === Phase M: tFAW stress (5 rapid ACTs) ===", $realtime);
         begin : phase_m_blk
@@ -1788,115 +1842,117 @@ module ddr4_sim_top;
             wb_idle;
             ref_start_m = ref_count;
             $display("[%0t]   Waiting for refresh to close all banks...", $realtime);
-            wait (ref_count > ref_start_m);
+            wait (ref_count > ref_start_m);  // ensure all banks are closed
             @(posedge controller_clk);
             while (wb_stall) @(posedge controller_clk);
             $display("[%0t]   5 writes to 5 cold banks:", $realtime);
-            wb_write_one(ROW0_BG0,     128'hFA01);
-            wb_write_one(ROW0_BG1,     128'hFA02);
-            wb_write_one(ROW0_BG2,     128'hFA03);
-            wb_write_one(ROW0_BG3,     128'hFA04);
-            wb_write_one(ROW0_BG0_BA1, 128'hFA05);
-            drain_pipeline;
-            $display("[%0t]   Readback Phase M:", $realtime);
-            wb_read_check(ROW0_BG0,     128'hFA01);
-            wb_read_check(ROW0_BG1,     128'hFA02);
-            wb_read_check(ROW0_BG2,     128'hFA03);
-            wb_read_check(ROW0_BG3,     128'hFA04);
-            wb_read_check(ROW0_BG0_BA1, 128'hFA05);
+            wb_push_write(ROW0_BG0,     128'hFA01);  // ACT #1
+            wb_push_write(ROW0_BG1,     128'hFA02);  // ACT #2
+            wb_push_write(ROW0_BG2,     128'hFA03);  // ACT #3
+            wb_push_write(ROW0_BG3,     128'hFA04);  // ACT #4
+            wb_push_write(ROW0_BG0_BA1, 128'hFA05);  // ACT #5 (must wait for tFAW)
+            wb_push_read(ROW0_BG0,     128'hFA01);
+            wb_push_read(ROW0_BG1,     128'hFA02);
+            wb_push_read(ROW0_BG2,     128'hFA03);
+            wb_push_read(ROW0_BG3,     128'hFA04);
+            wb_push_read(ROW0_BG0_BA1, 128'hFA05);
+            wb_pump_all;
         end
 
-        // -- Phase N: Pipeline saturation (32 back-to-back writes) --
+        // -- Phase N: Maximum pipeline depth (TB_DEPTH=32 transactions) --
+        // Queues 32 writes + 32 reads = 64 total transactions in one burst.
+        // This saturates the controller's internal pipeline and exercises
+        // its ability to sustain back-to-back traffic at full rate.
+        // Also used for throughput measurement (cycles / transaction).
         test_phase = "PHASE_N";
         $display("[%0t] === Phase N: Pipeline saturation (%0d writes) ===", $realtime, TB_DEPTH);
         begin : phase_n_blk
             integer pn_idx;
-            integer pn_err;
-            reg [WB_DATA_BITS-1:0] pn_exp;
-            reg [WB_DATA_BITS-1:0] pn_captured;
-            pn_err = 0;
+            integer pn_err_start;
+            pn_err_start = rd_err_count;
             phase_n_start = cycle_count;
             phase_n_wr_start = wr_count;
 
-            wb_cyc = 1'b1;
-            wb_stb = 1'b1;
-            wb_we  = 1'b1;
-            wb_sel = {WB_SEL_BITS{1'b1}};
-            wb_addr = 27'h2000;
-            wb_data = gen_pattern_tb(8'd0);
-
             for (pn_idx = 0; pn_idx < TB_DEPTH; pn_idx = pn_idx + 1) begin
-                @(posedge controller_clk);
-                while (wb_stall) @(posedge controller_clk);
-                if (pn_idx < TB_DEPTH - 1) begin
-                    wb_addr = 27'h2000 + pn_idx + 1;
-                    wb_data = gen_pattern_tb(pn_idx[7:0] + 8'd1);
-                end else begin
-                    wb_stb = 1'b0;
-                end
+                wb_push_write(27'h2000 + pn_idx, gen_pattern_tb(pn_idx[7:0]));
             end
-            wb_we = 1'b0;
-
-            drain_pipeline;
-
             for (pn_idx = 0; pn_idx < TB_DEPTH; pn_idx = pn_idx + 1) begin
-                wb_read_one(27'h2000 + pn_idx);
-                wb_stb = 1'b0;
-                while (!wb_ack) @(posedge controller_clk);
-                pn_captured = wb_rdata;
-                wb_idle;
-                repeat (5) @(posedge controller_clk);
-                pn_exp = gen_pattern_tb(pn_idx[7:0]);
-                if (pn_captured !== pn_exp) begin
-                    $display("[%0t]   PHASE_N FAIL: addr=%0d exp=%0h got=%0h",
-                        $realtime, pn_idx, pn_exp, pn_captured);
-                    pn_err = pn_err + 1;
-                end
+                wb_push_read(27'h2000 + pn_idx, gen_pattern_tb(pn_idx[7:0]));
             end
-            wb_idle;
+            wb_pump_all;
 
             phase_n_end = cycle_count;
-            if (pn_err == 0)
+            if (rd_err_count == pn_err_start)
                 $display("[%0t] PASS: Phase N  -  all %0d pipelined write->read checks passed", $realtime, TB_DEPTH);
             else begin
-                $display("[%0t] FAIL: Phase N  -  %0d of %0d checks failed", $realtime, pn_err, TB_DEPTH);
-                rd_err_count = rd_err_count + pn_err;
+                $display("[%0t] FAIL: Phase N  -  %0d of %0d checks failed", $realtime, rd_err_count - pn_err_start, TB_DEPTH);
             end
         end
 
-        // -- Phase O: Refresh-during-traffic (data integrity across refresh) --
-        // Fires continuous WB writes while waiting for at least 2 tREFI
-        // refresh events to happen. Verifies that the controller correctly
-        // pauses traffic for REF, re-opens the right rows, and data
-        // written before/during refresh reads back correctly after.
+        // -- Phase O: Sustained traffic through periodic refresh --
+        // Unlike other phases that use wb_pump_all (fixed queue), this
+        // phase uses a CUSTOM INLINE DRIVER that keeps writing forever
+        // until 2 refresh events happen. This tests that:
+        //   a) The controller correctly pauses user traffic for REF
+        //   b) Data written before/after/during refresh reads back OK
+        //   c) The master never sees corruption from refresh interleaving
+        //
+        // The inline driver is hand-coded (not using wb_pump_all) because
+        // we don't know in advance how many writes will be needed — it
+        // depends on when the refresh timer fires.
+        //
+        // After the write storm completes, we do 8 verification reads
+        // using the standard wb_pump_all path.
         test_phase = "PHASE_O";
         $display("[%0t] === Phase O: Refresh-during-traffic ===", $realtime);
         begin : phase_o_blk
-            integer ref_start_o;
-            integer po_iter;
-            integer po_i;
-            reg [WB_ADDR_BITS-1:0] po_addr;
-
+            integer ref_start_o, po_iter, po_outstanding, po_i;
             ref_start_o = ref_count;
             po_iter = 0;
+            po_outstanding = 0;  // tracks how many ACKs we're still waiting for
             phase_o_start = cycle_count;
             phase_o_wr_start = wr_count;
             $display("[%0t]   Issuing continuous traffic, waiting for 2 refreshes...", $realtime);
 
-            while (ref_count < ref_start_o + 2) begin
-                for (po_i = 0; po_i < 8; po_i = po_i + 1) begin
-                    po_addr = (6 << 10) | ((po_i >> 2) << 8) | (po_i & 3);
-                    wb_write_one(po_addr, gen_pattern_tb(po_i[7:0]));
-                end
-                po_iter = po_iter + 1;
-            end
-            drain_pipeline;
+            // Start the inline pipelined driver (same logic as wb_pump_all
+            // but we generate addresses on-the-fly instead of pre-queuing).
+            wb_cyc = 1'b1;
+            wb_stb = 1'b1;
+            wb_we  = 1'b1;
+            wb_sel = {WB_SEL_BITS{1'b1}};
+            wb_addr = (6 << 10) | 0;        // first address
+            wb_data = gen_pattern_tb(8'd0);  // first data
 
+            // Keep pumping writes every cycle (when !stall) until 2 REFs seen.
+            // We write to 8 rotating addresses (po_iter % 8). The last value
+            // written to each address is what we'll verify at the end.
+            while (ref_count < ref_start_o + 2) begin
+                @(posedge controller_clk);
+                if (wb_ack) po_outstanding = po_outstanding - 1;
+                if (!wb_stall) begin
+                    po_outstanding = po_outstanding + 1;
+                    po_iter = po_iter + 1;
+                    // Rotate through 8 addresses across 2 bank groups
+                    wb_addr = (6 << 10) | (((po_iter % 8) >> 2) << 8) | ((po_iter % 8) & 3);
+                    wb_data = gen_pattern_tb(po_iter[7:0] % 8);
+                end
+            end
+            // Done sending — deassert STB, wait for remaining ACKs
+            wb_stb = 1'b0;
+            while (po_outstanding > 0) begin
+                @(posedge controller_clk);
+                if (wb_ack) po_outstanding = po_outstanding - 1;
+            end
+            wb_cyc = 1'b0;
+            wb_we  = 1'b0;
+
+            // Now verify: read back the 8 addresses and check against
+            // the last pattern written to each (gen_pattern_tb(i)).
             $display("[%0t]   Traffic complete after %0d iterations, verifying...", $realtime, po_iter);
             for (po_i = 0; po_i < 8; po_i = po_i + 1) begin
-                po_addr = (6 << 10) | ((po_i >> 2) << 8) | (po_i & 3);
-                wb_read_check(po_addr, gen_pattern_tb(po_i[7:0]));
+                wb_push_read((6 << 10) | ((po_i >> 2) << 8) | (po_i & 3), gen_pattern_tb(po_i[7:0]));
             end
+            wb_pump_all;
             phase_o_end = cycle_count;
             phase_o_wr_count = wr_count - phase_o_wr_start;
             $display("[%0t]   Refreshes during traffic: %0d",
@@ -1904,17 +1960,32 @@ module ddr4_sim_top;
         end
 
         // -- Phase P: Address boundary corners --
+        // Writes to extreme address values to catch bit-routing bugs:
+        //   - Max column upper bits + max BG
+        //   - Max 10-bit address (all col+BG bits set)
+        //   - Combination of row=3 / BA=3 / max col / BG=3
         test_phase = "PHASE_P";
         $display("[%0t] === Phase P: Address boundary corners ===", $realtime);
-        wb_write_read_check((63 << 2) | 3, 128'hBEEF_0001_BEEF_0001_BEEF_0001_BEEF_0001);
-        $display("[%0t]   max col_upper + BG3", $realtime);
-        wb_write_read_check(10'h3FF, 128'hBEEF_0002_BEEF_0002_BEEF_0002_BEEF_0002);
-        $display("[%0t]   addr 1023 (max 10-bit)", $realtime);
-        wb_write_read_check((3 << 10) | (3 << 8) | (63 << 2) | 3,
+        wb_push_write((63 << 2) | 3, 128'hBEEF_0001_BEEF_0001_BEEF_0001_BEEF_0001);
+        wb_push_read((63 << 2) | 3,  128'hBEEF_0001_BEEF_0001_BEEF_0001_BEEF_0001);
+        wb_push_write(10'h3FF, 128'hBEEF_0002_BEEF_0002_BEEF_0002_BEEF_0002);
+        wb_push_read(10'h3FF,  128'hBEEF_0002_BEEF_0002_BEEF_0002_BEEF_0002);
+        wb_push_write((3 << 10) | (3 << 8) | (63 << 2) | 3,
             128'hBEEF_0003_BEEF_0003_BEEF_0003_BEEF_0003);
+        wb_push_read((3 << 10) | (3 << 8) | (63 << 2) | 3,
+            128'hBEEF_0003_BEEF_0003_BEEF_0003_BEEF_0003);
+        wb_pump_all;
+        $display("[%0t]   max col_upper + BG3", $realtime);
+        $display("[%0t]   addr 1023 (max 10-bit)", $realtime);
         $display("[%0t]   row3/BA3/max_col/BG3 (addr 4095)", $realtime);
 
-        // -- Phase Q: Multi-bank-group interleaving (all 16 banks) --
+        // -- Phase Q: All 16 banks exercised in one pipelined burst --
+        // DDR4 x8 has 4 bank groups × 4 banks = 16 banks total.
+        // We write a unique pattern to each bank (encoding BG+BA in the
+        // data), then read all 16 back. All 32 transactions (16 WR + 16 RD)
+        // are queued at once and fired through a single wb_pump_all.
+        // This exercises the controller's full bank-state tracking and
+        // measures cross-BG interleaving throughput.
         test_phase = "PHASE_Q";
         $display("[%0t] === Phase Q: Multi-BG interleaving (16 banks) ===", $realtime);
         begin : phase_q_blk
@@ -1926,23 +1997,23 @@ module ddr4_sim_top;
             phase_q_start = cycle_count;
             phase_q_wr_start = wr_count;
 
+            // Queue 16 writes: one per bank (BG0-3 × BA0-3)
             for (pq_ba = 0; pq_ba < 4; pq_ba = pq_ba + 1) begin
                 for (pq_bg = 0; pq_bg < 4; pq_bg = pq_bg + 1) begin
                     pq_addr = (7 << 10) | (pq_ba << 8) | pq_bg;
                     pq_data = {112'd0, pq_bg[3:0], pq_ba[3:0], 8'hAA};
-                    wb_write_one(pq_addr, pq_data);
+                    wb_push_write(pq_addr, pq_data);
                 end
             end
-            drain_pipeline;
-
-            $display("[%0t]   Readback all 16 banks:", $realtime);
+            // Queue 16 reads: same addresses, same expected data
             for (pq_ba = 0; pq_ba < 4; pq_ba = pq_ba + 1) begin
                 for (pq_bg = 0; pq_bg < 4; pq_bg = pq_bg + 1) begin
                     pq_addr = (7 << 10) | (pq_ba << 8) | pq_bg;
                     pq_data = {112'd0, pq_bg[3:0], pq_ba[3:0], 8'hAA};
-                    wb_read_check(pq_addr, pq_data);
+                    wb_push_read(pq_addr, pq_data);
                 end
             end
+            wb_pump_all;
 
             phase_q_end = cycle_count;
             if (rd_err_count == pq_err_start)
@@ -1950,6 +2021,337 @@ module ddr4_sim_top;
             else
                 $display("[%0t] FAIL: Phase Q  -  %0d of 16 bank checks failed",
                          $realtime, rd_err_count - pq_err_start);
+        end
+
+        // =============================================================
+        // PHASES R-Z: Advanced WB protocol corner cases
+        //
+        // These phases stress behaviors that real masters generate but
+        // are NOT covered by the DDR4-timing-focused phases A-Q above.
+        // A production-quality controller must handle all of these
+        // without corruption, hangs, or protocol violations.
+        // =============================================================
+
+        // -- Phase R: Bursty master (STB gaps within CYC) --
+        // A real CPU/DMA might assert STB for a few cycles, pause (STB=0
+        // but CYC stays high), then resume. The controller must not lose
+        // state or corrupt tracking when STB goes away mid-burst.
+        //
+        // Approach: issue writes with gaps using a custom inline driver,
+        // then drain all write ACKs, then verify with wb_pump_all reads.
+        test_phase = "PHASE_R";
+        $display("[%0t] === Phase R: Bursty master (STB gaps within CYC) ===", $realtime);
+        begin : phase_r_blk
+            integer pr_err_start, pr_outstanding, pr_i;
+            pr_err_start = rd_err_count;
+            pr_outstanding = 0;
+
+            wb_cyc = 1'b1;
+
+            // Burst 1: 3 writes to addresses 0-2
+            wb_stb = 1'b1; wb_we = 1'b1; wb_sel = {WB_SEL_BITS{1'b1}};
+            for (pr_i = 0; pr_i < 3; pr_i = pr_i + 1) begin
+                wb_addr = (8 << 10) | pr_i;
+                wb_data = gen_pattern_tb(pr_i[7:0]);
+                @(posedge controller_clk);
+                while (wb_stall) @(posedge controller_clk);
+            end
+
+            // Gap: STB=0 for 5 cycles (CYC stays high — this is the key test!)
+            wb_stb = 1'b0;
+            repeat (5) @(posedge controller_clk);
+
+            // Burst 2: 3 more writes to addresses 3-5
+            wb_stb = 1'b1;
+            for (pr_i = 3; pr_i < 6; pr_i = pr_i + 1) begin
+                wb_addr = (8 << 10) | pr_i;
+                wb_data = gen_pattern_tb(pr_i[7:0]);
+                @(posedge controller_clk);
+                while (wb_stall) @(posedge controller_clk);
+            end
+
+            // Gap: STB=0 for 8 cycles
+            wb_stb = 1'b0;
+            repeat (8) @(posedge controller_clk);
+
+            // Burst 3: 2 more writes to addresses 6-7
+            wb_stb = 1'b1;
+            for (pr_i = 6; pr_i < 8; pr_i = pr_i + 1) begin
+                wb_addr = (8 << 10) | pr_i;
+                wb_data = gen_pattern_tb(pr_i[7:0]);
+                @(posedge controller_clk);
+                while (wb_stall) @(posedge controller_clk);
+            end
+            wb_stb = 1'b0;
+
+            // Wait for all 8 write ACKs to flush through the pipeline.
+            // 40 cycles is generous (ack_pipe depth is ~20 max).
+            repeat (40) @(posedge controller_clk);
+            wb_cyc = 1'b0; wb_we = 1'b0;
+
+            // Now verify all 8 writes using the proven wb_pump_all path
+            for (pr_i = 0; pr_i < 8; pr_i = pr_i + 1) begin
+                wb_push_read((8 << 10) | pr_i, gen_pattern_tb(pr_i[7:0]));
+            end
+            wb_pump_all;
+
+            if (rd_err_count == pr_err_start)
+                $display("[%0t] PASS: Phase R  -  bursty master (3+gap+3+gap+2 writes verified)", $realtime);
+            else
+                $display("[%0t] FAIL: Phase R  -  %0d errors", $realtime, rd_err_count - pr_err_start);
+        end
+
+        // -- Phase S: Sustained alternating W-R-W-R (64 pairs) --
+        // Mimics a DMA engine doing read-modify-write. Each cycle
+        // (when not stalled) alternates between write and read to the
+        // SAME address — the read must always return what was just written.
+        // This stresses tWTR/tRTW turnaround at maximum rate.
+        test_phase = "PHASE_S";
+        $display("[%0t] === Phase S: Sustained alternating W-R (64 pairs) ===", $realtime);
+        begin : phase_s_blk
+            integer ps_err_start, ps_i;
+            ps_err_start = rd_err_count;
+
+            for (ps_i = 0; ps_i < 64; ps_i = ps_i + 1) begin
+                wb_push_write((9 << 10) | (ps_i & 3), gen_pattern_tb(ps_i[7:0]));
+                wb_push_read((9 << 10) | (ps_i & 3), gen_pattern_tb(ps_i[7:0]));
+            end
+            wb_pump_all;
+
+            if (rd_err_count == ps_err_start)
+                $display("[%0t] PASS: Phase S  -  all 64 W-R pairs verified", $realtime);
+            else
+                $display("[%0t] FAIL: Phase S  -  %0d errors", $realtime, rd_err_count - ps_err_start);
+        end
+
+        // -- Phase T: Sequential burst crossing row boundary --
+        // Writes to consecutive addresses that span from the end of one
+        // row into the start of the next row. The controller must detect
+        // the row change and issue PRE+ACT automatically. A single
+        // pipelined burst of 16 writes + 16 reads with no manual gaps.
+        test_phase = "PHASE_T";
+        $display("[%0t] === Phase T: Row-crossing sequential burst ===", $realtime);
+        begin : phase_t_blk
+            integer pt_err_start, pt_i;
+            reg [WB_ADDR_BITS-1:0] pt_base;
+            pt_err_start = rd_err_count;
+            // Start 8 addresses before row boundary (row 4→5 transition)
+            // ROW_SHIFT puts the row field at the top. Address just below row5:
+            pt_base = (4 << ROW_SHIFT) | ((1 << (COL_BITS - COL_LOW)) - 8) << COL_SHIFT;
+
+            for (pt_i = 0; pt_i < 16; pt_i = pt_i + 1) begin
+                wb_push_write(pt_base + (pt_i << COL_SHIFT), gen_pattern_tb(pt_i[7:0] + 8'hC0));
+            end
+            for (pt_i = 0; pt_i < 16; pt_i = pt_i + 1) begin
+                wb_push_read(pt_base + (pt_i << COL_SHIFT), gen_pattern_tb(pt_i[7:0] + 8'hC0));
+            end
+            wb_pump_all;
+
+            if (rd_err_count == pt_err_start)
+                $display("[%0t] PASS: Phase T  -  row-crossing burst verified", $realtime);
+            else
+                $display("[%0t] FAIL: Phase T  -  %0d errors", $realtime, rd_err_count - pt_err_start);
+        end
+
+        // -- Phase U: LFSR random address stress (128 transactions) --
+        // Generates pseudo-random addresses using an LFSR, producing
+        // unpredictable bank/row access patterns. This catches bugs that
+        // only appear under non-deterministic traffic (e.g., bank-state
+        // machine transitions that never occur with structured patterns).
+        test_phase = "PHASE_U";
+        $display("[%0t] === Phase U: LFSR random address stress (128 txns) ===", $realtime);
+        begin : phase_u_blk
+            integer pu_err_start, pu_i;
+            reg [15:0] lfsr;
+            reg [WB_ADDR_BITS-1:0] pu_addr;
+            pu_err_start = rd_err_count;
+            lfsr = 16'hACE1;  // non-zero seed
+
+            // Write 128 random addresses
+            for (pu_i = 0; pu_i < 128; pu_i = pu_i + 1) begin
+                // LFSR: x^16 + x^14 + x^13 + x^11 + 1 (maximal length)
+                lfsr = {lfsr[14:0], lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10]};
+                pu_addr = {{(WB_ADDR_BITS-16){1'b0}}, lfsr};
+                wb_push_write(pu_addr, {8{lfsr, ~lfsr}});
+            end
+            wb_pump_all;
+
+            // Re-seed and read back same sequence
+            lfsr = 16'hACE1;
+            for (pu_i = 0; pu_i < 128; pu_i = pu_i + 1) begin
+                lfsr = {lfsr[14:0], lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10]};
+                pu_addr = {{(WB_ADDR_BITS-16){1'b0}}, lfsr};
+                wb_push_read(pu_addr, {8{lfsr, ~lfsr}});
+            end
+            wb_pump_all;
+
+            if (rd_err_count == pu_err_start)
+                $display("[%0t] PASS: Phase U  -  all 128 random addresses verified", $realtime);
+            else
+                $display("[%0t] FAIL: Phase U  -  %0d errors", $realtime, rd_err_count - pu_err_start);
+        end
+
+        // -- Phase V: Same-address overwrite stress --
+        // Writes the same address 16 times with different data, then reads
+        // once. Only the LAST write should be visible. Tests that the
+        // controller properly handles repeated bank-hits to the same column
+        // without data corruption from the pipeline.
+        test_phase = "PHASE_V";
+        $display("[%0t] === Phase V: Same-address overwrite (16 writes, 1 read) ===", $realtime);
+        begin : phase_v_blk
+            integer pv_err_start, pv_i;
+            reg [WB_ADDR_BITS-1:0] pv_addr;
+            pv_err_start = rd_err_count;
+            pv_addr = (10 << 10) | 2;  // arbitrary address
+
+            for (pv_i = 0; pv_i < 16; pv_i = pv_i + 1) begin
+                wb_push_write(pv_addr, gen_pattern_tb(pv_i[7:0] + 8'hD0));
+            end
+            // Only the last write's data should survive
+            wb_push_read(pv_addr, gen_pattern_tb(8'hDF));  // 0xD0 + 15 = 0xDF
+            wb_pump_all;
+
+            if (rd_err_count == pv_err_start)
+                $display("[%0t] PASS: Phase V  -  last write wins", $realtime);
+            else
+                $display("[%0t] FAIL: Phase V  -  %0d errors", $realtime, rd_err_count - pv_err_start);
+        end
+
+        // -- Phase W: Single-beat transactions --
+        // Real masters sometimes do isolated single-beat accesses (one
+        // write or one read, then CYC drops). Tests that the controller
+        // handles the minimum-size burst correctly. Each wb_pump_all
+        // below is a single-transaction burst.
+        test_phase = "PHASE_W";
+        $display("[%0t] === Phase W: Single-beat transactions ===", $realtime);
+        begin : phase_w_blk
+            integer pw_err_start;
+            pw_err_start = rd_err_count;
+
+            // Single write
+            wb_push_write((11 << 10) | 0, 128'hCAFE_0001_CAFE_0001_CAFE_0001_CAFE_0001);
+            wb_pump_all;
+
+            // Single read (verify)
+            wb_push_read((11 << 10) | 0, 128'hCAFE_0001_CAFE_0001_CAFE_0001_CAFE_0001);
+            wb_pump_all;
+
+            // Single write to different address
+            wb_push_write((11 << 10) | 1, 128'hBEEF_0002_BEEF_0002_BEEF_0002_BEEF_0002);
+            wb_pump_all;
+
+            // Single read to different address
+            wb_push_read((11 << 10) | 1, 128'hBEEF_0002_BEEF_0002_BEEF_0002_BEEF_0002);
+            wb_pump_all;
+
+            // Verify first address still intact
+            wb_push_read((11 << 10) | 0, 128'hCAFE_0001_CAFE_0001_CAFE_0001_CAFE_0001);
+            wb_pump_all;
+
+            if (rd_err_count == pw_err_start)
+                $display("[%0t] PASS: Phase W  -  single-beat transactions OK", $realtime);
+            else
+                $display("[%0t] FAIL: Phase W  -  %0d errors", $realtime, rd_err_count - pw_err_start);
+        end
+
+        // -- Phase X: Back-to-back CYC cycles (no idle between bursts) --
+        // After wb_pump_all drops CYC, immediately start the next burst.
+        // Tests that the slave correctly resets between bus cycles without
+        // needing idle time. 4 rapid burst pairs (write burst → read burst).
+        test_phase = "PHASE_X";
+        $display("[%0t] === Phase X: Back-to-back CYC cycles ===", $realtime);
+        begin : phase_x_blk
+            integer px_err_start, px_i;
+            px_err_start = rd_err_count;
+
+            for (px_i = 0; px_i < 4; px_i = px_i + 1) begin
+                // Write burst (4 addrs)
+                wb_push_write((12 << 10) | (px_i * 4) + 0, gen_pattern_tb(px_i[7:0]*4));
+                wb_push_write((12 << 10) | (px_i * 4) + 1, gen_pattern_tb(px_i[7:0]*4+1));
+                wb_push_write((12 << 10) | (px_i * 4) + 2, gen_pattern_tb(px_i[7:0]*4+2));
+                wb_push_write((12 << 10) | (px_i * 4) + 3, gen_pattern_tb(px_i[7:0]*4+3));
+                wb_pump_all;  // CYC drops here
+                // Immediately start read burst (no idle cycles inserted)
+                wb_push_read((12 << 10) | (px_i * 4) + 0, gen_pattern_tb(px_i[7:0]*4));
+                wb_push_read((12 << 10) | (px_i * 4) + 1, gen_pattern_tb(px_i[7:0]*4+1));
+                wb_push_read((12 << 10) | (px_i * 4) + 2, gen_pattern_tb(px_i[7:0]*4+2));
+                wb_push_read((12 << 10) | (px_i * 4) + 3, gen_pattern_tb(px_i[7:0]*4+3));
+                wb_pump_all;  // CYC drops, next iteration immediately re-asserts
+            end
+
+            if (rd_err_count == px_err_start)
+                $display("[%0t] PASS: Phase X  -  back-to-back CYC cycles OK", $realtime);
+            else
+                $display("[%0t] FAIL: Phase X  -  %0d errors", $realtime, rd_err_count - px_err_start);
+        end
+
+        // -- Phase Y: Maximum outstanding under heavy stall --
+        // Write to the SAME bank/row 32 times in rapid succession.
+        // Since all target the same bank, the controller can issue one
+        // ACT then stream 32 WRs without PRE — but internal pipeline
+        // depth is limited. This pushes the controller's ack_pipe to
+        // its maximum occupancy and verifies no data is dropped.
+        test_phase = "PHASE_Y";
+        $display("[%0t] === Phase Y: Same-bank pipeline saturation (32 hits) ===", $realtime);
+        begin : phase_y_blk
+            integer py_err_start, py_i;
+            py_err_start = rd_err_count;
+
+            // 32 writes to same bank (BG0/BA0), same row, different columns
+            for (py_i = 0; py_i < 32; py_i = py_i + 1) begin
+                wb_push_write((13 << ROW_SHIFT) | (py_i << COL_SHIFT), gen_pattern_tb(py_i[7:0] + 8'hE0));
+            end
+            // 32 reads to verify
+            for (py_i = 0; py_i < 32; py_i = py_i + 1) begin
+                wb_push_read((13 << ROW_SHIFT) | (py_i << COL_SHIFT), gen_pattern_tb(py_i[7:0] + 8'hE0));
+            end
+            wb_pump_all;
+
+            if (rd_err_count == py_err_start)
+                $display("[%0t] PASS: Phase Y  -  same-bank 32 hits OK", $realtime);
+            else
+                $display("[%0t] FAIL: Phase Y  -  %0d errors", $realtime, rd_err_count - py_err_start);
+        end
+
+        // -- Phase Z: Read-after-Read repetition + Write-Read-Write-Read same addr --
+        // Tests: (a) multiple reads to same address return same data,
+        //        (b) write-read-write-read to same address always returns
+        //        the most recent write's value.
+        test_phase = "PHASE_Z";
+        $display("[%0t] === Phase Z: Read-repeat + W-R-W-R same address ===", $realtime);
+        begin : phase_z_blk
+            integer pz_err_start;
+            pz_err_start = rd_err_count;
+
+            // Part 1: Write once, read 8 times (all must match)
+            wb_push_write((14 << 10) | 0, 128'h1111_2222_3333_4444_5555_6666_7777_8888);
+            wb_push_read((14 << 10) | 0, 128'h1111_2222_3333_4444_5555_6666_7777_8888);
+            wb_push_read((14 << 10) | 0, 128'h1111_2222_3333_4444_5555_6666_7777_8888);
+            wb_push_read((14 << 10) | 0, 128'h1111_2222_3333_4444_5555_6666_7777_8888);
+            wb_push_read((14 << 10) | 0, 128'h1111_2222_3333_4444_5555_6666_7777_8888);
+            wb_push_read((14 << 10) | 0, 128'h1111_2222_3333_4444_5555_6666_7777_8888);
+            wb_push_read((14 << 10) | 0, 128'h1111_2222_3333_4444_5555_6666_7777_8888);
+            wb_push_read((14 << 10) | 0, 128'h1111_2222_3333_4444_5555_6666_7777_8888);
+            wb_push_read((14 << 10) | 0, 128'h1111_2222_3333_4444_5555_6666_7777_8888);
+            wb_pump_all;
+
+            // Part 2: W-R-W-R-W-R to same address (each read sees latest write)
+            wb_push_write((14 << 10) | 1, 128'hAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
+            wb_push_read((14 << 10) | 1, 128'hAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
+            wb_push_write((14 << 10) | 1, 128'hBBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB);
+            wb_push_read((14 << 10) | 1, 128'hBBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB);
+            wb_push_write((14 << 10) | 1, 128'hCCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC);
+            wb_push_read((14 << 10) | 1, 128'hCCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC);
+            wb_pump_all;
+
+            // Part 3: Verify first address wasn't corrupted by part 2
+            wb_push_read((14 << 10) | 0, 128'h1111_2222_3333_4444_5555_6666_7777_8888);
+            wb_pump_all;
+
+            if (rd_err_count == pz_err_start)
+                $display("[%0t] PASS: Phase Z  -  read-repeat + W-R-W-R OK", $realtime);
+            else
+                $display("[%0t] FAIL: Phase Z  -  %0d errors", $realtime, rd_err_count - pz_err_start);
         end
 
         // -- CSR Read Test: read debug registers 0x0-0xC + value verification --
@@ -2007,7 +2409,7 @@ module ddr4_sim_top;
         $display("[%0t] === BIST Re-trigger Test (via CSR 0xC) ===", $realtime);
         wb_dbg_write(4'hC, 32'd1);
         wb_dbg_idle;
-        drain_pipeline;
+        repeat (40) @(posedge controller_clk);
         begin : retrig_block
             integer retrig_timeout;
             reg [31:0] csr5_val;

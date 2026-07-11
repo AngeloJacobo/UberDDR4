@@ -113,7 +113,7 @@ end
 // The +1's account for the 1-cycle pipeline register between each scheduler phase.
 localparam F_MAX_STALL = MAX_PRECHARGE_DELAY + 1
                             + max_fn(max_fn(PRECHARGE_TO_ACTIVATE_DELAY, MAX_RRD_DELAY), TFAW_CYCLES) + 1
-                            + max_fn(max_fn(ACTIVATE_TO_WRITE_DELAY, ACTIVATE_TO_READ_DELAY), max_fn(CAS_TO_CAS_DELAY_SAME_BG, WRITE_TO_READ_DELAY_SAME_BG)) + 1;
+                            + max_fn(max_fn(MAX_WRITE_DELAY, ACTIVATE_TO_READ_DELAY), max_fn(CAS_TO_CAS_DELAY_SAME_BG, WRITE_TO_READ_DELAY_SAME_BG)) + 1;
 localparam F_MAX_ACK_DELAY = 0;
 localparam F_DLYBITS = $clog2(F_MAX_STALL + 1);
 wire [F_DLYBITS-1:0] f_stall_count_w;

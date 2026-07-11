@@ -138,7 +138,7 @@ module ddr4_phy #(
     output wire [3:0]                       o_phy_state,
     output wire [9*BYTE_LANES-1:0]          o_phy_idelay_center,
     output wire [9*BYTE_LANES-1:0]          o_phy_wl_tap,
-    output wire [3*BYTE_LANES-1:0]          o_phy_bitslip,
+    output wire [4*BYTE_LANES-1:0]          o_phy_bitslip,
     output wire [BYTE_LANES-1:0]            o_phy_train_fail_gate,
     output wire [BYTE_LANES-1:0]            o_phy_train_fail_eye,
     output wire [BYTE_LANES-1:0]            o_phy_train_fail_wl
@@ -291,8 +291,29 @@ module ddr4_phy #(
         .T(1'b0)
     );
 
+    localparam integer CK_ODELAY_PS = DDR4_CLK_PERIOD / 4;
+
+    wire ck_delayed;
+    (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
+    ODELAYE3 #(
+        .CASCADE("NONE"), .DELAY_FORMAT("TIME"),
+        .DELAY_TYPE("VAR_LOAD"), .DELAY_VALUE(CK_ODELAY_PS),
+        .IS_CLK_INVERTED(1'b0), .IS_RST_INVERTED(1'b0),
+        .REFCLK_FREQUENCY(300.0), .SIM_DEVICE("ULTRASCALE_PLUS"),
+        .UPDATE_MODE("ASYNC")
+    ) odelay_ck (
+        .ODATAIN(ck_oserdes_out), .DATAOUT(ck_delayed),
+        .CLK(i_controller_clk), .RST(sync_rst),
+        .CE(1'b0), .INC(1'b0),
+        .LOAD(1'b0),
+        .CNTVALUEIN(9'b0),
+        .CNTVALUEOUT(),
+        .EN_VTC(en_vtc_q),
+        .CASC_IN(1'b0), .CASC_RETURN(1'b0), .CASC_OUT()
+    );
+
     OBUFDS ck_buf (
-        .I(ck_oserdes_out),
+        .I(ck_delayed),
         .O(o_ddr4_ck_p),
         .OB(o_ddr4_ck_n)
     );
@@ -771,7 +792,7 @@ module ddr4_phy #(
     // Before training, bitslip_count=0 (no correction applied).
     // -----------------------------------------------------------------
     reg [7:0]  prev_iserdes_q [TOTAL_DQ-1:0];
-    reg [2:0]  bitslip_count_q [BYTE_LANES-1:0];
+    reg [3:0]  bitslip_count_q [BYTE_LANES-1:0];
     wire [7:0] aligned_dq [TOTAL_DQ-1:0];
 
 
@@ -1034,7 +1055,7 @@ module ddr4_phy #(
                                 `ifndef YOSYS // Display bitslip result for this lane at the end of gate training for the lane 
                                     $display("[%0t] PHY gate: lane %0d bitslip=%0d match (tap=%0d)", $realtime, train_lane, bitslip_count_q[train_lane], {3'b0, coarse_tap_idx, 4'b0});
                                 `endif
-                            end else if (bitslip_shift_count == 4'd8) begin // Tried all 8 bitslip positions with no match at this tap so move to next coarse tap
+                            end else if (bitslip_shift_count == 4'd8) begin // Tried all 9 bitslip positions (0-8) with no match at this tap so move to next coarse tap
                                 if (coarse_tap_idx == 2'd3) begin // Tried all 4 coarse taps with no match -- gate training failed for this lane
                                     coarse_tap_idx <= 2'd0;
                                     idelay_cntvalue <= 9'd0;
@@ -1350,7 +1371,7 @@ module ddr4_phy #(
             assign o_phy_idelay_center[dbg_lane*9 +: 9] =
                 (first_pass_tap[dbg_lane] + last_pass_tap[dbg_lane]) >> 1;
             assign o_phy_wl_tap[dbg_lane*9 +: 9] = wl_tap[dbg_lane];
-            assign o_phy_bitslip[dbg_lane*3 +: 3] = bitslip_count_q[dbg_lane];
+            assign o_phy_bitslip[dbg_lane*4 +: 4] = bitslip_count_q[dbg_lane];
         end
     endgenerate
 

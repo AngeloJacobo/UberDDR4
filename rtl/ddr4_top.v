@@ -175,7 +175,7 @@ module ddr4_top #(
     wire [3:0]              phy_train_state;
     wire [9*BYTE_LANES-1:0] phy_idelay_center;
     wire [9*BYTE_LANES-1:0] phy_wl_tap;
-    wire [3*BYTE_LANES-1:0] phy_bitslip;
+    wire [4*BYTE_LANES-1:0] phy_bitslip;
     wire [BYTE_LANES-1:0]   phy_train_fail_gate;
     wire [BYTE_LANES-1:0]   phy_train_fail_eye;
     wire [BYTE_LANES-1:0]   phy_train_fail_wl;
@@ -202,7 +202,8 @@ module ddr4_top #(
     // passes through directly.
     wire bist_active = prober_bist_busy;
 
-    // external reset + CSR-triggered  soft reset + BIST-failure-triggered soft-reset (if enabled in AUTO_RESET_EN)
+    // Reset to controller + PHY:
+    // external reset + CSR-triggered soft reset + BIST-failure-triggered soft-reset (if enabled in AUTO_RESET_EN)
     wire internal_rst_n = i_rst_n && !prober_soft_reset_req && !prober_bist_failed_reset_req;
 
     wire                     ctrl_wb_cyc;
@@ -215,6 +216,7 @@ module ddr4_top #(
     wire                     ctrl_wb_ack;
     wire [WB_DATA_BITS-1:0]  ctrl_wb_rdata;
 
+    // Route prober or user WB signals to controller depending on BIST activity
     assign ctrl_wb_cyc  = bist_active ? prober_wb_cyc  : i_wb_cyc;
     assign ctrl_wb_stb  = bist_active ? prober_wb_stb  : i_wb_stb;
     assign ctrl_wb_we   = bist_active ? prober_wb_we   : i_wb_we;

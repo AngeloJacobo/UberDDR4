@@ -755,8 +755,9 @@ module ddr4_controller #(
     //
     //    STB+WE ──────► stage1_pending ───► stage2_pending ───► sched_write
     //                                                               │
-    //                                                               ├─► ack_pipe_q[write_ack_idx_q] (variable pos)
-    //                                                               │        │  shift right ──► ack_pipe_q[0] ──► o_wb_ack
+    //                               ack_pipe_q[write_ack_idx_q]◄────┤ 
+    //                                      │                        │
+    //     o_wb_ack ◄───── ack_pipe_q[0] ◄──┤ (shift right)          │   
     //                                                               │
     //                                                               └─► wrdata_en_pipe_q ──► o_dfi_wrdata_en
     //                                                                 (+WRITE_DATA_DELAY)
@@ -765,14 +766,15 @@ module ddr4_controller #(
     //
     //    STB+!WE ─────► stage1_pending ───► stage2_pending ───► sched_read
     //                                                               │
-    //                                                               ├─► ack_pipe_q[ACK_PIPE_WIDTH-1] (far end)
-    //                                                               │        │  shift right ──► ack_pipe_q[0] ──► o_wb_ack
+    //                              ack_pipe_q[ACK_PIPE_WIDTH-1]◄────┤ 
+    //                                      │                        │
+    //     o_wb_ack ◄───── ack_pipe_q[0] ◄──┤ (shift right)          │   
     //                                                               │
     //                                                               └──► rddata_en_pipe_q ──► o_dfi_rddata_en
     //                                                                (+RDDATA_EN_PIPE_WIDTH)
     //
     // ACK ordering: both reads and writes share ack_pipe_q. Reads always
-    // enter at the far end (full latency). Writes enter at write_ack_idx_q
+    // enter at the far end (ACK_PIPE_WIDTH-1). Writes enter at write_ack_idx_q
     // which is closer to [0] (fast) when no read is ahead, or reset to the
     // far end after a read (ensuring the read exits first).
     // =============================================================================================================
@@ -1631,32 +1633,65 @@ module ddr4_controller #(
             end
 
             // WB ACK ordering pipe — shared shift register.
-            // Gated by pipe_stall: when a read is at [0] but data hasn't
-            // arrived from the PHY yet, the entire pipe freezes until
-            // i_dfi_rddata_valid fires and o_wb_data is latched.
+            //
+            // Both writes and reads share a single ACK_PIPE_WIDTH-bit shift
+            // register (ack_pipe_q). A '1' at position [0] means "ACK this
+            // cycle". The companion ack_is_read_q identifies the type
+            // (1=read, 0=write) so the WB master knows whether o_wb_data is
+            // meaningful.
+            //
+            // Writes enter CLOSE to [0] (at write_ack_idx_q, typically 1-2),
+            // giving them fast ACK turnaround. Reads enter at the FAR end
+            // [ACK_PIPE_WIDTH-1] because they must wait tphy_rdlat cycles
+            // for PHY data to return before ACK can fire.
+            //
+            // The pipe shifts right every cycle (when not stalled), moving
+            // entries toward [0]. pipe_stall freezes the shift when a read
+            // reaches [0] but PHY data hasn't arrived yet — this prevents
+            // o_wb_ack from firing before o_wb_data is valid.
+            //
+            // write_ack_idx_q tracks the insertion point for writes. It
+            // decrements with each shift (staying aligned with the pipe
+            // contents) but HOLDS on sched_write cycles to prevent
+            // back-to-back writes from colliding in the same slot.
+
+            // Shift pipe toward [0]; decrement write pointer to track shift
             if (!pipe_stall) begin
                 ack_pipe_q    <= {1'b0, ack_pipe_q[ACK_PIPE_WIDTH-1:1]};
                 ack_is_read_q <= {1'b0, ack_is_read_q[ACK_PIPE_WIDTH-1:1]};
-                write_ack_idx_q <= (write_ack_idx_q > 1)
-                                 ? write_ack_idx_q - 1'b1 : write_ack_idx_q;
+                write_ack_idx_q <= (write_ack_idx_q > 1) ? write_ack_idx_q - 1'b1 : write_ack_idx_q;
             end
+
+            // Insert write ACK close to [0] for fast turnaround.
+            // Hold pointer: the entry we just wrote will shift away next
+            // cycle, freeing this slot for the next consecutive write.
             if (sched_write) begin
                 ack_pipe_q[write_ack_idx_q]    <= 1'b1;
                 ack_is_read_q[write_ack_idx_q] <= 1'b0;
-                write_ack_idx_q <= write_ack_idx_q; // hold
+                write_ack_idx_q <= write_ack_idx_q;
             end
+
+            // Insert read ACK at far end — it will take ACK_PIPE_WIDTH
+            // shifts to reach [0], matching PHY read latency.
+            // Reset write pointer to far-1: any subsequent write must ACK
+            // AFTER this read (WB B4 in-order guarantee).
             if (sched_read) begin
                 ack_pipe_q[ACK_PIPE_WIDTH-1]    <= 1'b1;
                 ack_is_read_q[ACK_PIPE_WIDTH-1] <= 1'b1;
                 write_ack_idx_q <= ACK_PIPE_WIDTH[$clog2(ACK_PIPE_WIDTH)-1:0] - 1'b1;
             end
-            // read_data_pending: tracks PHY read returns not yet consumed by ACK.
-            // Gated by reset_done: training rddata_valid (MPR reads) must not count.
+
+            // Credit counter: how many PHY read data returns are buffered
+            // but not yet consumed by a read ACK firing at [0].
+            //   +1 when PHY returns data (i_dfi_rddata_valid)
+            //   -1 when a read ACK fires (read at [0], not stalled)
+            // When counter=0 and a read reaches [0]: pipe_stall activates,
+            // freezing everything until PHY data arrives.
+            // Gated by reset_done so PHY training reads (MPR) don't count.
             if (reset_done) begin
-                if (|i_dfi_rddata_valid && !(ack_pipe_q[0] && ack_is_read_q[0] && !pipe_stall))
-                    read_data_pending_q <= read_data_pending_q + 1'b1;
-                else if (!(|i_dfi_rddata_valid) && (ack_pipe_q[0] && ack_is_read_q[0] && !pipe_stall))
-                    read_data_pending_q <= read_data_pending_q - 1'b1;
+                read_data_pending_q <= read_data_pending_q
+                    + (|i_dfi_rddata_valid)
+                    - (ack_pipe_q[0] && ack_is_read_q[0] && !pipe_stall);
             end
             if (!i_wb_cyc) begin
                 ack_pipe_q          <= {ACK_PIPE_WIDTH{1'b0}};
