@@ -97,7 +97,7 @@ module ddr4_controller #(
               T_WRLVL_EN  = 4,   // min DFI clks: wrlvl_en -> first strobe
               T_WRLVL_WW  = 16,  // min DFI clks between strobe pulses
               // DFI training timing (MC-defined, override for longer PHY write/read leveling)
-              T_RDLVL_MAX     = 4096, // timeout (DFI clks) for rdlvl_resp
+              T_RDLVL_MAX     = 8192, // timeout (DFI clks) for rdlvl_resp
               T_WRLVL_MAX     = 4096, // timeout (DFI clks) for wrlvl_resp
               CALIB_RETRY_MAX = 3     // retries per training phase before failure
 ) (
