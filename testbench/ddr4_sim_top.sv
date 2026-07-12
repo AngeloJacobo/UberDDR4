@@ -815,14 +815,14 @@ module ddr4_sim_top;
                 $display("[%0t] PHY eye training started", $realtime);
             if (u_dut.u_phy.phy_state == 4'd7 && prev_phy_state != 4'd7)
                 if (BYTE_LANES > 1)
-                    $display("[%0t] PHY eye training done (lane0 center=%0d bs=%0d, lane1 center=%0d bs=%0d)",
+                    $display("[%0t] PHY eye training done (lane0 center=%0d bs=%0d late=%0d, lane1 center=%0d bs=%0d late=%0d)",
                         $realtime,
-                        u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0],
-                        u_dut.u_phy.eye_center_tap[1], u_dut.u_phy.bitslip_count_q[1]);
+                        u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0], u_dut.u_phy.rd_lat_extra[0],
+                        u_dut.u_phy.eye_center_tap[1], u_dut.u_phy.bitslip_count_q[1], u_dut.u_phy.rd_lat_extra[1]);
                 else
-                    $display("[%0t] PHY eye training done (lane0 center=%0d bs=%0d)",
+                    $display("[%0t] PHY eye training done (lane0 center=%0d bs=%0d late=%0d)",
                         $realtime,
-                        u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0]);
+                        u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0], u_dut.u_phy.rd_lat_extra[0]);
 
             // Write leveling
             if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd8)
@@ -859,14 +859,14 @@ module ddr4_sim_top;
                     $realtime,
                     u_dut.u_phy.bitslip_count_q[0]);
             if (BYTE_LANES > 1)
-                $display("[%0t]   Eye:  lane0 center=%0d bs=%0d, lane1 center=%0d bs=%0d",
+                $display("[%0t]   Eye:  lane0 center=%0d bs=%0d late=%0d, lane1 center=%0d bs=%0d late=%0d",
                     $realtime,
-                    u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0],
-                    u_dut.u_phy.eye_center_tap[1], u_dut.u_phy.bitslip_count_q[1]);
+                    u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0], u_dut.u_phy.rd_lat_extra[0],
+                    u_dut.u_phy.eye_center_tap[1], u_dut.u_phy.bitslip_count_q[1], u_dut.u_phy.rd_lat_extra[1]);
             else
-                $display("[%0t]   Eye:  lane0 center=%0d bs=%0d",
+                $display("[%0t]   Eye:  lane0 center=%0d bs=%0d late=%0d",
                     $realtime,
-                    u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0]);
+                    u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0], u_dut.u_phy.rd_lat_extra[0]);
             if (BYTE_LANES > 1)
                 $display("[%0t]   WL:   lane0 dqs_tap=%0d dq_tap=%0d, lane1 dqs_tap=%0d dq_tap=%0d",
                     $realtime,

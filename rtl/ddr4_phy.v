@@ -167,6 +167,7 @@ module ddr4_phy #(
                     PHY_EYE_TRACK     = 4'd3,
                     PHY_EYE_DECIDE    = 4'd4,
                     PHY_EYE_VERIFY    = 4'd5,
+                    PHY_EYE_LATE      = 4'd6,
                     PHY_EYE_DONE      = 4'd7,
                     PHY_WL_SAMPLE     = 4'd8,
                     PHY_WL_ADJUST     = 4'd9,
@@ -823,12 +824,19 @@ module ddr4_phy #(
     reg       best_valid;           // 1 = at least one valid range has been recorded
     reg       pattern_found_q;      // pipeline reg: MPR pattern found at current tap (registered from comb)
     reg [3:0] pattern_offset_q;     // pipeline reg: offset where pattern was found (registered from comb)
+    reg       pattern_late_q;       // pipeline reg: pattern arrived 1 CLKDIV cycle after rddata_en
+    reg       cur_late;             // current range: data arrives late (1 cycle after rddata_en)
+    reg       best_late;            // best range: data arrives late
+    reg       verify_mode;          // 1 = PHY_EYE_LATE is doing verify check (not sweep late-check)
+    reg [BYTE_LANES-1:0] rd_lat_extra; // per-lane: 1 = read data arrives 1 CLKDIV cycle late
+    reg [SERDES_RATIO-1:0] rddata_en_d1; // 1-cycle delayed rddata_en for late-lane capture
     reg [8:0] eye_center_tap [BYTE_LANES-1:0]; // final center tap per lane (for debug readback)
 
     // Write leveling registers (ODELAYE3 DQS sweep)
     reg [8:0] wl_tap        [BYTE_LANES-1:0];
     reg [8:0] wl_dq_tap     [BYTE_LANES-1:0];
-    reg       wl_prev_dq0   [BYTE_LANES-1:0];
+    reg       wl_prev_dq0   [BYTE_LANES-1:0];  // previous DQ sample (for debug display)
+    reg       wl_seen_zero  [BYTE_LANES-1:0];  // 1 = have observed DQ=0; enables 0→1 detection
     reg [8:0] dqs_initial_tap [BYTE_LANES-1:0];
     reg [7:0] vtc_settle_counter;
 
@@ -954,6 +962,7 @@ module ddr4_phy #(
                 wl_tap[dfi_pack_idx]           <= 9'b0;
                 wl_dq_tap[dfi_pack_idx]        <= 9'b0;
                 wl_prev_dq0[dfi_pack_idx]      <= 1'b0;
+                wl_seen_zero[dfi_pack_idx]     <= 1'b0;
                 dqs_initial_tap[dfi_pack_idx]  <= 9'b0;
             end
             phy_state           <= PHY_IDLE;
@@ -971,6 +980,12 @@ module ddr4_phy #(
             best_valid          <= 1'b0;
             pattern_found_q     <= 1'b0;
             pattern_offset_q    <= 4'b0;
+            pattern_late_q      <= 1'b0;
+            cur_late            <= 1'b0;
+            best_late           <= 1'b0;
+            verify_mode         <= 1'b0;
+            rd_lat_extra        <= {BYTE_LANES{1'b0}};
+            rddata_en_d1        <= {SERDES_RATIO{1'b0}};
             odelay_dqs_cntvalue <= 9'b0;
             odelay_dq_cntvalue  <= 9'b0;
             wl_dqs_strobe       <= 1'b0;
@@ -994,10 +1009,14 @@ module ddr4_phy #(
             for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
                 prev_iserdes_q[dfi_pack_idx] <= iserdes_dq_q[dfi_pack_idx];
 
-            // DFI Read Data Packing: capture aligned ISERDESE3 outputs on rddata_en.
-            // Gated by rddata_en: capture once, hold until next read.
-            if (|i_dfi_rddata_en) begin
-                for (dfi_pack_lane = 0; dfi_pack_lane < BYTE_LANES; dfi_pack_lane = dfi_pack_lane + 1) begin
+            // Delayed rddata_en for late-lane capture (1 CLKDIV cycle delay)
+            rddata_en_d1 <= i_dfi_rddata_en;
+
+            // DFI Read Data Packing: capture aligned ISERDESE3 outputs.
+            // Per-lane gating: on-time lanes capture at rddata_en,
+            // late lanes (rd_lat_extra=1) capture at rddata_en_d1.
+            for (dfi_pack_lane = 0; dfi_pack_lane < BYTE_LANES; dfi_pack_lane = dfi_pack_lane + 1) begin
+                if (rd_lat_extra[dfi_pack_lane] ? |rddata_en_d1 : |i_dfi_rddata_en) begin
                     for (dfi_pack_bit = 0; dfi_pack_bit < DQ_BITS; dfi_pack_bit = dfi_pack_bit + 1) begin
                         dfi_pack_idx = dfi_pack_lane * DQ_BITS + dfi_pack_bit;
                         for (dfi_pack_phase = 0; dfi_pack_phase < SERDES_RATIO; dfi_pack_phase = dfi_pack_phase + 1) begin
@@ -1010,8 +1029,10 @@ module ddr4_phy #(
                 end
             end
 
-            // rddata_valid: 1 cycle after rddata_en
-            o_dfi_rddata_valid <= i_dfi_rddata_en;
+            // rddata_valid: asserts when ALL lanes have valid data captured.
+            // If any lane is late, valid follows rddata_en_d1 (1 cycle later).
+            // Controller pipe_stall mechanism tolerates the extra cycle.
+            o_dfi_rddata_valid <= (|rd_lat_extra) ? rddata_en_d1 : i_dfi_rddata_en;
 
             // ---------------------------------------------------------
             // PHY Training FSM
@@ -1064,6 +1085,9 @@ module ddr4_phy #(
                             best_valid <= 1'b0;
                             best_width <= 9'd0;
                             cur_width <= 9'd0;
+                            cur_late <= 1'b0;
+                            best_late <= 1'b0;
+                            verify_mode <= 1'b0;
                             phy_timer <= 3'd4;
                             phy_state <= PHY_EYE_SWEEP;
                         end else if (i_dfi_wrlvl_en) begin // Write leveling starts on wrlvl_en
@@ -1083,6 +1107,7 @@ module ddr4_phy #(
                                 wl_tap[dfi_pack_idx]    <= odelay_dqs_cntvalueout[dfi_pack_idx];
                                 wl_dq_tap[dfi_pack_idx] <= 9'd0;
                                 wl_prev_dq0[dfi_pack_idx] <= 1'b0;
+                                wl_seen_zero[dfi_pack_idx] <= 1'b0;
                             end
                             phy_timer <= 3'd4;
                             phy_state <= PHY_WL_SAMPLE;
@@ -1115,12 +1140,17 @@ module ddr4_phy #(
                                 idelay_load_lane[train_lane] <= 1'b1;
                             phy_timer <= phy_timer - 1'b1;
                         end else if (|i_dfi_rddata_en) begin
-                            // Register comparator output for use in TRACK state
-                            // (pipelining separates timing-critical comparison
-                            // from range-tracking logic for timing closure at 300 MHz)
-                            pattern_found_q <= pattern_found_comb;
-                            pattern_offset_q <= pattern_offset_comb;
-                            phy_state <= PHY_EYE_TRACK;
+                            if (pattern_found_comb) begin
+                                // Pattern found on the rddata_en cycle (on-time arrival)
+                                pattern_found_q <= 1'b1;
+                                pattern_offset_q <= pattern_offset_comb;
+                                pattern_late_q <= 1'b0;
+                                phy_state <= PHY_EYE_TRACK;
+                            end else begin
+                                // Not found — IDELAY may have pushed data to next CLKDIV cycle.
+                                // Wait 1 more cycle and re-check (PHY_EYE_LATE).
+                                phy_state <= PHY_EYE_LATE;
+                            end
                         end
                     end
 
@@ -1128,9 +1158,10 @@ module ddr4_phy #(
                     // results to maintain the current and best ranges. Then advance
                     // the sweep tap or finish if we've reached the end (tap 508).
                     //
+                    // Range identity = (offset, late). A range closes when either changes.
                     // Three cases per tap:
-                    //   1. Pattern found, same offset as current range → extend
-                    //   2. Pattern found, different offset → close current, open new
+                    //   1. Pattern found, same (offset,late) as current range → extend
+                    //   2. Pattern found, different (offset,late) → close current, open new
                     //   3. Pattern not found → close current range (edge/metastable zone)
                     //
                     // On close: if current range is wider than best, promote it.
@@ -1142,23 +1173,26 @@ module ddr4_phy #(
                                 cur_start <= sweep_tap;
                                 cur_width <= 9'd0;
                                 cur_offset <= pattern_offset_q;
+                                cur_late <= pattern_late_q;
                                 in_range <= 1'b1;
-                            end else if (pattern_offset_q == cur_offset) begin
-                                // Same offset — extend current range
+                            end else if (pattern_offset_q == cur_offset && pattern_late_q == cur_late) begin
+                                // Same offset AND same latency — extend current range
                                 cur_width <= cur_width + {5'd0, TAP_SWEEP_STEP};
                             end else begin
-                                // Offset changed — close current range, open new one.
-                                // This happens when IDELAYE3 pushes DQ past a clock edge:
-                                // the captured pattern rotates by 1 bit in the window.
+                                // Offset or latency changed — close current range, open new.
+                                // This happens when IDELAYE3 pushes DQ past a clock edge
+                                // or past a full CLKDIV boundary (on-time → late transition).
                                 if (!best_valid || cur_width > best_width) begin
                                     best_start <= cur_start;
                                     best_width <= cur_width;
                                     best_offset <= cur_offset;
+                                    best_late <= cur_late;
                                     best_valid <= 1'b1;
                                 end
                                 cur_start <= sweep_tap;
                                 cur_width <= 9'd0;
                                 cur_offset <= pattern_offset_q;
+                                cur_late <= pattern_late_q;
                             end
                         end else begin
                             // No pattern found (metastable/edge zone) — close range
@@ -1167,6 +1201,7 @@ module ddr4_phy #(
                                     best_start <= cur_start;
                                     best_width <= cur_width;
                                     best_offset <= cur_offset;
+                                    best_late <= cur_late;
                                     best_valid <= 1'b1;
                                 end
                                 in_range <= 1'b0;
@@ -1195,6 +1230,7 @@ module ddr4_phy #(
                                 best_start <= cur_start;
                                 best_width <= cur_width;
                                 best_offset <= cur_offset;
+                                best_late <= cur_late;
                                 best_valid <= 1'b1;
                             end
                             in_range <= 1'b0;
@@ -1212,6 +1248,8 @@ module ddr4_phy #(
                                 best_valid <= 1'b0;
                                 best_width <= 9'd0;
                                 cur_width <= 9'd0;
+                                cur_late <= 1'b0;
+                                best_late <= 1'b0;
                                 phy_timer <= 3'd4;
                                 phy_state <= PHY_EYE_SWEEP;
                             end else begin
@@ -1221,15 +1259,18 @@ module ddr4_phy #(
                             // Load center of widest range into IDELAYE3.
                             // Set bitslip to the offset where MPR was found in that range —
                             // this is the correct byte boundary for all subsequent reads.
+                            // rd_lat_extra: if best range was "late", normal reads arrive
+                            // 1 CLKDIV cycle after rddata_en — capture path uses rddata_en_d1.
                             idelay_cntvalue <= best_start + (best_width >> 1);
                             eye_center_tap[train_lane] <= best_start + (best_width >> 1);
                             bitslip_count_q[train_lane] <= best_offset;
+                            rd_lat_extra[train_lane] <= best_late;
                             phy_timer <= 3'd4;
                             phy_state <= PHY_EYE_VERIFY;
                             `ifndef YOSYS
-                                $display("[%0t] PHY eye: lane %0d best_start=%0d width=%0d center=%0d offset=%0d",
+                                $display("[%0t] PHY eye: lane %0d best_start=%0d width=%0d center=%0d offset=%0d late=%0d",
                                     $realtime, train_lane, best_start, best_width,
-                                    best_start + (best_width >> 1), best_offset);
+                                    best_start + (best_width >> 1), best_offset, best_late);
                             `endif
                         end
                     end
@@ -1238,6 +1279,8 @@ module ddr4_phy #(
                     // bitslip + IDELAYE3 combination actually produces correct data.
                     // Uses aligned_dq (barrel shifter output with new bitslip) so
                     // this validates the exact path used during normal operation.
+                    // For late lanes, data arrives 1 cycle after rddata_en so we
+                    // transition to PHY_EYE_LATE with verify_mode=1.
                     // On success: advance to next lane or finish.
                     // On failure: latch eye_train_fail, proceed anyway.
                     PHY_EYE_VERIFY: begin
@@ -1246,9 +1289,12 @@ module ddr4_phy #(
                                 idelay_load_lane[train_lane] <= 1'b1;
                             phy_timer <= phy_timer - 1'b1;
                         end else if (|i_dfi_rddata_en) begin
-                            if (aligned_dq[train_lane * DQ_BITS] == MPR_PATTERN) begin
+                            if (rd_lat_extra[train_lane]) begin
+                                // Late lane: data arrives next cycle, defer check
+                                verify_mode <= 1'b1;
+                                phy_state <= PHY_EYE_LATE;
+                            end else if (aligned_dq[train_lane * DQ_BITS] === MPR_PATTERN) begin
                                 if (train_lane < BYTE_LANES - 1) begin
-                                    // Advance to next lane — reset range tracking
                                     train_lane <= train_lane + 1'b1;
                                     sweep_tap <= 9'd0;
                                     idelay_cntvalue <= 9'd0;
@@ -1256,19 +1302,19 @@ module ddr4_phy #(
                                     best_valid <= 1'b0;
                                     best_width <= 9'd0;
                                     cur_width <= 9'd0;
+                                    cur_late <= 1'b0;
+                                    best_late <= 1'b0;
                                     phy_timer <= 3'd4;
                                     phy_state <= PHY_EYE_SWEEP;
                                 end else begin
-                                    // Last lane done — finish eye training
                                     phy_state <= PHY_EYE_DONE;
                                     `ifndef YOSYS
                                         for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1)
-                                            $display("[%0t] PHY eye done: lane %0d center=%0d bitslip=%0d",
-                                                $realtime, dfi_pack_idx, eye_center_tap[dfi_pack_idx], bitslip_count_q[dfi_pack_idx]);
+                                            $display("[%0t] PHY eye done: lane %0d center=%0d bitslip=%0d rd_lat_extra=%0d",
+                                                $realtime, dfi_pack_idx, eye_center_tap[dfi_pack_idx], bitslip_count_q[dfi_pack_idx], rd_lat_extra[dfi_pack_idx]);
                                     `endif
                                 end
                             end else begin
-                                // Verification failed — latch failure, proceed to next lane
                                 eye_train_fail[train_lane] <= 1'b1;
                                 `ifndef YOSYS
                                     $display("[%0t] PHY eye: lane %0d verify FAILED at center tap", $realtime, train_lane);
@@ -1281,6 +1327,69 @@ module ddr4_phy #(
                                     best_valid <= 1'b0;
                                     best_width <= 9'd0;
                                     cur_width <= 9'd0;
+                                    cur_late <= 1'b0;
+                                    best_late <= 1'b0;
+                                    phy_timer <= 3'd4;
+                                    phy_state <= PHY_EYE_SWEEP;
+                                end else begin
+                                    phy_state <= PHY_EYE_DONE;
+                                end
+                            end
+                        end
+                    end
+
+                    // Late-arrival check (dual-purpose state):
+                    // verify_mode=0: Sweep late-check. Sample train_window one CLKDIV
+                    //   cycle after rddata_en. At high IDELAY taps, BL8 burst crosses
+                    //   the CLKDIV boundary and arrives in the next cycle.
+                    // verify_mode=1: Verify late-check. Confirm aligned_dq matches MPR
+                    //   pattern at the center tap for a lane whose best eye is "late".
+                    PHY_EYE_LATE: begin
+                        if (!verify_mode) begin
+                            // Sweep late-check: sample comparator result, proceed to TRACK
+                            pattern_found_q <= pattern_found_comb;
+                            pattern_offset_q <= pattern_offset_comb;
+                            pattern_late_q <= pattern_found_comb;
+                            phy_state <= PHY_EYE_TRACK;
+                        end else begin
+                            // Verify late-check: confirm aligned_dq matches MPR
+                            verify_mode <= 1'b0;
+                            if (aligned_dq[train_lane * DQ_BITS] === MPR_PATTERN) begin
+                                if (train_lane < BYTE_LANES - 1) begin
+                                    train_lane <= train_lane + 1'b1;
+                                    sweep_tap <= 9'd0;
+                                    idelay_cntvalue <= 9'd0;
+                                    in_range <= 1'b0;
+                                    best_valid <= 1'b0;
+                                    best_width <= 9'd0;
+                                    cur_width <= 9'd0;
+                                    cur_late <= 1'b0;
+                                    best_late <= 1'b0;
+                                    phy_timer <= 3'd4;
+                                    phy_state <= PHY_EYE_SWEEP;
+                                end else begin
+                                    phy_state <= PHY_EYE_DONE;
+                                    `ifndef YOSYS
+                                        for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1)
+                                            $display("[%0t] PHY eye done: lane %0d center=%0d bitslip=%0d rd_lat_extra=%0d",
+                                                $realtime, dfi_pack_idx, eye_center_tap[dfi_pack_idx], bitslip_count_q[dfi_pack_idx], rd_lat_extra[dfi_pack_idx]);
+                                    `endif
+                                end
+                            end else begin
+                                eye_train_fail[train_lane] <= 1'b1;
+                                `ifndef YOSYS
+                                    $display("[%0t] PHY eye: lane %0d verify FAILED (late) at center tap", $realtime, train_lane);
+                                `endif
+                                if (train_lane < BYTE_LANES - 1) begin
+                                    train_lane <= train_lane + 1'b1;
+                                    sweep_tap <= 9'd0;
+                                    idelay_cntvalue <= 9'd0;
+                                    in_range <= 1'b0;
+                                    best_valid <= 1'b0;
+                                    best_width <= 9'd0;
+                                    cur_width <= 9'd0;
+                                    cur_late <= 1'b0;
+                                    best_late <= 1'b0;
                                     phy_timer <= 3'd4;
                                     phy_state <= PHY_EYE_SWEEP;
                                 end else begin
@@ -1320,32 +1429,52 @@ module ddr4_phy #(
                     end
 
                     // Read back DRAM's WL response after strobe settles.
-                    // Detect 0→1 transition on DQ[0] (OR-reduced across bits):
-                    // previous=0, current=1 means DQS now leads CK — done.
-                    // Otherwise increment DQS/DQ ODELAY and retry.
+                    // Detect 0→1 transition on DQ[0] (OR-reduced across bits).
+                    // Uses wl_seen_zero guard: only accept DQ=1 as a valid
+                    // transition AFTER we have explicitly observed DQ=0 at a
+                    // prior tap. This prevents two failure modes:
+                    //   1. Stale high in iserdes_dq_q from before the first strobe
+                    //   2. Genuine initial DQ=1 with wl_prev_dq0 initialized to 0
+                    // Both would falsely trigger without the guard.
                     PHY_WL_ADJUST: begin
-                        if (phy_timer != 0) // Wait for strobe to settle before sampling
+                        if (phy_timer != 0)
                             phy_timer <= phy_timer - 1'b1;
                         else begin
-                            // Write leveling edge detection (JESD79-4D §4.7):
-                            // DRAM samples CK with the rising DQS edge and feeds
-                            // back the result on ALL DQ bits. The controller sweeps
-                            // DQS delay until DQ transitions 0->1, indicating DQS
-                            // rising edge is now aligned with CK rising edge.
-                            // DQ ODELAYE3 tracks DQS to preserve the 90° write offset.
                             `ifndef YOSYS
-                                $display("[%0t] PHY WL sweep: lane %0d dqs_tap=%0d dq_tap=%0d DQ=%0b prev=%0b", $realtime, train_lane, wl_tap[train_lane],
-                                    wl_dq_tap[train_lane], |iserdes_dq_q[train_lane * DQ_BITS], wl_prev_dq0[train_lane]);
+                                $display("[%0t] PHY WL sweep: lane %0d dqs_tap=%0d dq_tap=%0d DQ=%0b seen_zero=%0b", $realtime, train_lane, wl_tap[train_lane],
+                                    wl_dq_tap[train_lane], |iserdes_dq_q[train_lane * DQ_BITS], wl_seen_zero[train_lane]);
                             `endif
-                            if (!wl_prev_dq0[train_lane] && |iserdes_dq_q[train_lane * DQ_BITS]) begin // Detected 0->1 transition -- write leveling for this lane is done
+                            if (wl_seen_zero[train_lane] && |iserdes_dq_q[train_lane * DQ_BITS]) begin
+                                // Valid 0→1 transition: previously confirmed DQ=0,
+                                // now DQ=1 → DQS rising edge aligned with CK rising edge.
                                 phy_state <= PHY_WL_CHECK;
-                            end else begin // No transition yet -- increment taps and try again
-                                wl_prev_dq0[train_lane] <= |iserdes_dq_q[train_lane * DQ_BITS]; // Update previous DQ state for next transition detection
-                                if (wl_tap[train_lane][8:2] == 7'b1111111) begin // Reached max tap 508-511 without seeing transition -- WL failed for this lane
-                                    wl_train_fail[train_lane] <= 1'b1;
-                                    `ifndef YOSYS
-                                        $display("[%0t] PHY WL Failed: lane %0d exhausted taps", $realtime, train_lane);
-                                    `endif
+                            end else begin
+                                // Record DQ=0 observation for future transition detection
+                                if (!(|iserdes_dq_q[train_lane * DQ_BITS]))
+                                    wl_seen_zero[train_lane] <= 1'b1;
+                                wl_prev_dq0[train_lane] <= |iserdes_dq_q[train_lane * DQ_BITS]; // does wl_prev_dq0 has use???
+                                if (wl_tap[train_lane][8:2] == 7'b1111111) begin
+                                    if (!wl_seen_zero[train_lane]) begin
+                                        // DQ was 1 for the entire sweep — DQS already leads CK
+                                        // at the initial tap. Revert to initial alignment and
+                                        // pulse LOAD to physically apply the tap value.
+                                        wl_tap[train_lane] <= dqs_initial_tap[train_lane];
+                                        wl_dq_tap[train_lane] <= 9'd0;
+                                        odelay_dqs_cntvalue <= dqs_initial_tap[train_lane];
+                                        odelay_dq_cntvalue <= 9'd0;
+                                        odelay_dqs_load[train_lane] <= 1'b1;
+                                        odelay_dq_load[train_lane] <= 1'b1;
+                                        `ifndef YOSYS
+                                            $display("[%0t] PHY WL: lane %0d DQS already leads CK, using initial tap %0d",
+                                                $realtime, train_lane, dqs_initial_tap[train_lane]);
+                                        `endif
+                                    end else begin
+                                        // Saw DQ=0 but never saw 0→1 — genuine failure
+                                        wl_train_fail[train_lane] <= 1'b1;
+                                        `ifndef YOSYS
+                                            $display("[%0t] PHY WL Failed: lane %0d exhausted taps", $realtime, train_lane);
+                                        `endif
+                                    end
                                     phy_state <= PHY_WL_CHECK;
                                 end else begin // Increment ODELAY taps and try again
                                     wl_tap[train_lane] <= wl_tap[train_lane] + {5'b0, WL_TAP_STEP};
@@ -1371,6 +1500,7 @@ module ddr4_phy #(
                             wl_tap[train_lane + 1'b1]    <= dqs_initial_tap[train_lane + 1'b1]; // resume from 90° baseline (tCK/4 tap set by IODELAY BISC)
                             wl_dq_tap[train_lane + 1'b1] <= 9'd0;              // DQ has no initial offset — tracks DQS delta after WL
                             wl_prev_dq0[train_lane + 1'b1] <= 1'b0;
+                            wl_seen_zero[train_lane + 1'b1] <= 1'b0;
                             odelay_dqs_cntvalue <= dqs_initial_tap[train_lane + 1'b1]; // load DQS ODELAY to same 90° baseline
                             odelay_dq_cntvalue  <= 9'd0;                       // DQ ODELAY starts at 0, incremented in lockstep with DQS
                             phy_timer <= 3'd4;

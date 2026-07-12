@@ -8,7 +8,7 @@ An open-source, fully parameterized DDR4 SDRAM controller targeting Xilinx Ultra
 - 4 bank groups x 4 banks with full tFAW/tRRD/tCCD_L tracking
 - Bank-group interleaved address mapping for maximum throughput
 - Speculative bank anticipation (both PRECHARGE and ACTIVATE) for next-request lookahead
-- Write leveling, read gate training (bitslip), and read eye training (IDELAY tap sweep)
+- Write leveling, read gate training (bitslip), and phase-aware read eye training (IDELAY tap sweep with late-arrival detection)
 - Built-in self-test (BIST) with burst, random, and alternating write-read patterns
 - Debug CSR register file accessible via Wishbone
 - AXI4 slave wrapper using the [ZipCPU](https://github.com/ZipCPU/wb2axip) AXI-to-Wishbone bridge
@@ -194,6 +194,13 @@ For AXI4 integration, `ddr4_top_axi.v` wraps `ddr4_top` with the ZipCPU `axim2wb
 ```
 AXI4 slave --> axim2wbsp --> ddr4_top (Wishbone) --> DDR4
 ```
+
+### PHY Eye Training
+
+The PHY calibration sequence performs write leveling, bitslip (gate) training, and a full phase-aware IDELAYE3 tap sweep for read eye training. The eye training algorithm sweeps all 512 IDELAYE3 taps across 9 DQS offsets, tracking up to two passing ranges per lane and selecting the center of the widest range.
+
+**Late-Arrival Detection (`PHY_EYE_LATE`, state 4'd6):**  
+High IDELAYE3 tap values can push a BL8 burst's arrival past `rddata_en` by one full CLKDIV cycle. The `PHY_EYE_LATE` state re-samples `train_window` one cycle after `rddata_en` to catch these taps. Ranges are identified by `(offset, late)` tuples so on-time and late regions are never merged. If the best range for a lane is late, the per-lane `rd_lat_extra` flag is set; that lane then uses `rddata_en_d1` for capture, and `rddata_valid` is delayed by one cycle. The controller's `pipe_stall` credit counter absorbs the extra latency transparently. See [`doc/eye_training_redesign.md`](doc/eye_training_redesign.md) for the full design specification.
 
 ### CSR Register Map
 
