@@ -113,7 +113,7 @@ module ddr4_controller #(
     input wire[WB_SEL_BITS-1:0]      i_wb_sel,   // Byte-lane select (1 bit per byte of write data)
     output reg                       o_wb_stall, // Pipeline stall (high when slave cannot accept new request)
     output wire                      o_wb_ack,   // Transfer acknowledge to master
-    output reg[WB_DATA_BITS-1:0]     o_wb_data,  // Read data to master
+    output wire[WB_DATA_BITS-1:0]    o_wb_data,  // Read data to master
 
     // DFI 3.1 Control Interface 
     output reg[SERDES_RATIO*17-1:0]             o_dfi_address,    // DRAM address bus (per-phase)
@@ -167,7 +167,13 @@ module ddr4_controller #(
     output wire                      o_stage2_pending,
     output wire                      o_stage2_we,
     output wire                      o_refresh_idle,
-    output wire [NUM_BANKS-1:0]      o_bank_status
+    output wire [NUM_BANKS-1:0]      o_bank_status,
+    // Extended debug status (CSR 0xD readback)
+    output wire [5:0]                o_instruction_address, // ROM step 0-35 (init progress)
+    output wire                      o_pause_counter,       // 1 = ROM frozen by training FSM
+    output wire                      o_reset_done,          // 1 = init ROM completed
+    output wire                      o_pipe_stall,          // 1 = WB pipeline stalled
+    output wire [1:0]                o_calib_retry_count    // Training retry attempts (0-3)
 );
 
     // =====================================================================
@@ -467,6 +473,16 @@ module ddr4_controller #(
     // tFAW in controller cycles
     localparam TFAW_CYCLES = nCK_to_cycles(ps_to_nCK(tFAW_ps)); // tFAW (see JESD79-4D Figure 72)
 
+    // Far lookahead depth for bank anticipation (JESD79-4D §4.19)
+    // Looks tRP + tRCD + NUM_BG addresses ahead so that PRE+ACT complete
+    // before the request arrives. With BG-interleaved mapping, the same
+    // bank group reappears every NUM_BG addresses — PRE fires on first
+    // encounter, ACT on the next encounter after tRP elapses, giving
+    // tRCD cycles of headroom before the request reaches Stage 2.
+    localparam FAR_LOOKAHEAD_DEPTH = PRECHARGE_TO_ACTIVATE_DELAY
+                                   + ACTIVATE_TO_WRITE_DELAY
+                                   + NUM_BG;
+
     // Counter width sizing 
     localparam MAX_PRECHARGE_DELAY = max_fn(max_fn(ACTIVATE_TO_PRECHARGE_DELAY, WRITE_TO_PRECHARGE_DELAY), READ_TO_PRECHARGE_DELAY);
     localparam MAX_ACTIVATE_DELAY  = PRECHARGE_TO_ACTIVATE_DELAY; // tRRD(act-to-act) uses separate rrd_counter
@@ -734,11 +750,20 @@ module ddr4_controller #(
     reg[$clog2(ACK_PIPE_WIDTH)-1:0] write_ack_idx_q;
     reg[$clog2(ACK_PIPE_WIDTH):0] read_data_pending_q;
 
-    // Pipe stalls when a read is at [0] but no read data has arrived yet.
-    // This ensures o_wb_ack never fires before o_wb_data is valid, making
-    // the design robust to PHYs with variable or larger tphy_rdlat.
+    reg[WB_DATA_BITS-1:0] wb_data_q;
+
+    // Pipe stall: read at [0] with no buffered data AND no same-cycle arrival.
+    // When rddata_valid is high on the same cycle, the bypass MUX provides
+    // valid data combinationally, so the stall is suppressed.
     wire pipe_stall = ack_pipe_q[0] && ack_is_read_q[0]
-                    && (read_data_pending_q == 0);
+                    && (read_data_pending_q == 0) && !(|i_dfi_rddata_valid);
+
+    // Combinational bypass MUX: when counter=0 and rddata_valid arrives
+    // simultaneously with a read at [0], forward i_dfi_rddata directly
+    // (wb_data_q won't update until next edge). When counter>0, wb_data_q
+    // already holds the correct previously-latched data for the current read.
+    assign o_wb_data = (read_data_pending_q == 0 && |i_dfi_rddata_valid)
+                     ? i_dfi_rddata : wb_data_q;
 
     // -- Static outputs --
     // WB B4 Rule 3.30 compliance handled by ddr4_top (CYC gating at top-level output)
@@ -790,7 +815,7 @@ module ddr4_controller #(
     wire[BG_BITS-1:0]         wb_bg;
     wire[ROW_BITS-1:0]        wb_row;
     wire[BG_BITS+BA_BITS-1:0] wb_bank;
-    wire[WB_ADDR_BITS-1:0]    wb_addr_next = i_wb_addr + 1'b1;
+    wire[WB_ADDR_BITS-1:0]    wb_addr_next = i_wb_addr + FAR_LOOKAHEAD_DEPTH[$clog2(WB_ADDR_BITS+1)-1:0];
     wire[BG_BITS-1:0]         wb_next_bg;
     wire[BA_BITS-1:0]         wb_next_ba;
     wire[ROW_BITS-1:0]        wb_next_row;
@@ -946,10 +971,13 @@ module ddr4_controller #(
     // Bank Anticipation — Enable / Guard Wires
     //
     // Anticipation speculatively issues PRE/ACT for stage1_next_bank
-    // (the bank that the NEXT sequential WB address maps to) while
-    // Stage 2 is busy with the current request.  By the time the next
-    // request reaches Stage 2, the bank is already open on the correct
-    // row — hiding tRP + tRCD behind the current transaction.
+    // (the bank FAR_LOOKAHEAD_DEPTH addresses ahead of the current WB
+    // request). The depth is tRP + tRCD + NUM_BG (JESD79-4D §4.19),
+    // so that even a bank needing PRE+ACT has time to complete both
+    // before the request reaches Stage 2. With BG-interleaved mapping
+    // the same bank group reappears every NUM_BG addresses — PRE fires
+    // on the first encounter, ACT fires on the next encounter after
+    // tRP elapses, and tRCD completes before the request arrives.
     //
     // Architecture: ENABLE (from _q only) + KILL (1 gate after Stage 2)
     //
@@ -968,14 +996,6 @@ module ddr4_controller #(
     //
     //   SLOT CONFLICT (!sched_precharge / !sched_activate) prevents two
     //   commands on the same DFI slot in the same controller cycle.
-    //
-    // With BG-interleaved mapping (ADDR_MAPPING=1), consecutive WB
-    // addresses cycle through bank groups, so stage1_next_bank is
-    // always a different BG — anticipation fires every cycle during
-    // sequential bursts.  With row-first mapping (ADDR_MAPPING=0),
-    // consecutive addresses stay in the same bank/row, so the enable
-    // conditions naturally evaluate false (bank already active on
-    // correct row) and anticipation stays dormant — no wasted commands.
     // =====================================================================
     wire ant_pre_enable = stage1_pending && !refresh_active
         && bank_status_q[stage1_next_bank]
@@ -1149,7 +1169,7 @@ module ddr4_controller #(
                 //         (b) tCCD elapsed (ccd_counter per bank group).
                 // ODT (On-Die Termination) is enabled for writes — the
                 // DRAM switches its termination resistors to transmit mode.
-                if (stage2_we && !pipe_stall
+                if (stage2_we && (!pipe_stall || !ack_pipe_q[write_ack_idx_q])
                     && (delay_before_write_counter_q[stage2_bank] <= 1)
                     && (ccd_counter_q[stage2_bg] <= 1)) begin
                     sched_write = 1'b1;
@@ -1185,7 +1205,7 @@ module ddr4_controller #(
                 //             any prior WRITE's data to clear the bus
                 //             before driving a READ.
                 // ODT stays off for reads — DRAM is in receive mode.
-                else if (!stage2_we && !pipe_stall
+                else if (!stage2_we && (!pipe_stall || !ack_pipe_q[ACK_PIPE_WIDTH-1])
                          && (delay_before_read_counter_q[stage2_bank] <= 1)
                          && (ccd_counter_q[stage2_bg] <= 1)
                          && (wtr_counter_q[stage2_bg] <= 1)) begin
@@ -1314,7 +1334,7 @@ module ddr4_controller #(
             o_dfi_wrlvl_strobe  <= 1'b0;
             o_dfi_lvl_pattern   <= {SERDES_RATIO{1'b0}};
             o_dfi_lvl_periodic  <= 1'b0;
-            o_wb_data  <= {WB_DATA_BITS{1'b0}};
+            wb_data_q  <= {WB_DATA_BITS{1'b0}};
             reset_done <= 1'b0;
             instruction_address <= 6'd0;
             bank_status_q <= {NUM_BANKS{1'b0}};
@@ -1629,7 +1649,7 @@ module ddr4_controller #(
             // 4 bits wide because DFI has one valid flag per phase (SERDES_RATIO=4).
             // For BL8, all 4 phases return data together, so OR-reduce works.
             if (|i_dfi_rddata_valid) begin
-                o_wb_data <= i_dfi_rddata;
+                wb_data_q <= i_dfi_rddata;
             end
 
             // WB ACK ordering pipe — shared shift register.
@@ -2470,6 +2490,13 @@ module ddr4_controller #(
     assign o_stage2_we      = stage2_we;
     assign o_refresh_idle   = refresh_idle;
     assign o_bank_status    = bank_status_q;
+
+    // Extended Debug Status Assigns
+    assign o_instruction_address = instruction_address;
+    assign o_pause_counter       = pause_counter;
+    assign o_reset_done          = reset_done;
+    assign o_pipe_stall          = pipe_stall;
+    assign o_calib_retry_count   = calib_retry_count;
 
     // =======================
     // Formal Properties

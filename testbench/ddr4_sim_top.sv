@@ -92,7 +92,13 @@ module ddr4_sim_top;
 `ifdef SIM_BIST_MODE
     localparam TB_BIST_MODE = `SIM_BIST_MODE;
 `else
-    localparam TB_BIST_MODE = 1;
+    localparam TB_BIST_MODE = 2;
+`endif
+
+`ifdef SIM_BIST_DM_TEST
+    localparam TB_BIST_DM_TEST = `SIM_BIST_DM_TEST;
+`else
+    localparam TB_BIST_DM_TEST = 0;
 `endif
 
 `ifdef SIM_TB_DEPTH_BITS
@@ -259,6 +265,7 @@ module ddr4_sim_top;
         .MICRON_SIM            (1),
         .ADDR_MAPPING          (TB_ADDR_MAPPING),
         .BIST_MODE             (TB_BIST_MODE),
+        .BIST_DM_TEST          (TB_BIST_DM_TEST),
         .DEBUG_CSR_ENABLE      (1)
     ) u_dut (
         .i_controller_clk (controller_clk),

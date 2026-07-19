@@ -208,16 +208,23 @@ CSR registers are 32-bit, accessed via the dedicated debug Wishbone port (`i_wb_
 
 | Addr | Name | Access | Description |
 | :---: | :--- | :---: | :--- |
-| 0x0 | Controller Status | RO | `[3:0]` phy_state, `[7:4]` calib_state, `[8]` stage1_pending, `[9]` stage2_pending, `[11]` stage2_we, `[12]` refresh_idle |
-| 0x1 | Bank Status | RO | `[NUM_BANKS-1:0]` per-bank active flag |
-| 0x3 | BIST Correct Count | RO | Number of passing read comparisons |
-| 0x4 | BIST Error Count | RO | Number of failing read comparisons |
-| 0x5 | BIST State | RO | `[2:0]` FSM state, `[3]` busy, `[4]` pass, `[5]` fail |
-| 0x6 | PHY Lane 0 | RO | `[3:0]` phy_state, `[12:4]` idelay_center, `[21:13]` wl_tap, `[24:22]` bitslip |
-| 0x7 | PHY Lane 1 | RO | `[8:0]` idelay_center, `[17:9]` wl_tap, `[20:18]` bitslip |
-| 0xA | Configuration | RO | `[1:0]` BIST_MODE, `[7:4]` BYTE_LANES |
-| 0xB | Version | RO | `[7:0]` minor, `[15:8]` major |
-| 0xC | Control | R/W | `[0]` W1S: trigger BIST start, `[1]` W1S: soft reset (re-calibrate), `[2]` R/W: enable auto-reset on BIST fail (default 0) |
+| 0x0 | STATUS | RO | `[3:0]` phy_state, `[7:4]` calib_state, `[8]` stage1_pending, `[9]` stage2_pending, `[11]` stage2_we, `[12]` refresh_idle |
+| 0x1 | BANK_STATUS | RO | `[NUM_BANKS-1:0]` per-bank active flag (1=row open, 0=idle) |
+| 0x2 | TRAIN_FAIL | RO | `[BL-1:0]` gate_fail, `[2*BL-1:BL]` eye_fail, `[3*BL-1:2*BL]` wl_fail |
+| 0x3 | CORRECT_COUNT | RO | BIST: number of passing read comparisons |
+| 0x4 | ERROR_COUNT | RO | BIST: number of failing read comparisons |
+| 0x5 | BIST_STATUS | RO | `[2:0]` FSM state, `[3]` busy, `[4]` pass, `[5]` fail_sticky, `[6]` init_done, `[7]` init_failed |
+| 0x6 | LANE0_TRAINING | RO | `[3:0]` phy_state, `[12:4]` idelay_center, `[21:13]` wl_dqs_tap, `[25:22]` bitslip |
+| 0x7 | LANE1_TRAINING | RO | `[8:0]` idelay_center, `[17:9]` wl_dqs_tap, `[21:18]` bitslip |
+| 0x8 | EYE_HEALTH | RO | `[8:0]` lane0 eye_width, `[17:9]` lane1 eye_width, `[19:18]` rd_lat_extra, `[20]` en_vtc |
+| 0x9 | WRITE_PATH | RO | `[8:0]` lane0 wl_dq_tap, `[17:9]` lane1 wl_dq_tap, `[26:18]` lane0 dqs_initial_tap |
+| 0xA | CONFIG | RO | `[1:0]` BIST_MODE, `[7:4]` BYTE_LANES |
+| 0xB | VERSION | RO | `[7:0]` minor, `[15:8]` major |
+| 0xC | CONTROL | R/W | `[0]` W1S: trigger BIST start, `[1]` W1S: soft reset (re-calibrate), `[2]` R/W: auto_reset_en |
+| 0xD | INIT_PROGRESS | RO | `[5:0]` ROM instruction_address, `[6]` pause_counter, `[7]` reset_done, `[8]` pipe_stall, `[10:9]` calib_retry_count |
+| 0xE | EYE_POSITION | RO | `[8:0]` lane0 best_start, `[17:9]` lane1 best_start, `[26:18]` lane1 dqs_initial_tap |
+
+**Debug workflow:** After boot, read 0x5 for init_done/failed. If init hangs, read 0xD for ROM step. If training fails, read 0x2 for which phase failed, then 0x8/0xE for eye margins. For throughput issues, poll 0xD bit[8] (pipe_stall). Compare 0x8 eye_width against expected (~200+ taps for healthy margin).
 
 ***
 

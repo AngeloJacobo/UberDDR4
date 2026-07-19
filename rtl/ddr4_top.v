@@ -87,8 +87,11 @@ module ddr4_top #(
     //   Auto values: DDR4-1600=9, DDR4-1866=10, DDR4-2133=11, DDR4-2400=12
     parameter[4:0] CWL = 0,
     // BIST / debug prober configuration
-    //   BIST_MODE: 0=disabled, 1=burst sequential only, 2=full (burst+random+alternating)
+    //   BIST_MODE: 0=disabled, 1=half-range, 2=full-range (all three phases always run)
     parameter[1:0] BIST_MODE = 1,
+    //   BIST_DM_TEST: 0=full-word burst writes, 1=per-byte-lane writes (stress DM path)
+    //   Auto-disabled for x4 devices (no DM pin on x4, JESD79-4D Table 2)
+    parameter[0:0] BIST_DM_TEST = (DEVICE_WIDTH == 4) ? 0 : 1,
     // Debug CSR register file: 0=disabled (saves area), 1=enabled
     parameter DEBUG_CSR_ENABLE = 1,
     // Derived from DEVICE_WIDTH -- do not override
@@ -179,6 +182,17 @@ module ddr4_top #(
     wire [BYTE_LANES-1:0]   phy_train_fail_gate;
     wire [BYTE_LANES-1:0]   phy_train_fail_eye;
     wire [BYTE_LANES-1:0]   phy_train_fail_wl;
+    wire [9*BYTE_LANES-1:0] phy_best_width;
+    wire [9*BYTE_LANES-1:0] phy_best_start;
+    wire [9*BYTE_LANES-1:0] phy_wl_dq_tap;
+    wire [9*BYTE_LANES-1:0] phy_dqs_initial_tap;
+    wire [BYTE_LANES-1:0]   phy_rd_lat_extra;
+    wire                     phy_en_vtc;
+    wire [5:0]              ctrl_instruction_address;
+    wire                    ctrl_pause_counter;
+    wire                    ctrl_reset_done;
+    wire                    ctrl_pipe_stall;
+    wire [1:0]             ctrl_calib_retry_count;
 
     // -----------------------------------------------------------------
     // Prober (BIST + CSR) Wires
@@ -312,7 +326,12 @@ module ddr4_top #(
         .o_stage2_pending(ctrl_stage2_pending),
         .o_stage2_we(ctrl_stage2_we),
         .o_refresh_idle(ctrl_refresh_idle),
-        .o_bank_status(ctrl_bank_status)
+        .o_bank_status(ctrl_bank_status),
+        .o_instruction_address(ctrl_instruction_address),
+        .o_pause_counter(ctrl_pause_counter),
+        .o_reset_done(ctrl_reset_done),
+        .o_pipe_stall(ctrl_pipe_stall),
+        .o_calib_retry_count(ctrl_calib_retry_count)
     );
 
     // -----------------------------------------------------------------
@@ -388,7 +407,13 @@ module ddr4_top #(
         .o_phy_bitslip(phy_bitslip),
         .o_phy_train_fail_gate(phy_train_fail_gate),
         .o_phy_train_fail_eye(phy_train_fail_eye),
-        .o_phy_train_fail_wl(phy_train_fail_wl)
+        .o_phy_train_fail_wl(phy_train_fail_wl),
+        .o_phy_best_width(phy_best_width),
+        .o_phy_best_start(phy_best_start),
+        .o_phy_wl_dq_tap(phy_wl_dq_tap),
+        .o_phy_dqs_initial_tap(phy_dqs_initial_tap),
+        .o_phy_rd_lat_extra(phy_rd_lat_extra),
+        .o_phy_en_vtc(phy_en_vtc)
     );
 
     // -----------------------------------------------------------------
@@ -405,6 +430,7 @@ module ddr4_top #(
         .ROW_BITS(ROW_BITS),
         .MICRON_SIM(MICRON_SIM),
         .BIST_MODE(BIST_MODE),
+        .BIST_DM_TEST(BIST_DM_TEST),
         .DEBUG_CSR_ENABLE(DEBUG_CSR_ENABLE)
     ) u_prober (
         .i_clk(i_controller_clk),
@@ -444,7 +470,18 @@ module ddr4_top #(
         .i_phy_idelay_center(phy_idelay_center),
         .i_phy_wl_tap(phy_wl_tap),
         .i_phy_bitslip(phy_bitslip),
-        .i_phy_train_fail({phy_train_fail_wl, phy_train_fail_eye, phy_train_fail_gate})
+        .i_phy_train_fail({phy_train_fail_wl, phy_train_fail_eye, phy_train_fail_gate}),
+        .i_phy_best_width(phy_best_width),
+        .i_phy_best_start(phy_best_start),
+        .i_phy_wl_dq_tap(phy_wl_dq_tap),
+        .i_phy_dqs_initial_tap(phy_dqs_initial_tap),
+        .i_phy_rd_lat_extra(phy_rd_lat_extra),
+        .i_phy_en_vtc(phy_en_vtc),
+        .i_instruction_address(ctrl_instruction_address),
+        .i_pause_counter(ctrl_pause_counter),
+        .i_reset_done(ctrl_reset_done),
+        .i_pipe_stall(ctrl_pipe_stall),
+        .i_calib_retry_count(ctrl_calib_retry_count)
     );
 
 endmodule

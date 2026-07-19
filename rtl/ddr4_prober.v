@@ -4,9 +4,10 @@
 // Project:  UberDDR4 - An Open Source DDR4 Controller
 //
 // Purpose:  Combined BIST engine and debug CSR register file. The BIST
-//  exercises the DDR4 data path via sequential, random-order, and alternating
-//  write/read patterns through a Wishbone B4 master port. The debug CSR
-//  provides read-only register access to controller, PHY, and BIST status.
+//  exercises the DDR4 data path via sequential (burst), stress-addressed
+//  (row/bank thrashing), and alternating write/read patterns through a
+//  Wishbone B4 master port. The debug CSR provides read-only register
+//  access to controller, PHY, and BIST status.
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -42,8 +43,12 @@ module ddr4_prober #(
               ROW_BITS           = 16,
     // Set to 1 when simulating with Micron DDR4 model (adjusts timing checks)
     parameter[0:0] MICRON_SIM    = 0,
-    // BIST_MODE: 0=disabled, 1=burst sequential only, 2=full (burst+random+alternating)
+    // BIST_MODE: 0=disabled, 1=half-range (each phase covers half the address space),
+    //            2=full-range (each phase covers the full address space)
     parameter[1:0] BIST_MODE     = 2,
+    // BIST burst write per-byte-lane masking: 0=disabled (full-word writes),
+    // 1=enabled (cycles through byte lanes one at a time to stress DM path)
+    parameter[0:0] BIST_DM_TEST     = 1,
     // Debug CSR register file: 0=disabled (saves area), 1=enabled
     parameter      DEBUG_CSR_ENABLE = 1
 ) (
@@ -65,7 +70,7 @@ module ddr4_prober #(
     output reg                      o_wb_we,            // Write enable: 1=write, 0=read
     output reg  [WB_ADDR_BITS-1:0]  o_wb_addr,          // DDR4 word address
     output reg  [WB_DATA_BITS-1:0]  o_wb_data,          // Write data (full cache-line width)
-    output reg  [WB_SEL_BITS-1:0]   o_wb_sel,           // Byte-lane select (always all-ones for BIST)
+    output reg  [WB_SEL_BITS-1:0]   o_wb_sel,           // Byte-lane select (one-hot when BIST_DM_TEST=1, all-ones otherwise)
     input  wire                     i_wb_stall,         // Backpressure from controller: request not accepted this cycle
     input  wire                     i_wb_ack,           // Acknowledge: read data valid or write committed
     input  wire [WB_DATA_BITS-1:0]  i_wb_data,          // Read data returned by controller
@@ -91,7 +96,19 @@ module ddr4_prober #(
     input  wire [9*BYTE_LANES-1:0]  i_phy_idelay_center, // 9b per lane: IDELAY tap at center of read data eye
     input  wire [9*BYTE_LANES-1:0]  i_phy_wl_tap,       // 9b per lane: ODELAY tap where DQS aligns to CK at DRAM
     input  wire [4*BYTE_LANES-1:0]  i_phy_bitslip,      // 4b per lane: ISERDES barrel-shift aligning capture to burst boundary
-    input  wire [3*BYTE_LANES-1:0]  i_phy_train_fail    // Per lane: {wl_fail, eye_fail, gate_fail} — sticky failure flags
+    input  wire [3*BYTE_LANES-1:0]  i_phy_train_fail,   // Per lane: {wl_fail, eye_fail, gate_fail} — sticky failure flags
+    // Extended training debug (CSR 0x8, 0x9, 0xD, 0xE readback)
+    input  wire [9*BYTE_LANES-1:0]  i_phy_best_width,   // 9b per lane: eye width in IDELAY taps
+    input  wire [9*BYTE_LANES-1:0]  i_phy_best_start,   // 9b per lane: first passing IDELAY tap
+    input  wire [9*BYTE_LANES-1:0]  i_phy_wl_dq_tap,    // 9b per lane: DQ ODELAYE3 tap after WL
+    input  wire [9*BYTE_LANES-1:0]  i_phy_dqs_initial_tap, // 9b per lane: BISC-calibrated DQS baseline
+    input  wire [BYTE_LANES-1:0]    i_phy_rd_lat_extra,  // 1b per lane: read data arrives 1 CLKDIV late
+    input  wire                     i_phy_en_vtc,        // 1 = voltage-temperature compensation active
+    input  wire [5:0]               i_instruction_address, // ROM step 0-35 (init progress)
+    input  wire                     i_pause_counter,     // 1 = ROM frozen by training FSM
+    input  wire                     i_reset_done,        // 1 = init ROM completed
+    input  wire                     i_pipe_stall,        // 1 = WB pipeline stalled
+    input  wire [1:0]               i_calib_retry_count  // Training retry attempts (0-3)
 );
 
     // -----------------------------------------------------------------
@@ -99,18 +116,22 @@ module ddr4_prober #(
     // -----------------------------------------------------------------
     // The BIST engine exercises the DDR4 data path in three phases:
     //
-    //   Phase 1 - Burst:       Sequential write of the entire address
-    //                          range, then sequential read-back.
-    //   Phase 2 - Random:      Bit-reversed (scrambled) address write
-    //                          then read-back.  Forces frequent row
-    //                          precharge/activate to stress timing.
+    //   Phase 1 - Burst:       Sequential write then sequential
+    //                          read-back (streaming throughput test).
+    //   Phase 2 - Stress:      Writes then reads using stress_addr()
+    //                          mapping that distributes counter bits
+    //                          across row/bank/BG fields, forcing
+    //                          precharge/activate on nearly every
+    //                          access (timing margin stress test).
     //   Phase 3 - Alternating: Write one address, immediately read it
-    //                          back, repeat for the full range.  Tests
-    //                          tight write-to-read turnaround.
+    //                          back, repeat (tight write-to-read
+    //                          turnaround test).
     //
-    // BIST_MODE selects which phases run (0=disabled, 1=burst only,
-    // 2=all three).  BURST_END / RANDOM_END / ALT_END control how
-    // deep each phase sweeps.
+    // All three phases always run.  BIST_MODE controls the address
+    // DEPTH each phase covers: 0=disabled, 1=half-range (each phase
+    // uses half the address space), 2=full-range (each phase uses the
+    // full address space).  BURST_END / RANDOM_END / ALT_END encode
+    // the end address for each phase based on BIST_MODE.
     //
     // BIST can be triggered two ways:
     //   1. Auto-start -- on rising edge of i_calib_complete from ddr4_top
@@ -132,11 +153,9 @@ module ddr4_prober #(
                      BIST_FINISH         = 3'd6,
                      BIST_DONE           = 3'd7;
 
-    // Limit address range to 10 bits when simulating with Micron model
-    // (1024 addresses is enough to verify data path without waiting hours).
     localparam BIST_ADDR_BITS = MICRON_SIM ? 10 : WB_ADDR_BITS;
-    // Each phase covers a different slice of address space.
-    // BIST_MODE[1]=1 enables full-range; =0 reduces to half for mode 1.
+    // Phase end addresses: BIST_MODE[1]=1 (full-range) gives each phase
+    // the full counter space; =0 (half-range) halves the depth per phase.
     localparam [BIST_ADDR_BITS-1:0] BURST_END  = {{2{BIST_MODE[1]}}, {(BIST_ADDR_BITS-2){1'b1}}};
     localparam [BIST_ADDR_BITS-1:0] RANDOM_END = {1'b1, BIST_MODE[1], {(BIST_ADDR_BITS-2){1'b1}}};
     localparam [BIST_ADDR_BITS-1:0] ALT_END    = {BIST_ADDR_BITS{1'b1}};
@@ -183,12 +202,14 @@ module ddr4_prober #(
                 bist_csr_start_d <= bist_csr_start_r;
                 bist_csr_start_r <= 1'b0;
                 o_soft_reset_req <= 1'b0;
-                if (csr_we && i_wb_dbg_addr == 4'hC) begin
-                    if (i_wb_dbg_data[0])
+                if (csr_we && i_wb_dbg_addr == 4'hC) begin  // CSR register 0xC (Control)
+                    if (i_wb_dbg_data[0]) begin// CSR bit[0] = 1 triggers BIST re-start (W1S)
                         bist_csr_start_r <= 1'b1;
-                    if (i_wb_dbg_data[1])
+                    end
+                    if (i_wb_dbg_data[1]) begin// CSR bit[1] = 1 triggers soft reset (W1S)
                         o_soft_reset_req <= 1'b1;
-                    auto_reset_en <= i_wb_dbg_data[2];
+                    end
+                    auto_reset_en <= i_wb_dbg_data[2]; // CSR bit[2] = 1 enables auto-reset on BIST fail (R/W)
                 end
             end
         end
@@ -203,6 +224,7 @@ module ddr4_prober #(
         reg [BIST_ADDR_BITS-1:0] check_addr;
         reg alt_phase;
         reg last_read_scrambled;
+        reg [$clog2(WB_SEL_BITS)-1:0] write_byte_counter;
 
         // Outstanding request tracking for WB pipelining.
         // Circular buffer FIFO tracks W/R type per outstanding request.
@@ -231,8 +253,27 @@ module ddr4_prober #(
             end
         endfunction
 
-        // Bit-reversal address scramble -- forces row changes on sequential
-        // counter values, maximizing precharge/activate stress.
+        // Data-mask test pattern: returns full data word with only the byte
+        // at position byte_idx carrying the real pattern; all other bytes
+        // are filled with 0xAA (a canary value that will be caught during
+        // read-back if the data mask fails to suppress the write).
+        function [WB_DATA_BITS-1:0] dm_pattern;
+            input [BIST_ADDR_BITS-1:0] addr;
+            input [$clog2(WB_SEL_BITS)-1:0] byte_idx;
+            reg [WB_DATA_BITS-1:0] pat;
+            integer i;
+            begin
+                pat = gen_pattern(addr);
+                for (i = 0; i < WB_SEL_BITS; i = i + 1) begin
+                    if (i[$clog2(WB_SEL_BITS)-1:0] == byte_idx)
+                        dm_pattern[8*i +: 8] = pat[8*i +: 8];
+                    else
+                        dm_pattern[8*i +: 8] = 8'hAA;
+                end
+            end
+        endfunction
+
+        // Bit-reversal scramble for data pattern uniqueness.
         function [BIST_ADDR_BITS-1:0] scramble_addr;
             input [BIST_ADDR_BITS-1:0] addr;
             integer i;
@@ -240,6 +281,24 @@ module ddr4_prober #(
                 for (i = 0; i < BIST_ADDR_BITS; i = i + 1) begin
                     scramble_addr[i] = addr[BIST_ADDR_BITS-1-i];
                 end
+            end
+        endfunction
+
+        // Stress address mapping: distributes counter bits across BG, BA,
+        // row, and column fields (ADDR_MAPPING=1 layout) to force
+        // precharge/activate on nearly every access.
+        //   counter[1:0] → row[1:0]  (row changes every address)
+        //   counter[3:2] → BA        (bank changes every 4)
+        //   counter[5:4] → BG        (bank group changes every 16)
+        //   counter[9:6] → col[3:0]  (column varies)
+        function [WB_ADDR_BITS-1:0] stress_addr;
+            input [BIST_ADDR_BITS-1:0] addr;
+            begin
+                stress_addr = {WB_ADDR_BITS{1'b0}};
+                stress_addr[1:0]   = addr[5:4];
+                stress_addr[5:2]   = addr[9:6];
+                stress_addr[11:10] = addr[3:2];
+                stress_addr[13:12] = addr[1:0];
             end
         endfunction
 
@@ -264,6 +323,7 @@ module ddr4_prober #(
                 o_bist_failed_reset_req <= 1'b0;
                 alt_phase       <= 1'b0;
                 last_read_scrambled <= 1'b0;
+                write_byte_counter <= {$clog2(WB_SEL_BITS){1'b0}};
                 o_wb_cyc        <= 1'b0;
                 o_wb_stb        <= 1'b0;
                 o_wb_we         <= 1'b0;
@@ -331,29 +391,72 @@ module ddr4_prober #(
                             o_wb_we       <= 1'b1;
                             o_wb_addr     <= {WB_ADDR_BITS{1'b0}};
                             o_wb_data     <= gen_pattern({BIST_ADDR_BITS{1'b0}});
+                            o_wb_sel      <= BIST_DM_TEST ? {{(WB_SEL_BITS-1){1'b0}}, 1'b1} : {WB_SEL_BITS{1'b1}};
+                            write_byte_counter <= {$clog2(WB_SEL_BITS){1'b0}};
                             outstanding   <= 5'd0;
                         end
                     end
 
                     // -- Burst Sequential Write --
-                    // Streams writes at full WB throughput (one per cycle when
-                    // not stalled). Writes addr 0..BURST_END with deterministic
-                    // pattern, then transitions to read-back.
+                    // When BIST_DM_TEST=1, writes each byte lane individually
+                    // (one-hot o_wb_sel) with 0xAA fill on masked bytes to
+                    // stress the data-mask path. Address advances only after
+                    // all byte lanes are written. When BIST_DM_TEST=0, streams
+                    // full-word writes at full WB throughput.
                     BIST_BURST_WRITE: begin
-                        if (!i_wb_stall) begin // not stalled, so issue next write
-                            write_addr <= write_addr + 1'b1;
-                            o_wb_addr  <= write_addr + 1'b1;  // pre-compute next address
-                            o_wb_data  <= gen_pattern(write_addr + 1'b1);
-                            if (write_addr == BURST_END) begin // last write issued, so transition to read phase (notice stb is still high for this current transaction)
-                                `ifndef YOSYS
-                                    $display("[%0t] BIST W->R: outstanding=%0d", $realtime, outstanding);
-                                `endif
-                                bist_state <= BIST_BURST_READ;
-                                last_read_scrambled <= 1'b0;
-                                o_wb_we    <= 1'b0;
-                                read_addr  <= {BIST_ADDR_BITS{1'b0}};
-                                check_addr <= {BIST_ADDR_BITS{1'b0}};
-                                o_wb_addr  <= {WB_ADDR_BITS{1'b0}};
+                        if (!i_wb_stall) begin
+                            if (BIST_DM_TEST) begin
+                                // -- Per-byte-lane data-mask stress test --
+                                // Each address is written WB_SEL_BITS times (once per byte
+                                // lane). Only one byte lane is enabled per write (one-hot
+                                // o_wb_sel). Unselected bytes carry 0xAA on the bus — if
+                                // the data mask fails, 0xAA will corrupt the location and
+                                // be caught during read-back.
+                                //
+                                // Advance byte counter; set next byte's sel/data
+                                write_byte_counter <= write_byte_counter + 1'b1;
+                                // One-hot byte select shifted to the NEXT byte lane
+                                o_wb_sel <= {{(WB_SEL_BITS-1){1'b0}}, 1'b1} << (write_byte_counter + 1'b1);
+                                // Real pattern byte at active lane, 0xAA everywhere else
+                                o_wb_data <= dm_pattern(write_addr, write_byte_counter + 1'b1);
+
+                                // All byte lanes done for this address — advance to next
+                                if (write_byte_counter == {$clog2(WB_SEL_BITS){1'b1}}) begin
+                                    write_addr <= write_addr + 1'b1;
+                                    o_wb_addr  <= write_addr + 1'b1;
+                                    // Reset byte counter to lane 0 for new address
+                                    o_wb_sel  <= {{(WB_SEL_BITS-1){1'b0}}, 1'b1};
+                                    o_wb_data <= dm_pattern(write_addr + 1'b1, {$clog2(WB_SEL_BITS){1'b0}});
+                                    // Check if this was the last address
+                                    if (write_addr == BURST_END) begin
+                                        `ifndef YOSYS
+                                            $display("[%0t] BIST W->R: outstanding=%0d", $realtime, outstanding);
+                                        `endif
+                                        bist_state <= BIST_BURST_READ;
+                                        last_read_scrambled <= 1'b0;
+                                        o_wb_we    <= 1'b0;
+                                        o_wb_sel   <= {WB_SEL_BITS{1'b1}};
+                                        read_addr  <= {BIST_ADDR_BITS{1'b0}};
+                                        check_addr <= {BIST_ADDR_BITS{1'b0}};
+                                        o_wb_addr  <= {WB_ADDR_BITS{1'b0}};
+                                    end
+                                end
+                            end else begin
+                                // -- Full-word burst write (original behavior) --
+                                write_addr <= write_addr + 1'b1;
+                                o_wb_addr  <= write_addr + 1'b1;
+                                o_wb_data  <= gen_pattern(write_addr + 1'b1);
+                                if (write_addr == BURST_END) begin
+                                    `ifndef YOSYS
+                                        $display("[%0t] BIST W->R: outstanding=%0d", $realtime, outstanding);
+                                    `endif
+                                    bist_state <= BIST_BURST_READ;
+                                    last_read_scrambled <= 1'b0;
+                                    o_wb_we    <= 1'b0;
+                                    read_addr  <= {BIST_ADDR_BITS{1'b0}};
+                                    check_addr <= {BIST_ADDR_BITS{1'b0}};
+                                    o_wb_addr  <= {WB_ADDR_BITS{1'b0}};
+                                end
                             end
                         end
                     end
@@ -373,23 +476,28 @@ module ddr4_prober #(
                         end
                     end
 
-                    // -- Random-Order Write (bit-reversed addresses) --
+                    // -- Stress Write (row/bank thrashing) --
+                    // Uses stress_addr() for o_wb_addr to distribute counter
+                    // bits across row/bank/BG fields, forcing precharge/activate
+                    // on nearly every access. Data pattern still uses
+                    // scramble_addr() (bit-reversal) for unique verification.
                     BIST_RANDOM_WRITE: begin
                         if (!o_wb_stb) begin // first cycle of this phase, so start issuing writes
                             o_wb_stb <= 1'b1;
                             o_wb_we  <= 1'b1;
+                            o_wb_sel <= {WB_SEL_BITS{1'b1}}; // full-word writes for stress phase
                             if (BIST_MODE == 2) begin // full-range random write, so start at addr=0
                                 write_addr <= {BIST_ADDR_BITS{1'b0}};
-                                o_wb_addr  <= scramble_addr({BIST_ADDR_BITS{1'b0}});
+                                o_wb_addr  <= stress_addr({BIST_ADDR_BITS{1'b0}});
                                 o_wb_data  <= gen_pattern(scramble_addr({BIST_ADDR_BITS{1'b0}}));
                             end else begin // half-range random write, so start at addr=BURST_END+1
                                 write_addr <= BURST_END + 1'b1;
-                                o_wb_addr  <= scramble_addr(BURST_END + 1'b1);
+                                o_wb_addr  <= stress_addr(BURST_END + 1'b1);
                                 o_wb_data  <= gen_pattern(scramble_addr(BURST_END + 1'b1));
                             end
                         end else if (o_wb_stb && !i_wb_stall) begin // not stalled, so issue next write
                             write_addr <= write_addr + 1'b1;
-                            o_wb_addr  <= scramble_addr(write_addr + 1'b1);
+                            o_wb_addr  <= stress_addr(write_addr + 1'b1);
                             o_wb_data  <= gen_pattern(scramble_addr(write_addr + 1'b1));
                             if (write_addr == RANDOM_END) begin // last write issued, so transition to read phase (notice stb is still high for this current transaction)
                                 bist_state <= BIST_RANDOM_READ;
@@ -398,21 +506,23 @@ module ddr4_prober #(
                                 if (BIST_MODE == 2) begin // full-range random read, so start at addr=0
                                     read_addr  <= {BIST_ADDR_BITS{1'b0}};
                                     check_addr <= {BIST_ADDR_BITS{1'b0}};
-                                    o_wb_addr  <= scramble_addr({BIST_ADDR_BITS{1'b0}});
+                                    o_wb_addr  <= stress_addr({BIST_ADDR_BITS{1'b0}});
                                 end else begin // half-range random read, so start at addr=BURST_END+1
                                     read_addr  <= BURST_END + 1'b1;
                                     check_addr <= BURST_END + 1'b1;
-                                    o_wb_addr  <= scramble_addr(BURST_END + 1'b1);
+                                    o_wb_addr  <= stress_addr(BURST_END + 1'b1);
                                 end
                             end
                         end
                     end
 
-                    // -- Random-Order Read --
+                    // -- Stress Read (row/bank thrashing) --
+                    // Reads back from the same stress_addr() locations written
+                    // above; expected data derived from scramble_addr(counter).
                     BIST_RANDOM_READ: begin
                         if (!i_wb_stall && o_wb_stb) begin // not stalled, so issue next read
                             read_addr <= read_addr + 1'b1;
-                            o_wb_addr <= scramble_addr(read_addr + 1'b1);
+                            o_wb_addr <= stress_addr(read_addr + 1'b1);
                             if (read_addr == RANDOM_END) begin
                                 o_wb_stb   <= 1'b0;  // last read issued, so stop issuing reads
                                 bist_state <= BIST_ALT_WRITE_READ;
@@ -545,11 +655,34 @@ module ddr4_prober #(
 
         reg [31:0] csr_data_r;
 
+        // =============================================================
+        // CSR Register Map (read-only, 32-bit registers)
+        //
+        //  Addr  Name                 Description
+        //  ----  -------------------  -----------------------------------------
+        //  0x0   STATUS               Controller + PHY live status
+        //  0x1   BANK_STATUS          Per-bank open/idle (1 bit per bank)
+        //  0x2   TRAIN_FAIL           Per-lane training failure flags
+        //  0x3   CORRECT_COUNT        BIST correct read count
+        //  0x4   ERROR_COUNT          BIST error read count
+        //  0x5   BIST_STATUS          BIST FSM + init_done/failed
+        //  0x6   LANE0_TRAINING       Lane 0 IDELAY center, WL DQS tap, bitslip
+        //  0x7   LANE1_TRAINING       Lane 1 IDELAY center, WL DQS tap, bitslip
+        //  0x8   EYE_HEALTH           Eye width per lane, VTC, rd_lat_extra
+        //  0x9   WRITE_PATH           DQ ODELAY taps, DQS BISC baseline (lane 0)
+        //  0xA   CONFIG               Static: BIST_MODE, BYTE_LANES
+        //  0xB   VERSION              IP version (major.minor)
+        //  0xC   CONTROL              BIST start, soft reset, auto_reset_en
+        //  0xD   INIT_PROGRESS        ROM address, pause, reset_done, pipe_stall
+        //  0xE   EYE_POSITION         Eye first-pass tap, DQS BISC baseline (lane 1)
+        //  0xF   (reserved)
+        // =============================================================
         always @* begin
             case (i_wb_dbg_addr)
+                // --- 0x0: STATUS ---
                 // [3:0]=PHY FSM state, [7:4]=controller calib state,
                 // [8]=stage1 pending, [9]=stage2 pending, [10]=rsvd,
-                // [11]=stage2_we, [12]=refresh_idle, [31:13]=0
+                // [11]=stage2_we, [12]=refresh_idle
                 4'h0: csr_data_r = {19'd0,
                                     i_refresh_idle,
                                     i_stage2_we, 1'b0,
@@ -557,13 +690,23 @@ module ddr4_prober #(
                                     i_stage1_pending,
                                     i_calib_state,
                                     i_phy_state};
-                4'h1: csr_data_r = {{(32-NUM_BANKS){1'b0}}, i_bank_status}; // 1 bit per bank: 1=active, 0=idle
+                // --- 0x1: BANK_STATUS ---
+                // 1 bit per bank: 1=row active, 0=precharged
+                4'h1: csr_data_r = {{(32-NUM_BANKS){1'b0}}, i_bank_status};
+                // --- 0x2: TRAIN_FAIL ---
                 // [BL-1:0]=gate_fail, [2*BL-1:BL]=eye_fail, [3*BL-1:2*BL]=wl_fail
                 4'h2: csr_data_r = {{(32-3*BYTE_LANES){1'b0}}, i_phy_train_fail};
+                // --- 0x3: CORRECT_COUNT ---
                 4'h3: csr_data_r = correct_count;
+                // --- 0x4: ERROR_COUNT ---
                 4'h4: csr_data_r = error_count;
+                // --- 0x5: BIST_STATUS ---
+                // [2:0]=BIST FSM state, [3]=bist_busy, [4]=bist_pass,
+                // [5]=bist_fail_sticky, [6]=init_done, [7]=init_failed
                 4'h5: begin
                     csr_data_r = 32'd0;
+                    csr_data_r[6] = o_init_done;
+                    csr_data_r[7] = o_init_failed;
                     if (BIST_MODE != 0) begin
                         csr_data_r[2:0] = bist_state;
                         csr_data_r[3]   = o_bist_busy;
@@ -571,15 +714,16 @@ module ddr4_prober #(
                         csr_data_r[5]   = bist_fail_sticky;
                     end
                 end
-                // Lane 0: [3:0]=PHY state, [12:4]=IDELAY center tap,
-                //          [21:13]=WL DQS tap, [25:22]=bitslip count
+                // --- 0x6: LANE0_TRAINING ---
+                // [3:0]=PHY state, [12:4]=IDELAY center tap,
+                // [21:13]=WL DQS tap, [25:22]=bitslip count
                 4'h6: csr_data_r = {6'd0,
                                     i_phy_bitslip[3:0],
                                     i_phy_wl_tap[8:0],
                                     i_phy_idelay_center[8:0],
                                     i_phy_state};
-                // Lane 1 (same layout without phy_state): [8:0]=IDELAY,
-                //          [17:9]=WL tap, [21:18]=bitslip
+                // --- 0x7: LANE1_TRAINING ---
+                // [8:0]=IDELAY center, [17:9]=WL DQS tap, [21:18]=bitslip
                 4'h7: begin
                     csr_data_r = 32'd0;
                     if (BYTE_LANES > 1)
@@ -588,10 +732,46 @@ module ddr4_prober #(
                                       i_phy_wl_tap[17:9],
                                       i_phy_idelay_center[17:9]};
                 end
-                // [1:0]=BIST_MODE, [7:4]=BYTE_LANES — static config readback
+                // --- 0x8: EYE_HEALTH ---
+                // [8:0]=Lane 0 best_width, [17:9]=Lane 1 best_width,
+                // [19:18]=rd_lat_extra, [20]=en_vtc
+                4'h8: csr_data_r = {11'd0,
+                                    i_phy_en_vtc,
+                                    i_phy_rd_lat_extra,
+                                    i_phy_best_width[17:9],
+                                    i_phy_best_width[8:0]};
+                // --- 0x9: WRITE_PATH ---
+                // [8:0]=Lane 0 wl_dq_tap, [17:9]=Lane 1 wl_dq_tap,
+                // [26:18]=Lane 0 dqs_initial_tap
+                4'h9: csr_data_r = {5'd0,
+                                    i_phy_dqs_initial_tap[8:0],
+                                    i_phy_wl_dq_tap[17:9],
+                                    i_phy_wl_dq_tap[8:0]};
+                // --- 0xA: CONFIG ---
+                // [1:0]=BIST_MODE, [7:4]=BYTE_LANES
                 4'hA: csr_data_r = {24'd0, BYTE_LANES[3:0], 2'd0, BIST_MODE};
-                4'hB: csr_data_r = {16'd0, 8'd0, 8'd1}; // IP version: major=0, minor=1
+                // --- 0xB: VERSION ---
+                // [7:0]=minor, [15:8]=major
+                4'hB: csr_data_r = {16'd0, 8'd0, 8'd1};
+                // --- 0xC: CONTROL ---
+                // [0]=bist_start (W), [1]=soft_reset (W), [2]=auto_reset_en (RW)
                 4'hC: csr_data_r = {29'd0, auto_reset_en, 2'b00};
+                // --- 0xD: INIT_PROGRESS ---
+                // [5:0]=instruction_address, [6]=pause_counter, [7]=reset_done,
+                // [8]=pipe_stall, [10:9]=calib_retry_count
+                4'hD: csr_data_r = {21'd0,
+                                    i_calib_retry_count,
+                                    i_pipe_stall,
+                                    i_reset_done,
+                                    i_pause_counter,
+                                    i_instruction_address};
+                // --- 0xE: EYE_POSITION ---
+                // [8:0]=Lane 0 best_start, [17:9]=Lane 1 best_start,
+                // [26:18]=Lane 1 dqs_initial_tap
+                4'hE: csr_data_r = {5'd0,
+                                    i_phy_dqs_initial_tap[17:9],
+                                    i_phy_best_start[17:9],
+                                    i_phy_best_start[8:0]};
                 default: csr_data_r = 32'd0;
             endcase
         end

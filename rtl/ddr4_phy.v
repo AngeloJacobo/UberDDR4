@@ -141,7 +141,14 @@ module ddr4_phy #(
     output wire [4*BYTE_LANES-1:0]          o_phy_bitslip,
     output wire [BYTE_LANES-1:0]            o_phy_train_fail_gate,
     output wire [BYTE_LANES-1:0]            o_phy_train_fail_eye,
-    output wire [BYTE_LANES-1:0]            o_phy_train_fail_wl
+    output wire [BYTE_LANES-1:0]            o_phy_train_fail_wl,
+    // Extended training debug (CSR 0x8, 0x9, 0xE readback)
+    output wire [9*BYTE_LANES-1:0]          o_phy_best_width,       // 9b per lane: eye width in IDELAY taps
+    output wire [9*BYTE_LANES-1:0]          o_phy_best_start,       // 9b per lane: first passing IDELAY tap
+    output wire [9*BYTE_LANES-1:0]          o_phy_wl_dq_tap,        // 9b per lane: DQ ODELAYE3 tap after WL
+    output wire [9*BYTE_LANES-1:0]          o_phy_dqs_initial_tap,  // 9b per lane: BISC-calibrated DQS baseline
+    output wire [BYTE_LANES-1:0]            o_phy_rd_lat_extra,     // 1b per lane: read data arrives 1 CLKDIV late
+    output wire                             o_phy_en_vtc            // 1 = voltage-temperature compensation active
 );
 
 
@@ -531,16 +538,19 @@ module ddr4_phy #(
                 dqs_pattern = 8'b00_00_00_00; // hold low between WL strobes
         end else if (wrdata_en_any) begin
             dqs_pattern = 8'b01_01_01_01; // normal write: toggle every UI
+        end else if (wrdata_en_shift[0]) begin
+            // Write postamble: after last data beat (DQS_t LOW), drive
+            // one UI HIGH per JEDEC tWPST >= 0.33 tCK (we provide 0.5 tCK).
+            // D[0] is first transmitted → first UI on wire is HIGH.
+            dqs_pattern = 8'b00_00_00_01;
         end else begin
             dqs_pattern = 8'b00_00_00_00; // idle: pin is tri-stated
         end
     end
 
-    // WL tri-state: drive DQS only during the strobe pulse + 1 cycle
-    // after (wl_dqs_strobe_d1) to complete the rising edge on the wire.
-    reg  wl_dqs_strobe_d1;
-    wire wl_dqs_drive = wl_dqs_strobe | wl_dqs_strobe_d1;
-    wire dqs_tristate_wl = wl_active ? ~wl_dqs_drive : ~output_enable;
+    // WL tri-state: DQS held driven (T=0) for the entire WL phase per
+    // JESD79-4D §4.7.2 — controller drives DQS LOW between strobes.
+    wire dqs_tristate_wl = wl_active ? 1'b0 : ~output_enable;
 
     // EN_VTC: LOW during training so IDELAYE3/ODELAYE3 tap values can be
     // loaded without the IDELAYCTRL overwriting them. HIGH in normal operation
@@ -800,7 +810,7 @@ module ddr4_phy #(
     // PHY training FSM state registers
     reg [3:0] phy_state;
     reg [$clog2(BYTE_LANES > 1 ? BYTE_LANES : 2)-1:0] train_lane;
-    reg [2:0] phy_timer;
+    reg [3:0] phy_timer;
 
     // Eye training registers (phase-aware range tracking)
     //
@@ -831,6 +841,8 @@ module ddr4_phy #(
     reg [BYTE_LANES-1:0] rd_lat_extra; // per-lane: 1 = read data arrives 1 CLKDIV cycle late
     reg [SERDES_RATIO-1:0] rddata_en_d1; // 1-cycle delayed rddata_en for late-lane capture
     reg [8:0] eye_center_tap [BYTE_LANES-1:0]; // final center tap per lane (for debug readback)
+    reg [8:0] eye_best_width [BYTE_LANES-1:0]; // per-lane: widest eye range (IDELAY taps)
+    reg [8:0] eye_best_start [BYTE_LANES-1:0]; // per-lane: first passing tap of widest range
 
     // Write leveling registers (ODELAYE3 DQS sweep)
     reg [8:0] wl_tap        [BYTE_LANES-1:0];
@@ -964,6 +976,8 @@ module ddr4_phy #(
                 wl_prev_dq0[dfi_pack_idx]      <= 1'b0;
                 wl_seen_zero[dfi_pack_idx]     <= 1'b0;
                 dqs_initial_tap[dfi_pack_idx]  <= 9'b0;
+                eye_best_width[dfi_pack_idx]   <= 9'b0;
+                eye_best_start[dfi_pack_idx]   <= 9'b0;
             end
             phy_state           <= PHY_IDLE;
             train_lane          <= 0;
@@ -989,7 +1003,6 @@ module ddr4_phy #(
             odelay_dqs_cntvalue <= 9'b0;
             odelay_dq_cntvalue  <= 9'b0;
             wl_dqs_strobe       <= 1'b0;
-            wl_dqs_strobe_d1    <= 1'b0;
             en_vtc_q            <= 1'b1;
             vtc_settle_counter  <= 8'b0;
             gate_train_fail     <= {BYTE_LANES{1'b0}};
@@ -1003,7 +1016,6 @@ module ddr4_phy #(
                 odelay_dq_load[dfi_pack_idx]   <= 1'b0;
             end
             wl_dqs_strobe <= 1'b0;
-            wl_dqs_strobe_d1 <= wl_dqs_strobe;
 
             // Update previous ISERDESE3 outputs for bitslip window
             for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
@@ -1265,6 +1277,8 @@ module ddr4_phy #(
                             eye_center_tap[train_lane] <= best_start + (best_width >> 1);
                             bitslip_count_q[train_lane] <= best_offset;
                             rd_lat_extra[train_lane] <= best_late;
+                            eye_best_width[train_lane] <= best_width;
+                            eye_best_start[train_lane] <= best_start;
                             phy_timer <= 3'd4;
                             phy_state <= PHY_EYE_VERIFY;
                             `ifndef YOSYS
@@ -1423,7 +1437,7 @@ module ddr4_phy #(
                             phy_timer <= phy_timer - 1'b1;
                         end else if (i_dfi_wrlvl_strobe) begin // Wait for controller strobe
                             wl_dqs_strobe <= 1'b1;
-                            phy_timer <= 3'd4;
+                            phy_timer <= 3'd15; // set to maximum
                             phy_state <= PHY_WL_ADJUST;
                         end
                     end
@@ -1569,5 +1583,18 @@ module ddr4_phy #(
     assign o_phy_train_fail_gate = gate_train_fail;
     assign o_phy_train_fail_eye  = eye_train_fail;
     assign o_phy_train_fail_wl   = wl_train_fail;
+
+    // Extended training debug assigns (per-lane packing)
+    generate
+        genvar dbg_ext_lane;
+        for (dbg_ext_lane = 0; dbg_ext_lane < BYTE_LANES; dbg_ext_lane = dbg_ext_lane + 1) begin : gen_dbg_ext
+            assign o_phy_best_width[dbg_ext_lane*9 +: 9]      = eye_best_width[dbg_ext_lane];
+            assign o_phy_best_start[dbg_ext_lane*9 +: 9]      = eye_best_start[dbg_ext_lane];
+            assign o_phy_wl_dq_tap[dbg_ext_lane*9 +: 9]       = wl_dq_tap[dbg_ext_lane];
+            assign o_phy_dqs_initial_tap[dbg_ext_lane*9 +: 9]  = dqs_initial_tap[dbg_ext_lane];
+        end
+    endgenerate
+    assign o_phy_rd_lat_extra = rd_lat_extra;
+    assign o_phy_en_vtc       = en_vtc_q;
 
 endmodule
