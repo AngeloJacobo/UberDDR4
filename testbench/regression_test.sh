@@ -98,6 +98,7 @@ else
 fi
 
 total=${#TESTS[@]}
+rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR"
 
 echo ""

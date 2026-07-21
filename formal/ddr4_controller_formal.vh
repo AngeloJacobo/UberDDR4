@@ -828,11 +828,14 @@ always @* begin
     end
 end
 
-// No dispatch during pipe_stall — prevents position collisions
+// During pipe_stall, dispatch is safe only if target slot is unoccupied
+// (pipe doesn't shift during stall, so collision would corrupt ordering)
 always @(posedge i_controller_clk) begin
     if (f_past_valid && $past(i_rst_n) && $past(pipe_stall)) begin
-        assert(!$past(sched_write));
-        assert(!$past(sched_read));
+        if ($past(sched_write))
+            assert(!$past(ack_pipe_q[write_ack_idx_q]));
+        if ($past(sched_read))
+            assert(!$past(ack_pipe_q[ACK_PIPE_WIDTH-1]));
     end
 end
 

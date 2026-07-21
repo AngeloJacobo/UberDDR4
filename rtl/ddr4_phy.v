@@ -840,6 +840,7 @@ module ddr4_phy #(
     reg       verify_mode;          // 1 = PHY_EYE_LATE is doing verify check (not sweep late-check)
     reg [BYTE_LANES-1:0] rd_lat_extra; // per-lane: 1 = read data arrives 1 CLKDIV cycle late
     reg [SERDES_RATIO-1:0] rddata_en_d1; // 1-cycle delayed rddata_en for late-lane capture
+    reg [2*SERDES_RATIO-1:0] ontime_shadow [TOTAL_DQ-1:0]; // shadow reg: holds on-time lane ISERDES data for 1 cycle
     reg [8:0] eye_center_tap [BYTE_LANES-1:0]; // final center tap per lane (for debug readback)
     reg [8:0] eye_best_width [BYTE_LANES-1:0]; // per-lane: widest eye range (IDELAY taps)
     reg [8:0] eye_best_start [BYTE_LANES-1:0]; // per-lane: first passing tap of widest range
@@ -1025,17 +1026,57 @@ module ddr4_phy #(
             rddata_en_d1 <= i_dfi_rddata_en;
 
             // DFI Read Data Packing: capture aligned ISERDESE3 outputs.
-            // Per-lane gating: on-time lanes capture at rddata_en,
-            // late lanes (rd_lat_extra=1) capture at rddata_en_d1.
-            for (dfi_pack_lane = 0; dfi_pack_lane < BYTE_LANES; dfi_pack_lane = dfi_pack_lane + 1) begin
-                if (rd_lat_extra[dfi_pack_lane] ? |rddata_en_d1 : |i_dfi_rddata_en) begin
-                    for (dfi_pack_bit = 0; dfi_pack_bit < DQ_BITS; dfi_pack_bit = dfi_pack_bit + 1) begin
-                        dfi_pack_idx = dfi_pack_lane * DQ_BITS + dfi_pack_bit;
-                        for (dfi_pack_phase = 0; dfi_pack_phase < SERDES_RATIO; dfi_pack_phase = dfi_pack_phase + 1) begin
-                            o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
-                                <= aligned_dq[dfi_pack_idx][2*dfi_pack_phase];
-                            o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + TOTAL_DQ + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
-                                <= aligned_dq[dfi_pack_idx][2*dfi_pack_phase + 1];
+            // When lanes have asymmetric rd_lat_extra (some late, some on-time),
+            // on-time lanes are captured into a shadow register at rddata_en,
+            // then assembled into o_dfi_rddata at rddata_en_d1 alongside late
+            // lanes. This prevents the next read's on-time data from overwriting
+            // the current read's data during back-to-back reads.
+            if (|rd_lat_extra) begin
+                // Shadow capture: on-time lanes latch at rddata_en
+                if (|i_dfi_rddata_en) begin
+                    for (dfi_pack_lane = 0; dfi_pack_lane < BYTE_LANES; dfi_pack_lane = dfi_pack_lane + 1) begin
+                        if (!rd_lat_extra[dfi_pack_lane]) begin
+                            for (dfi_pack_bit = 0; dfi_pack_bit < DQ_BITS; dfi_pack_bit = dfi_pack_bit + 1) begin
+                                dfi_pack_idx = dfi_pack_lane * DQ_BITS + dfi_pack_bit;
+                                ontime_shadow[dfi_pack_idx] <= aligned_dq[dfi_pack_idx];
+                            end
+                        end
+                    end
+                end
+                // Final assembly at rddata_en_d1: late lanes from live aligned_dq,
+                // on-time lanes from shadow register (captured previous cycle)
+                if (|rddata_en_d1) begin
+                    for (dfi_pack_lane = 0; dfi_pack_lane < BYTE_LANES; dfi_pack_lane = dfi_pack_lane + 1) begin
+                        for (dfi_pack_bit = 0; dfi_pack_bit < DQ_BITS; dfi_pack_bit = dfi_pack_bit + 1) begin
+                            dfi_pack_idx = dfi_pack_lane * DQ_BITS + dfi_pack_bit;
+                            for (dfi_pack_phase = 0; dfi_pack_phase < SERDES_RATIO; dfi_pack_phase = dfi_pack_phase + 1) begin
+                                if (rd_lat_extra[dfi_pack_lane]) begin
+                                    o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
+                                        <= aligned_dq[dfi_pack_idx][2*dfi_pack_phase];
+                                    o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + TOTAL_DQ + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
+                                        <= aligned_dq[dfi_pack_idx][2*dfi_pack_phase + 1];
+                                end else begin
+                                    o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
+                                        <= ontime_shadow[dfi_pack_idx][2*dfi_pack_phase];
+                                    o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + TOTAL_DQ + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
+                                        <= ontime_shadow[dfi_pack_idx][2*dfi_pack_phase + 1];
+                                end
+                            end
+                        end
+                    end
+                end
+            end else begin
+                // No late lanes: direct capture at rddata_en (original path)
+                if (|i_dfi_rddata_en) begin
+                    for (dfi_pack_lane = 0; dfi_pack_lane < BYTE_LANES; dfi_pack_lane = dfi_pack_lane + 1) begin
+                        for (dfi_pack_bit = 0; dfi_pack_bit < DQ_BITS; dfi_pack_bit = dfi_pack_bit + 1) begin
+                            dfi_pack_idx = dfi_pack_lane * DQ_BITS + dfi_pack_bit;
+                            for (dfi_pack_phase = 0; dfi_pack_phase < SERDES_RATIO; dfi_pack_phase = dfi_pack_phase + 1) begin
+                                o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
+                                    <= aligned_dq[dfi_pack_idx][2*dfi_pack_phase];
+                                o_dfi_rddata[dfi_pack_phase*DFI_DATA_WIDTH + TOTAL_DQ + dfi_pack_lane*DQ_BITS + dfi_pack_bit]
+                                    <= aligned_dq[dfi_pack_idx][2*dfi_pack_phase + 1];
+                            end
                         end
                     end
                 end

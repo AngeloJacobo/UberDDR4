@@ -50,6 +50,7 @@ RTL_AXI=(rtl/axi/ddr4_top_axi.v rtl/axi/axim2wbsp.v rtl/axi/aximrd2wbsp.v
          rtl/axi/aximwr2wbsp.v rtl/axi/axi_addr.v rtl/axi/skidbuffer.v
          rtl/axi/sfifo.v rtl/axi/wbarbiter.v)
 LOGDIR="build_logs"
+rm -rf "$LOGDIR"
 
 SIM_TESTS=(
     baseline flyby_50 flyby_100 flyby_200 flyby_300 flyby_400
@@ -345,6 +346,7 @@ run_formal() {
     fi
     header "$STAGE" "$TOTAL" "$label"
 
+    rm -rf formal/ddr4_*/
     mkdir -p "$LOGDIR"
     local log t0 t1
     log="$LOGDIR/formal.log"

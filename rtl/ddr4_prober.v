@@ -127,11 +127,14 @@ module ddr4_prober #(
     //                          back, repeat (tight write-to-read
     //                          turnaround test).
     //
-    // All three phases always run.  BIST_MODE controls the address
-    // DEPTH each phase covers: 0=disabled, 1=half-range (each phase
-    // uses half the address space), 2=full-range (each phase uses the
-    // full address space).  BURST_END / RANDOM_END / ALT_END encode
-    // the end address for each phase based on BIST_MODE.
+    // All three phases always run.  BIST_MODE controls addressing:
+    //   0 = disabled (BIST does not run)
+    //   1 = partitioned: phases cover contiguous, non-overlapping
+    //       slices that together span the full BIST address range
+    //       (burst: 0→BURST_END, random: BURST_END+1→RANDOM_END,
+    //        alt: RANDOM_END+1→ALT_END)
+    //   2 = full-range: every phase independently covers the entire
+    //       address space starting from 0
     //
     // BIST can be triggered two ways:
     //   1. Auto-start -- on rising edge of i_calib_complete from ddr4_top
@@ -154,8 +157,9 @@ module ddr4_prober #(
                      BIST_DONE           = 3'd7;
 
     localparam BIST_ADDR_BITS = MICRON_SIM ? 10 : WB_ADDR_BITS;
-    // Phase end addresses: BIST_MODE[1]=1 (full-range) gives each phase
-    // the full counter space; =0 (half-range) halves the depth per phase.
+    // Phase end addresses:
+    //   Mode 1: partitioned — burst gets 1/4, random gets 1/2, alt gets 1/4
+    //   Mode 2: full-range  — all three END values equal the max address
     localparam [BIST_ADDR_BITS-1:0] BURST_END  = {{2{BIST_MODE[1]}}, {(BIST_ADDR_BITS-2){1'b1}}};
     localparam [BIST_ADDR_BITS-1:0] RANDOM_END = {1'b1, BIST_MODE[1], {(BIST_ADDR_BITS-2){1'b1}}};
     localparam [BIST_ADDR_BITS-1:0] ALT_END    = {BIST_ADDR_BITS{1'b1}};
@@ -486,11 +490,11 @@ module ddr4_prober #(
                             o_wb_stb <= 1'b1;
                             o_wb_we  <= 1'b1;
                             o_wb_sel <= {WB_SEL_BITS{1'b1}}; // full-word writes for stress phase
-                            if (BIST_MODE == 2) begin // full-range random write, so start at addr=0
+                            if (BIST_MODE == 2) begin // full-range: restart at addr=0
                                 write_addr <= {BIST_ADDR_BITS{1'b0}};
                                 o_wb_addr  <= stress_addr({BIST_ADDR_BITS{1'b0}});
                                 o_wb_data  <= gen_pattern(scramble_addr({BIST_ADDR_BITS{1'b0}}));
-                            end else begin // half-range random write, so start at addr=BURST_END+1
+                            end else begin // partitioned: continue from BURST_END+1
                                 write_addr <= BURST_END + 1'b1;
                                 o_wb_addr  <= stress_addr(BURST_END + 1'b1);
                                 o_wb_data  <= gen_pattern(scramble_addr(BURST_END + 1'b1));
@@ -503,11 +507,11 @@ module ddr4_prober #(
                                 bist_state <= BIST_RANDOM_READ;
                                 last_read_scrambled <= 1'b1;
                                 o_wb_we <= 1'b0;
-                                if (BIST_MODE == 2) begin // full-range random read, so start at addr=0
+                                if (BIST_MODE == 2) begin // full-range: restart read at addr=0
                                     read_addr  <= {BIST_ADDR_BITS{1'b0}};
                                     check_addr <= {BIST_ADDR_BITS{1'b0}};
                                     o_wb_addr  <= stress_addr({BIST_ADDR_BITS{1'b0}});
-                                end else begin // half-range random read, so start at addr=BURST_END+1
+                                end else begin // partitioned: read back from BURST_END+1
                                     read_addr  <= BURST_END + 1'b1;
                                     check_addr <= BURST_END + 1'b1;
                                     o_wb_addr  <= stress_addr(BURST_END + 1'b1);
@@ -539,13 +543,20 @@ module ddr4_prober #(
                         if (!o_wb_stb) begin
                             if (outstanding == 0) begin // all prior-phase ACKs drained, so start issuing alternating W/R
                                 last_read_scrambled <= 1'b0;
-                                write_addr <= {BIST_ADDR_BITS{1'b0}};
-                                check_addr <= {BIST_ADDR_BITS{1'b0}};
+                                alt_phase <= 1'b0;
                                 o_wb_stb  <= 1'b1;
                                 o_wb_we   <= 1'b1;
-                                o_wb_addr <= {WB_ADDR_BITS{1'b0}};
-                                o_wb_data <= gen_pattern({BIST_ADDR_BITS{1'b0}});
-                                alt_phase <= 1'b0;
+                                if (BIST_MODE == 2) begin
+                                    write_addr <= {BIST_ADDR_BITS{1'b0}};
+                                    check_addr <= {BIST_ADDR_BITS{1'b0}};
+                                    o_wb_addr  <= {WB_ADDR_BITS{1'b0}};
+                                    o_wb_data  <= gen_pattern({BIST_ADDR_BITS{1'b0}});
+                                end else begin
+                                    write_addr <= RANDOM_END + 1'b1;
+                                    check_addr <= RANDOM_END + 1'b1;
+                                    o_wb_addr  <= {{(WB_ADDR_BITS-BIST_ADDR_BITS){1'b0}}, RANDOM_END + 1'b1};
+                                    o_wb_data  <= gen_pattern(RANDOM_END + 1'b1);
+                                end
                             end
                         end else if (!i_wb_stall) begin // not stalled, so issue next W/R
                             if (!alt_phase) begin // current phase is write, so next is read
@@ -625,19 +636,22 @@ module ddr4_prober #(
     // WB B4 pipelined, zero-wait-state: STALL=0 always, registered ACK
     // with 1-cycle latency. CSR write enable derived internally.
     //
-    // CSR Map:
-    //   0x0 -- Controller + PHY state summary
-    //   0x1 -- Per-bank active/idle status
-    //   0x2 -- Training failure status {wl[BL-1:0], eye[BL-1:0], gate[BL-1:0]}
-    //   0x3 -- BIST correct count
-    //   0x4 -- BIST error count
-    //   0x5 -- BIST FSM state + pass/fail flags
-    //   0x6 -- PHY lane 0: IDELAY center, write-leveling tap, bitslip
-    //   0x7 -- PHY lane 1 (same fields, if BYTE_LANES > 1)
-    //   0xA -- Configuration readback (BYTE_LANES, BIST_MODE)
-    //   0xB -- IP version (currently 1.0)
-    //   0xC -- Control: bit[0] BIST re-start (W1S), bit[1] soft reset (W1S),
-    //                   bit[2] auto-reset on BIST fail enable (R/W, default 0)
+    // CSR Map (see also the register table in the always @* block below):
+    //   0x0 -- STATUS:        Controller + PHY state summary
+    //   0x1 -- BANK_STATUS:   Per-bank active/idle (1 bit per bank)
+    //   0x2 -- TRAIN_FAIL:    Training failure flags + calib retry count
+    //   0x3 -- CORRECT_COUNT: BIST correct read count
+    //   0x4 -- ERROR_COUNT:   BIST error read count
+    //   0x5 -- BIST_STATUS:   BIST FSM state, busy, pass, fail, init_done/failed
+    //   0x6 -- LANE0_TRAINING: IDELAY center, WL DQS tap, bitslip, best_start
+    //   0x7 -- LANE1_TRAINING: Same fields (if BYTE_LANES > 1)
+    //   0x8 -- EYE_HEALTH:    Eye width per lane, rd_lat_extra, en_vtc
+    //   0x9 -- WRITE_PATH:    DQ ODELAY taps, DQS BISC baselines (both lanes)
+    //   0xA -- CONFIG:        Static readback (BYTE_LANES, BIST_MODE)
+    //   0xB -- VERSION:       IP version (major.minor, currently 0.1)
+    //   0xC -- CONTROL:       bit[0] BIST start (W1S), bit[1] soft reset (W1S),
+    //                         bit[2] auto-reset on BIST fail (R/W, default 0)
+    //   0xD -- INIT_PROGRESS: ROM step, pause, reset_done, pipe_stall
     //
     generate if (DEBUG_CSR_ENABLE) begin : gen_csr
 
@@ -655,28 +669,6 @@ module ddr4_prober #(
 
         reg [31:0] csr_data_r;
 
-        // =============================================================
-        // CSR Register Map (read-only, 32-bit registers)
-        //
-        //  Addr  Name                 Description
-        //  ----  -------------------  -----------------------------------------
-        //  0x0   STATUS               Controller + PHY live status
-        //  0x1   BANK_STATUS          Per-bank open/idle (1 bit per bank)
-        //  0x2   TRAIN_FAIL           Per-lane training failure flags
-        //  0x3   CORRECT_COUNT        BIST correct read count
-        //  0x4   ERROR_COUNT          BIST error read count
-        //  0x5   BIST_STATUS          BIST FSM + init_done/failed
-        //  0x6   LANE0_TRAINING       Lane 0 IDELAY center, WL DQS tap, bitslip
-        //  0x7   LANE1_TRAINING       Lane 1 IDELAY center, WL DQS tap, bitslip
-        //  0x8   EYE_HEALTH           Eye width per lane, VTC, rd_lat_extra
-        //  0x9   WRITE_PATH           DQ ODELAY taps, DQS BISC baseline (lane 0)
-        //  0xA   CONFIG               Static: BIST_MODE, BYTE_LANES
-        //  0xB   VERSION              IP version (major.minor)
-        //  0xC   CONTROL              BIST start, soft reset, auto_reset_en
-        //  0xD   INIT_PROGRESS        ROM address, pause, reset_done, pipe_stall
-        //  0xE   EYE_POSITION         Eye first-pass tap, DQS BISC baseline (lane 1)
-        //  0xF   (reserved)
-        // =============================================================
         always @* begin
             case (i_wb_dbg_addr)
                 // --- 0x0: STATUS ---
@@ -694,8 +686,11 @@ module ddr4_prober #(
                 // 1 bit per bank: 1=row active, 0=precharged
                 4'h1: csr_data_r = {{(32-NUM_BANKS){1'b0}}, i_bank_status};
                 // --- 0x2: TRAIN_FAIL ---
-                // [BL-1:0]=gate_fail, [2*BL-1:BL]=eye_fail, [3*BL-1:2*BL]=wl_fail
-                4'h2: csr_data_r = {{(32-3*BYTE_LANES){1'b0}}, i_phy_train_fail};
+                // [BL-1:0]=gate_fail, [2*BL-1:BL]=eye_fail,
+                // [3*BL-1:2*BL]=wl_fail, [3*BL+1:3*BL]=calib_retry_count
+                4'h2: csr_data_r = {{(32-3*BYTE_LANES-2){1'b0}},
+                                    i_calib_retry_count,
+                                    i_phy_train_fail};
                 // --- 0x3: CORRECT_COUNT ---
                 4'h3: csr_data_r = correct_count;
                 // --- 0x4: ERROR_COUNT ---
@@ -715,19 +710,21 @@ module ddr4_prober #(
                     end
                 end
                 // --- 0x6: LANE0_TRAINING ---
-                // [3:0]=PHY state, [12:4]=IDELAY center tap,
-                // [21:13]=WL DQS tap, [25:22]=bitslip count
-                4'h6: csr_data_r = {6'd0,
+                // [8:0]=IDELAY center, [17:9]=WL DQS tap,
+                // [21:18]=bitslip, [30:22]=best_start
+                4'h6: csr_data_r = {1'd0,
+                                    i_phy_best_start[8:0],
                                     i_phy_bitslip[3:0],
                                     i_phy_wl_tap[8:0],
-                                    i_phy_idelay_center[8:0],
-                                    i_phy_state};
+                                    i_phy_idelay_center[8:0]};
                 // --- 0x7: LANE1_TRAINING ---
-                // [8:0]=IDELAY center, [17:9]=WL DQS tap, [21:18]=bitslip
+                // [8:0]=IDELAY center, [17:9]=WL DQS tap,
+                // [21:18]=bitslip, [30:22]=best_start
                 4'h7: begin
                     csr_data_r = 32'd0;
                     if (BYTE_LANES > 1)
-                        csr_data_r = {10'd0,
+                        csr_data_r = {1'd0,
+                                      i_phy_best_start[17:9],
                                       i_phy_bitslip[7:4],
                                       i_phy_wl_tap[17:9],
                                       i_phy_idelay_center[17:9]};
@@ -741,12 +738,12 @@ module ddr4_prober #(
                                     i_phy_best_width[17:9],
                                     i_phy_best_width[8:0]};
                 // --- 0x9: WRITE_PATH ---
-                // [8:0]=Lane 0 wl_dq_tap, [17:9]=Lane 1 wl_dq_tap,
-                // [26:18]=Lane 0 dqs_initial_tap
-                4'h9: csr_data_r = {5'd0,
-                                    i_phy_dqs_initial_tap[8:0],
-                                    i_phy_wl_dq_tap[17:9],
-                                    i_phy_wl_dq_tap[8:0]};
+                // [7:0]=Lane 0 wl_dq_tap, [15:8]=Lane 1 wl_dq_tap,
+                // [23:16]=Lane 0 dqs_initial_tap, [31:24]=Lane 1 dqs_initial_tap
+                4'h9: csr_data_r = {i_phy_dqs_initial_tap[16:9],
+                                    i_phy_dqs_initial_tap[7:0],
+                                    i_phy_wl_dq_tap[16:9],
+                                    i_phy_wl_dq_tap[7:0]};
                 // --- 0xA: CONFIG ---
                 // [1:0]=BIST_MODE, [7:4]=BYTE_LANES
                 4'hA: csr_data_r = {24'd0, BYTE_LANES[3:0], 2'd0, BIST_MODE};
@@ -757,21 +754,13 @@ module ddr4_prober #(
                 // [0]=bist_start (W), [1]=soft_reset (W), [2]=auto_reset_en (RW)
                 4'hC: csr_data_r = {29'd0, auto_reset_en, 2'b00};
                 // --- 0xD: INIT_PROGRESS ---
-                // [5:0]=instruction_address, [6]=pause_counter, [7]=reset_done,
-                // [8]=pipe_stall, [10:9]=calib_retry_count
-                4'hD: csr_data_r = {21'd0,
-                                    i_calib_retry_count,
+                // [5:0]=instruction_address, [6]=pause_counter,
+                // [7]=reset_done, [8]=pipe_stall
+                4'hD: csr_data_r = {23'd0,
                                     i_pipe_stall,
                                     i_reset_done,
                                     i_pause_counter,
                                     i_instruction_address};
-                // --- 0xE: EYE_POSITION ---
-                // [8:0]=Lane 0 best_start, [17:9]=Lane 1 best_start,
-                // [26:18]=Lane 1 dqs_initial_tap
-                4'hE: csr_data_r = {5'd0,
-                                    i_phy_dqs_initial_tap[17:9],
-                                    i_phy_best_start[17:9],
-                                    i_phy_best_start[8:0]};
                 default: csr_data_r = 32'd0;
             endcase
         end

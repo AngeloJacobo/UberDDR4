@@ -1313,7 +1313,7 @@ module ddr4_sim_top;
             $finish;
         end
     `endif
-
+    `define SIM_CSR_RESET_TEST
     `ifdef SIM_CSR_RESET_TEST
         // =============================================================
         // CSR 0xC Reset Test — exercises soft reset, auto-reset, BIST restart
@@ -2617,12 +2617,85 @@ module ddr4_sim_top;
             $display("[%0t] FAIL: rd_err=%0d bist_err=%0d",
                      $realtime, rd_err_count, bist_error_int);
         $display("[%0t] ===============================================", $realtime);
+
+        // --- CSR Register Dump ---
+        $display("[%0t] === CSR Register Dump ===", $realtime);
+        begin
+            reg [31:0] csr [0:13];
+            integer ci;
+            for (ci = 0; ci <= 13; ci = ci + 1) begin
+                wb_dbg_read(ci[3:0]);
+                csr[ci] = wb_dbg_rdata;
+            end
+            wb_dbg_idle;
+
+            // 0x0: STATUS
+            $display("[%0t]   PHY FSM State        : %0d", $realtime, csr[0][3:0]);
+            $display("[%0t]   Calib State          : %0d", $realtime, csr[0][7:4]);
+            $display("[%0t]   Stage1 Pending       : %0b", $realtime, csr[0][8]);
+            $display("[%0t]   Stage2 Pending       : %0b", $realtime, csr[0][9]);
+            $display("[%0t]   Stage2 WE            : %0b", $realtime, csr[0][11]);
+            $display("[%0t]   Refresh Idle         : %0b", $realtime, csr[0][12]);
+            // 0x1: BANK_STATUS
+            $display("[%0t]   Bank Status          : %016b", $realtime, csr[1][15:0]);
+            // 0x2: TRAIN_FAIL
+            $display("[%0t]   Train Fail (gate)    : %0b", $realtime, csr[2][BYTE_LANES-1:0]);
+            $display("[%0t]   Train Fail (eye)     : %0b", $realtime, csr[2][2*BYTE_LANES-1:BYTE_LANES]);
+            $display("[%0t]   Train Fail (wl)      : %0b", $realtime, csr[2][3*BYTE_LANES-1:2*BYTE_LANES]);
+            $display("[%0t]   Calib Retry Count    : %0d", $realtime, csr[2][3*BYTE_LANES+1:3*BYTE_LANES]);
+            // 0x3/0x4: BIST counts
+            $display("[%0t]   BIST Correct Count   : %0d", $realtime, csr[3]);
+            $display("[%0t]   BIST Error Count     : %0d", $realtime, csr[4]);
+            // 0x5: BIST_STATUS
+            $display("[%0t]   BIST FSM State       : %0d", $realtime, csr[5][2:0]);
+            $display("[%0t]   BIST Busy            : %0b", $realtime, csr[5][3]);
+            $display("[%0t]   BIST Pass            : %0b", $realtime, csr[5][4]);
+            $display("[%0t]   BIST Fail Sticky     : %0b", $realtime, csr[5][5]);
+            $display("[%0t]   Init Done            : %0b", $realtime, csr[5][6]);
+            $display("[%0t]   Init Failed          : %0b", $realtime, csr[5][7]);
+            // 0x6: LANE0_TRAINING
+            $display("[%0t]   Lane 0 IDELAY Center : %0d", $realtime, csr[6][8:0]);
+            $display("[%0t]   Lane 0 WL DQS Tap    : %0d", $realtime, csr[6][17:9]);
+            $display("[%0t]   Lane 0 Bitslip       : %0d", $realtime, csr[6][21:18]);
+            $display("[%0t]   Lane 0 Eye Start     : %0d", $realtime, csr[6][30:22]);
+            // 0x7: LANE1_TRAINING
+            if (BYTE_LANES > 1) begin
+                $display("[%0t]   Lane 1 IDELAY Center : %0d", $realtime, csr[7][8:0]);
+                $display("[%0t]   Lane 1 WL DQS Tap    : %0d", $realtime, csr[7][17:9]);
+                $display("[%0t]   Lane 1 Bitslip       : %0d", $realtime, csr[7][21:18]);
+                $display("[%0t]   Lane 1 Eye Start     : %0d", $realtime, csr[7][30:22]);
+            end
+            // 0x8: EYE_HEALTH
+            $display("[%0t]   Lane 0 Eye Width     : %0d", $realtime, csr[8][8:0]);
+            $display("[%0t]   Lane 1 Eye Width     : %0d", $realtime, csr[8][17:9]);
+            $display("[%0t]   Rd Lat Extra         : %02b", $realtime, csr[8][19:18]);
+            $display("[%0t]   EN_VTC               : %0b", $realtime, csr[8][20]);
+            // 0x9: WRITE_PATH
+            $display("[%0t]   Lane 0 WL DQ Tap     : %0d", $realtime, csr[9][7:0]);
+            $display("[%0t]   Lane 1 WL DQ Tap     : %0d", $realtime, csr[9][15:8]);
+            $display("[%0t]   Lane 0 DQS Init Tap  : %0d", $realtime, csr[9][23:16]);
+            $display("[%0t]   Lane 1 DQS Init Tap  : %0d", $realtime, csr[9][31:24]);
+            // 0xA: CONFIG
+            $display("[%0t]   BIST_MODE            : %0d", $realtime, csr[10][1:0]);
+            $display("[%0t]   BYTE_LANES           : %0d", $realtime, csr[10][7:4]);
+            // 0xB: VERSION
+            $display("[%0t]   IP Version           : %0d.%0d", $realtime, csr[11][15:8], csr[11][7:0]);
+            // 0xC: CONTROL
+            $display("[%0t]   Auto Reset Enable    : %0b", $realtime, csr[12][2]);
+            // 0xD: INIT_PROGRESS
+            $display("[%0t]   ROM Instruction Addr : %0d", $realtime, csr[13][5:0]);
+            $display("[%0t]   Pause Counter        : %0b", $realtime, csr[13][6]);
+            $display("[%0t]   Reset Done           : %0b", $realtime, csr[13][7]);
+            $display("[%0t]   Pipe Stall           : %0b", $realtime, csr[13][8]);
+        end
+        $display("[%0t] === End CSR Dump ===", $realtime);
+
         $finish;
     end
 
     initial begin
-        #500_000_000;
-        $display("[%0t] TIMEOUT: simulation did not complete within 500 us", $realtime);
+        #1_000_000_000;
+        $display("[%0t] TIMEOUT: simulation did not complete within 1 ms", $realtime);
         $finish;
     end
 
