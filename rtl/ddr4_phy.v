@@ -65,7 +65,6 @@ module ddr4_phy #(
     //   8  = x8  (1 chip per byte lane, DM enabled, BG_BITS=2)
     //   16 = x16 (1 chip = 2 byte lanes, DM enabled, BG_BITS=1)
               DEVICE_WIDTH = 8,
-              ROW_BITS = 16,
     // Number of 8-bit byte lanes (typically 2 for x8, 2 for x16, 2+ for x4)
               BYTE_LANES = 2,
     // Derived from DEVICE_WIDTH -- do not override
@@ -73,8 +72,7 @@ module ddr4_phy #(
               BG_BITS = (DEVICE_WIDTH == 16) ? 1 : 2, //JESD79-4D Table 4
               DQ_BITS = 8,      //always 8 (byte-lane granularity)
     parameter SERDES_RATIO = 4,
-              DFI_DATA_WIDTH = 2 * DQ_BITS * BYTE_LANES, //per DFI phase
-              NUM_BG = (1 << BG_BITS)
+              DFI_DATA_WIDTH = 2 * DQ_BITS * BYTE_LANES //per DFI phase
 ) (
     // Clocks and reset
     input wire                              i_controller_clk,
@@ -82,7 +80,9 @@ module ddr4_phy #(
     input wire                              i_ref_clk,
     input wire                              i_rst_n,
     // DFI 3.1 Control (SERDES_RATIO phases, packed flat)
+    /* verilator lint_off UNUSEDSIGNAL */
     input wire [SERDES_RATIO*17-1:0]        i_dfi_address,
+    /* verilator lint_on UNUSEDSIGNAL */
     input wire [SERDES_RATIO*BA_BITS-1:0]   i_dfi_bank,
     input wire [SERDES_RATIO*BG_BITS-1:0]   i_dfi_bg,
     input wire [SERDES_RATIO-1:0]           i_dfi_cs_n,
@@ -102,15 +102,19 @@ module ddr4_phy #(
     output reg [SERDES_RATIO-1:0]           o_dfi_rddata_valid,
     input wire [SERDES_RATIO-1:0]           i_dfi_rddata_en,
     // DFI Status
+    /* verilator lint_off UNUSEDSIGNAL */
     input wire                              i_dfi_init_start,
+    /* verilator lint_on UNUSEDSIGNAL */
     output wire                             o_dfi_init_complete,
     // DFI Training (MC -> PHY)
     input wire                              i_dfi_rdlvl_en,
     input wire                              i_dfi_rdlvl_gate_en,
     input wire                              i_dfi_wrlvl_en,
     input wire                              i_dfi_wrlvl_strobe,
+    /* verilator lint_off UNUSEDSIGNAL */
     input wire [SERDES_RATIO-1:0]           i_dfi_lvl_pattern,
     input wire                              i_dfi_lvl_periodic,
+    /* verilator lint_on UNUSEDSIGNAL */
     // DFI Training (PHY -> MC)
     output reg [BYTE_LANES-1:0]             o_dfi_rdlvl_resp,
     output reg [BYTE_LANES-1:0]             o_dfi_wrlvl_resp,
@@ -132,8 +136,6 @@ module ddr4_phy #(
     inout  wire [DQ_BITS*BYTE_LANES-1:0]    io_ddr4_dq,
     inout  wire [BYTE_LANES-1:0]            io_ddr4_dqs_p,
     inout  wire [BYTE_LANES-1:0]            io_ddr4_dqs_n,
-    // Status
-    output wire                             o_idelayctrl_rdy,
     // Debug status (flat packed for synthesis)
     output wire [3:0]                       o_phy_state,
     output wire [9*BYTE_LANES-1:0]          o_phy_idelay_center,
@@ -231,8 +233,12 @@ module ddr4_phy #(
     //   sync_rst deasserts before releasing IDELAYCTRL (ordering).
     //
     // -----------------------------------------------------------------
-    localparam IODELAY_RST_DELAY = (52_000 / CONTROLLER_CLK_PERIOD) + 2;
-    localparam IDELAYCTRL_RST_EXTRA = 4;
+    localparam integer IODELAY_RST_DELAY = (52_000 / CONTROLLER_CLK_PERIOD) + 2;
+    localparam integer IDELAYCTRL_RST_EXTRA = 4;
+    /* verilator lint_off WIDTHTRUNC */
+    localparam [$clog2(IODELAY_RST_DELAY + IDELAYCTRL_RST_EXTRA + 1):0] RST_RELEASE_SERDES = IODELAY_RST_DELAY;
+    localparam [$clog2(IODELAY_RST_DELAY + IDELAYCTRL_RST_EXTRA + 1):0] RST_RELEASE_CTRL   = IODELAY_RST_DELAY + IDELAYCTRL_RST_EXTRA;
+    /* verilator lint_on WIDTHTRUNC */
 
     reg [$clog2(IODELAY_RST_DELAY + IDELAYCTRL_RST_EXTRA + 1):0] rst_cnt;
     reg sync_rst;
@@ -250,12 +256,12 @@ module ddr4_phy #(
             end
 
             // Step 2c: release SERDES/IDELAY/ODELAY reset after IODELAY_RST_DELAY
-            if (rst_cnt == IODELAY_RST_DELAY) begin 
+            if (rst_cnt == RST_RELEASE_SERDES) begin
                 sync_rst <= 1'b0;
             end
 
             // Step 2d: release IDELAYCTRL reset AFTER sync_rst (extra margin)
-            if (rst_cnt == IODELAY_RST_DELAY + IDELAYCTRL_RST_EXTRA) begin
+            if (rst_cnt == RST_RELEASE_CTRL) begin
                 idelayctrl_rst <= 1'b0;
             end
         end
@@ -272,7 +278,6 @@ module ddr4_phy #(
     // dfi_init_complete: asserted when IDELAYCTRL is ready
     wire idelayctrl_rdy_w;
     assign o_dfi_init_complete = idelayctrl_rdy_w;
-    assign o_idelayctrl_rdy   = idelayctrl_rdy_w;
 
     // -----------------------------------------------------------------
     // Clock Output Path
@@ -281,6 +286,7 @@ module ddr4_phy #(
     // -----------------------------------------------------------------
     wire ck_oserdes_out;
 
+    /* verilator lint_off PINCONNECTEMPTY */
     OSERDESE3 #(
         .DATA_WIDTH(8),
         .INIT(1'b0),
@@ -672,7 +678,8 @@ module ddr4_phy #(
                     .CLKDIV(i_controller_clk),
                     .D(idelay_dq_out), .Q(iserdes_dq_q[DQ_IDX]),
                     .RST(sync_rst),
-                    .FIFO_RD_CLK(1'b0), .FIFO_RD_EN(1'b0), .FIFO_EMPTY()
+                    .FIFO_RD_CLK(1'b0), .FIFO_RD_EN(1'b0), .FIFO_EMPTY(),
+                    .INTERNAL_DIVCLK()
                 );
             end
         end
@@ -790,6 +797,7 @@ module ddr4_phy #(
             assign o_ddr4_dm_n = {BYTE_LANES{1'b1}};
         end
     endgenerate
+    /* verilator lint_on PINCONNECTEMPTY */
 
     // -----------------------------------------------------------------
     // Fabric Bitslip Barrel Shifter
@@ -848,7 +856,7 @@ module ddr4_phy #(
     // Write leveling registers (ODELAYE3 DQS sweep)
     reg [8:0] wl_tap        [BYTE_LANES-1:0];
     reg [8:0] wl_dq_tap     [BYTE_LANES-1:0];
-    reg       wl_prev_dq0   [BYTE_LANES-1:0];  // previous DQ sample (for debug display)
+
     reg       wl_seen_zero  [BYTE_LANES-1:0];  // 1 = have observed DQ=0; enables 0→1 detection
     reg [8:0] dqs_initial_tap [BYTE_LANES-1:0];
     reg [7:0] vtc_settle_counter;
@@ -974,7 +982,6 @@ module ddr4_phy #(
                 odelay_dq_load[dfi_pack_idx]   <= 1'b0;
                 wl_tap[dfi_pack_idx]           <= 9'b0;
                 wl_dq_tap[dfi_pack_idx]        <= 9'b0;
-                wl_prev_dq0[dfi_pack_idx]      <= 1'b0;
                 wl_seen_zero[dfi_pack_idx]     <= 1'b0;
                 dqs_initial_tap[dfi_pack_idx]  <= 9'b0;
                 eye_best_width[dfi_pack_idx]   <= 9'b0;
@@ -982,7 +989,7 @@ module ddr4_phy #(
             end
             phy_state           <= PHY_IDLE;
             train_lane          <= 0;
-            phy_timer           <= 3'b0;
+            phy_timer           <= 4'b0;
             idelay_cntvalue     <= 9'b0;
             sweep_tap           <= 9'b0;
             cur_start           <= 9'b0;
@@ -1141,7 +1148,7 @@ module ddr4_phy #(
                             cur_late <= 1'b0;
                             best_late <= 1'b0;
                             verify_mode <= 1'b0;
-                            phy_timer <= 3'd4;
+                            phy_timer <= 4'd4;
                             phy_state <= PHY_EYE_SWEEP;
                         end else if (i_dfi_wrlvl_en) begin // Write leveling starts on wrlvl_en
                             en_vtc_q <= 1'b0;
@@ -1159,10 +1166,9 @@ module ddr4_phy #(
                                 dqs_initial_tap[dfi_pack_idx] <= odelay_dqs_cntvalueout[dfi_pack_idx];
                                 wl_tap[dfi_pack_idx]    <= odelay_dqs_cntvalueout[dfi_pack_idx];
                                 wl_dq_tap[dfi_pack_idx] <= 9'd0;
-                                wl_prev_dq0[dfi_pack_idx] <= 1'b0;
                                 wl_seen_zero[dfi_pack_idx] <= 1'b0;
                             end
-                            phy_timer <= 3'd4;
+                            phy_timer <= 4'd4;
                             phy_state <= PHY_WL_SAMPLE;
                         end
                     end
@@ -1189,7 +1195,7 @@ module ddr4_phy #(
                     // actively driving MPR data in response to a controller READ.
                     PHY_EYE_SWEEP: begin
                         if (phy_timer != 0) begin
-                            if (phy_timer == 3'd3)
+                            if (phy_timer == 4'd3)
                                 idelay_load_lane[train_lane] <= 1'b1;
                             phy_timer <= phy_timer - 1'b1;
                         end else if (|i_dfi_rddata_en) begin
@@ -1266,7 +1272,7 @@ module ddr4_phy #(
                         end else begin
                             sweep_tap <= sweep_tap + {5'd0, TAP_SWEEP_STEP};
                             idelay_cntvalue <= sweep_tap + {5'd0, TAP_SWEEP_STEP};
-                            phy_timer <= 3'd4;
+                            phy_timer <= 4'd4;
                             phy_state <= PHY_EYE_SWEEP;
                         end
                     end
@@ -1293,7 +1299,9 @@ module ddr4_phy #(
                             `ifndef YOSYS
                                 $display("[%0t] PHY eye: lane %0d no valid range found", $realtime, train_lane);
                             `endif
+                            /* verilator lint_off WIDTHEXPAND */
                             if (train_lane < BYTE_LANES - 1) begin
+                            /* verilator lint_on WIDTHEXPAND */
                                 train_lane <= train_lane + 1'b1;
                                 sweep_tap <= 9'd0;
                                 idelay_cntvalue <= 9'd0;
@@ -1303,7 +1311,7 @@ module ddr4_phy #(
                                 cur_width <= 9'd0;
                                 cur_late <= 1'b0;
                                 best_late <= 1'b0;
-                                phy_timer <= 3'd4;
+                                phy_timer <= 4'd4;
                                 phy_state <= PHY_EYE_SWEEP;
                             end else begin
                                 phy_state <= PHY_EYE_DONE;
@@ -1320,7 +1328,7 @@ module ddr4_phy #(
                             rd_lat_extra[train_lane] <= best_late;
                             eye_best_width[train_lane] <= best_width;
                             eye_best_start[train_lane] <= best_start;
-                            phy_timer <= 3'd4;
+                            phy_timer <= 4'd4;
                             phy_state <= PHY_EYE_VERIFY;
                             `ifndef YOSYS
                                 $display("[%0t] PHY eye: lane %0d best_start=%0d width=%0d center=%0d offset=%0d late=%0d",
@@ -1340,7 +1348,7 @@ module ddr4_phy #(
                     // On failure: latch eye_train_fail, proceed anyway.
                     PHY_EYE_VERIFY: begin
                         if (phy_timer != 0) begin
-                            if (phy_timer == 3'd3)
+                            if (phy_timer == 4'd3)
                                 idelay_load_lane[train_lane] <= 1'b1;
                             phy_timer <= phy_timer - 1'b1;
                         end else if (|i_dfi_rddata_en) begin
@@ -1349,7 +1357,9 @@ module ddr4_phy #(
                                 verify_mode <= 1'b1;
                                 phy_state <= PHY_EYE_LATE;
                             end else if (aligned_dq[train_lane * DQ_BITS] === MPR_PATTERN) begin
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (train_lane < BYTE_LANES - 1) begin
+                                /* verilator lint_on WIDTHEXPAND */
                                     train_lane <= train_lane + 1'b1;
                                     sweep_tap <= 9'd0;
                                     idelay_cntvalue <= 9'd0;
@@ -1359,7 +1369,7 @@ module ddr4_phy #(
                                     cur_width <= 9'd0;
                                     cur_late <= 1'b0;
                                     best_late <= 1'b0;
-                                    phy_timer <= 3'd4;
+                                    phy_timer <= 4'd4;
                                     phy_state <= PHY_EYE_SWEEP;
                                 end else begin
                                     phy_state <= PHY_EYE_DONE;
@@ -1374,7 +1384,9 @@ module ddr4_phy #(
                                 `ifndef YOSYS
                                     $display("[%0t] PHY eye: lane %0d verify FAILED at center tap", $realtime, train_lane);
                                 `endif
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (train_lane < BYTE_LANES - 1) begin
+                                /* verilator lint_on WIDTHEXPAND */
                                     train_lane <= train_lane + 1'b1;
                                     sweep_tap <= 9'd0;
                                     idelay_cntvalue <= 9'd0;
@@ -1384,7 +1396,7 @@ module ddr4_phy #(
                                     cur_width <= 9'd0;
                                     cur_late <= 1'b0;
                                     best_late <= 1'b0;
-                                    phy_timer <= 3'd4;
+                                    phy_timer <= 4'd4;
                                     phy_state <= PHY_EYE_SWEEP;
                                 end else begin
                                     phy_state <= PHY_EYE_DONE;
@@ -1410,7 +1422,9 @@ module ddr4_phy #(
                             // Verify late-check: confirm aligned_dq matches MPR
                             verify_mode <= 1'b0;
                             if (aligned_dq[train_lane * DQ_BITS] === MPR_PATTERN) begin
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (train_lane < BYTE_LANES - 1) begin
+                                /* verilator lint_on WIDTHEXPAND */
                                     train_lane <= train_lane + 1'b1;
                                     sweep_tap <= 9'd0;
                                     idelay_cntvalue <= 9'd0;
@@ -1420,7 +1434,7 @@ module ddr4_phy #(
                                     cur_width <= 9'd0;
                                     cur_late <= 1'b0;
                                     best_late <= 1'b0;
-                                    phy_timer <= 3'd4;
+                                    phy_timer <= 4'd4;
                                     phy_state <= PHY_EYE_SWEEP;
                                 end else begin
                                     phy_state <= PHY_EYE_DONE;
@@ -1435,7 +1449,9 @@ module ddr4_phy #(
                                 `ifndef YOSYS
                                     $display("[%0t] PHY eye: lane %0d verify FAILED (late) at center tap", $realtime, train_lane);
                                 `endif
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (train_lane < BYTE_LANES - 1) begin
+                                /* verilator lint_on WIDTHEXPAND */
                                     train_lane <= train_lane + 1'b1;
                                     sweep_tap <= 9'd0;
                                     idelay_cntvalue <= 9'd0;
@@ -1445,7 +1461,7 @@ module ddr4_phy #(
                                     cur_width <= 9'd0;
                                     cur_late <= 1'b0;
                                     best_late <= 1'b0;
-                                    phy_timer <= 3'd4;
+                                    phy_timer <= 4'd4;
                                     phy_state <= PHY_EYE_SWEEP;
                                 end else begin
                                     phy_state <= PHY_EYE_DONE;
@@ -1471,14 +1487,14 @@ module ddr4_phy #(
                     // toggle so the DRAM samples CK and returns the result).
                     PHY_WL_SAMPLE: begin
                         if (phy_timer != 0) begin // Wait for ODELAY to settle before pulsing strobe
-                            if (phy_timer == 3'd3) begin
+                            if (phy_timer == 4'd3) begin
                                 odelay_dqs_load[train_lane] <= 1'b1;
                                 odelay_dq_load[train_lane]  <= 1'b1;
                             end
                             phy_timer <= phy_timer - 1'b1;
                         end else if (i_dfi_wrlvl_strobe) begin // Wait for controller strobe
                             wl_dqs_strobe <= 1'b1;
-                            phy_timer <= 3'd15; // set to maximum
+                            phy_timer <= 4'd15; // set to maximum
                             phy_state <= PHY_WL_ADJUST;
                         end
                     end
@@ -1507,7 +1523,7 @@ module ddr4_phy #(
                                 // Record DQ=0 observation for future transition detection
                                 if (!(|iserdes_dq_q[train_lane * DQ_BITS]))
                                     wl_seen_zero[train_lane] <= 1'b1;
-                                wl_prev_dq0[train_lane] <= |iserdes_dq_q[train_lane * DQ_BITS]; // does wl_prev_dq0 has use???
+
                                 if (wl_tap[train_lane][8:2] == 7'b1111111) begin
                                     if (!wl_seen_zero[train_lane]) begin
                                         // DQ was 1 for the entire sweep — DQS already leads CK
@@ -1536,7 +1552,7 @@ module ddr4_phy #(
                                     wl_dq_tap[train_lane] <= wl_dq_tap[train_lane] + {5'b0, WL_TAP_STEP};
                                     odelay_dqs_cntvalue <= wl_tap[train_lane] + {5'b0, WL_TAP_STEP};
                                     odelay_dq_cntvalue <= wl_dq_tap[train_lane] + {5'b0, WL_TAP_STEP};
-                                    phy_timer <= 3'd4;
+                                    phy_timer <= 4'd4;
                                     phy_state <= PHY_WL_SAMPLE;
                                 end
                             end
@@ -1550,15 +1566,16 @@ module ddr4_phy #(
                         `ifndef YOSYS
                             $display("[%0t] PHY WL: lane %0d dqs_tap=%0d dq_tap=%0d", $realtime, train_lane, wl_tap[train_lane], wl_dq_tap[train_lane]);
                         `endif
+                        /* verilator lint_off WIDTHEXPAND */
                         if (train_lane < BYTE_LANES - 1) begin
+                        /* verilator lint_on WIDTHEXPAND */
                             train_lane <= train_lane + 1'b1;
                             wl_tap[train_lane + 1'b1]    <= dqs_initial_tap[train_lane + 1'b1]; // resume from 90° baseline (tCK/4 tap set by IODELAY BISC)
                             wl_dq_tap[train_lane + 1'b1] <= 9'd0;              // DQ has no initial offset — tracks DQS delta after WL
-                            wl_prev_dq0[train_lane + 1'b1] <= 1'b0;
                             wl_seen_zero[train_lane + 1'b1] <= 1'b0;
                             odelay_dqs_cntvalue <= dqs_initial_tap[train_lane + 1'b1]; // load DQS ODELAY to same 90° baseline
                             odelay_dq_cntvalue  <= 9'd0;                       // DQ ODELAY starts at 0, incremented in lockstep with DQS
-                            phy_timer <= 3'd4;
+                            phy_timer <= 4'd4;
                             phy_state <= PHY_WL_SAMPLE;
                         end else begin // Last lane done -- finish write leveling and prepare for normal operation
                             en_vtc_q <= 1'b1;

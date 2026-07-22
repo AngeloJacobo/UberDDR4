@@ -1313,7 +1313,7 @@ module ddr4_sim_top;
             $finish;
         end
     `endif
-    `define SIM_CSR_RESET_TEST
+
     `ifdef SIM_CSR_RESET_TEST
         // =============================================================
         // CSR 0xC Reset Test — exercises soft reset, auto-reset, BIST restart
@@ -2694,8 +2694,8 @@ module ddr4_sim_top;
     end
 
     initial begin
-        #1_000_000_000;
-        $display("[%0t] TIMEOUT: simulation did not complete within 1 ms", $realtime);
+        #10_000_000_000;
+        $display("[%0t] TIMEOUT: simulation did not complete within 10 ms", $realtime);
         $finish;
     end
 

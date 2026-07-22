@@ -45,6 +45,11 @@ formal/ddr4_multiconfig_*/
 __pycache__/
 *.pyc
 
+# Temporary / generated
+.tmp/
+build_logs/
+doc/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -218,7 +218,9 @@ module ddr4_top #(
 
     // Reset to controller + PHY:
     // external reset + CSR-triggered soft reset + BIST-failure-triggered soft-reset (if enabled in AUTO_RESET_EN)
+    /* verilator lint_off SYNCASYNCNET */
     wire internal_rst_n = i_rst_n && !prober_soft_reset_req && !prober_bist_failed_reset_req;
+    /* verilator lint_on SYNCASYNCNET */
 
     wire                     ctrl_wb_cyc;
     wire                     ctrl_wb_stb;
@@ -343,7 +345,6 @@ module ddr4_top #(
         .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),
         .DDR4_CLK_PERIOD(DDR4_CLK_PERIOD),
         .DEVICE_WIDTH(DEVICE_WIDTH),
-        .ROW_BITS(ROW_BITS),
         .BYTE_LANES(BYTE_LANES)
     ) u_phy (
         .i_controller_clk(i_controller_clk),
@@ -400,7 +401,6 @@ module ddr4_top #(
         .io_ddr4_dq(io_ddr4_dq),
         .io_ddr4_dqs_p(io_ddr4_dqs_p),
         .io_ddr4_dqs_n(io_ddr4_dqs_n),
-        .o_idelayctrl_rdy(),
         .o_phy_state(phy_train_state),
         .o_phy_idelay_center(phy_idelay_center),
         .o_phy_wl_tap(phy_wl_tap),

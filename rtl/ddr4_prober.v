@@ -40,7 +40,9 @@ module ddr4_prober #(
     // Number of 8-bit byte lanes (typically 2 for x8, 2 for x16, 2+ for x4)
               BYTE_LANES         = 2,
               NUM_BANKS          = 16,
+              /* verilator lint_off UNUSEDPARAM */
               ROW_BITS           = 16,
+              /* verilator lint_on UNUSEDPARAM */
     // Set to 1 when simulating with Micron DDR4 model (adjusts timing checks)
     parameter[0:0] MICRON_SIM    = 0,
     // BIST_MODE: 0=disabled, 1=half-range (each phase covers half the address space),
@@ -79,8 +81,10 @@ module ddr4_prober #(
     input  wire                     i_wb_dbg_stb,       // CSR strobe
     input  wire                     i_wb_dbg_we,        // CSR write enable
     input  wire [3:0]               i_wb_dbg_addr,      // CSR register address (selects 1 of 16 registers)
-    input  wire [31:0]              i_wb_dbg_data,      // CSR write data
+    /* verilator lint_off UNUSEDSIGNAL */
+    input  wire [31:0]              i_wb_dbg_data,      // CSR write data (only [2:0] used for control reg)
     input  wire [3:0]               i_wb_dbg_sel,       // CSR byte select (unused, always full-word)
+    /* verilator lint_on UNUSEDSIGNAL */
     output wire                     o_wb_dbg_stall,     // Always 0: CSR port never stalls
     output reg                      o_wb_dbg_ack,       // Registered ACK (1-cycle latency)
     output reg  [31:0]              o_wb_dbg_data,      // CSR read data
@@ -100,8 +104,10 @@ module ddr4_prober #(
     // Extended training debug (CSR 0x8, 0x9, 0xD, 0xE readback)
     input  wire [9*BYTE_LANES-1:0]  i_phy_best_width,   // 9b per lane: eye width in IDELAY taps
     input  wire [9*BYTE_LANES-1:0]  i_phy_best_start,   // 9b per lane: first passing IDELAY tap
-    input  wire [9*BYTE_LANES-1:0]  i_phy_wl_dq_tap,    // 9b per lane: DQ ODELAYE3 tap after WL
-    input  wire [9*BYTE_LANES-1:0]  i_phy_dqs_initial_tap, // 9b per lane: BISC-calibrated DQS baseline
+    /* verilator lint_off UNUSEDSIGNAL */
+    input  wire [9*BYTE_LANES-1:0]  i_phy_wl_dq_tap,    // 9b per lane: DQ ODELAYE3 tap after WL (MSB truncated in CSR)
+    input  wire [9*BYTE_LANES-1:0]  i_phy_dqs_initial_tap, // 9b per lane: BISC-calibrated DQS baseline (MSB truncated in CSR)
+    /* verilator lint_on UNUSEDSIGNAL */
     input  wire [BYTE_LANES-1:0]    i_phy_rd_lat_extra,  // 1b per lane: read data arrives 1 CLKDIV late
     input  wire                     i_phy_en_vtc,        // 1 = voltage-temperature compensation active
     input  wire [5:0]               i_instruction_address, // ROM step 0-35 (init progress)
@@ -295,6 +301,7 @@ module ddr4_prober #(
         //   counter[3:2] → BA        (bank changes every 4)
         //   counter[5:4] → BG        (bank group changes every 16)
         //   counter[9:6] → col[3:0]  (column varies)
+        /* verilator lint_off UNUSEDSIGNAL */
         function [WB_ADDR_BITS-1:0] stress_addr;
             input [BIST_ADDR_BITS-1:0] addr;
             begin
@@ -305,6 +312,7 @@ module ddr4_prober #(
                 stress_addr[13:12] = addr[1:0];
             end
         endfunction
+        /* verilator lint_on UNUSEDSIGNAL */
 
         // Expected data for read verification (covers trailing ACKs across phases)
         wire uses_scramble = (bist_state == BIST_RANDOM_READ) ||

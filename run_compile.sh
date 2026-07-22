@@ -221,18 +221,23 @@ run_lint() {
     mkdir -p "$LOGDIR"
     local stubs="$LOGDIR/.xilinx_stubs.v"
     cat > "$stubs" << 'STUBS'
+/* verilator lint_off DECLFILENAME */
+/* verilator lint_off UNUSEDSIGNAL */
+/* verilator lint_off UNDRIVEN */
+/* verilator lint_off UNUSEDPARAM */
+`timescale 1ps / 1ps
 module OSERDESE3 #(parameter DATA_WIDTH=8, INIT=0, IS_CLKDIV_INVERTED=0,
     IS_CLK_INVERTED=0, IS_RST_INVERTED=0, ODDR_MODE="FALSE",
     OSERDES_D_BYPASS="FALSE", OSERDES_T_BYPASS="FALSE", SIM_DEVICE="")
-    (input CLK, CLKDIV, RST, T1, T2, T3, T4,
-     input D1, D2, D3, D4, D5, D6, D7, D8,
+    (input CLK, CLKDIV, RST, T,
+     input [DATA_WIDTH-1:0] D,
      output OQ, T_OUT);
 endmodule
 module ISERDESE3 #(parameter DATA_WIDTH=8, FIFO_ENABLE="FALSE",
     FIFO_SYNC_MODE="FALSE", IS_CLK_B_INVERTED=1, IS_CLK_INVERTED=0,
     IS_RST_INVERTED=0, SIM_DEVICE="")
     (input CLK, CLK_B, CLKDIV, D, RST, FIFO_RD_CLK, FIFO_RD_EN,
-     output Q1, Q2, Q3, Q4, Q5, Q6, Q7, Q8, FIFO_EMPTY, INTERNAL_DIVCLK);
+     output [DATA_WIDTH-1:0] Q, output FIFO_EMPTY, INTERNAL_DIVCLK);
 endmodule
 module ODELAYE3 #(parameter CASCADE="NONE", DELAY_FORMAT="TIME",
     DELAY_TYPE="FIXED", DELAY_VALUE=0, IS_CLK_INVERTED=0,
@@ -244,9 +249,9 @@ module ODELAYE3 #(parameter CASCADE="NONE", DELAY_FORMAT="TIME",
      output [8:0] CNTVALUEOUT);
 endmodule
 module IDELAYE3 #(parameter CASCADE="NONE", DELAY_FORMAT="TIME",
-    DELAY_TYPE="FIXED", DELAY_VALUE=0, IS_CLK_INVERTED=0,
-    IS_RST_INVERTED=0, REFCLK_FREQUENCY=300.0, SIM_DEVICE="",
-    SIM_VERSION=1.0, UPDATE_MODE="ASYNC")
+    DELAY_TYPE="FIXED", DELAY_VALUE=0, DELAY_SRC="IDATAIN",
+    IS_CLK_INVERTED=0, IS_RST_INVERTED=0, REFCLK_FREQUENCY=300.0,
+    SIM_DEVICE="", SIM_VERSION=1.0, UPDATE_MODE="ASYNC")
     (input CLK, EN_VTC, INC, CE, LOAD, RST, IDATAIN, DATAIN,
      CASC_IN, CASC_RETURN,
      input [8:0] CNTVALUEIN,
@@ -259,6 +264,12 @@ module OBUF (input I, output O);
 endmodule
 module IOBUF (input I, T, output O, inout IO);
 endmodule
+module IOBUFDS #(parameter DQS_BIAS="FALSE")
+    (input I, T, output O, inout IO, IOB);
+endmodule
+module IDELAYCTRL #(parameter SIM_DEVICE="")
+    (input REFCLK, RST, output RDY);
+endmodule
 STUBS
 
     for f in "${RTL_CORE[@]}"; do
@@ -266,8 +277,12 @@ STUBS
         mod=$(basename "$f" .v)
         log="$LOGDIR/lint_${mod}.log"
         t0=$(date +%s)
+        local lint_files="$f"
+        if [[ "$mod" == "ddr4_top" ]]; then
+            lint_files="${RTL_CORE[*]}"
+        fi
         if verilator --lint-only -Wall \
-               --top-module "$mod" "$stubs" "$f" > "$log" 2>&1; then
+               --top-module "$mod" "$stubs" $lint_files > "$log" 2>&1; then
             t1=$(date +%s)
             local wc
             wc=$(grep -c "Warning" "$log" 2>/dev/null || true)

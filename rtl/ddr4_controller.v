@@ -153,9 +153,11 @@ module ddr4_controller #(
     // DFI 3.1 Training Interface: PHY -> MC
     input wire[BYTE_LANES-1:0]       i_dfi_rdlvl_resp,     // Read training done (per byte lane)
     input wire[BYTE_LANES-1:0]       i_dfi_wrlvl_resp,     // Write leveling done (per byte lane)
-    input wire                       i_dfi_rdlvl_req,      // PHY requests read data eye training
-    input wire                       i_dfi_rdlvl_gate_req, // PHY requests gate training
-    input wire                       i_dfi_wrlvl_req,      // PHY requests write leveling
+    /* verilator lint_off UNUSEDSIGNAL */
+    input wire                       i_dfi_rdlvl_req,      // PHY requests read data eye training (reserved)
+    input wire                       i_dfi_rdlvl_gate_req, // PHY requests gate training (reserved)
+    input wire                       i_dfi_wrlvl_req,      // PHY requests write leveling (reserved)
+    /* verilator lint_on UNUSEDSIGNAL */
 
     // Status
     output reg                       o_calib_complete, // All training phases finished successfully
@@ -225,7 +227,6 @@ module ddr4_controller #(
     // Named ROM address constants
     localparam[5:0] ROM_ADDR_RD_CAL    = 22,
                     ROM_ADDR_WL_CAL    = 27,
-                    ROM_ADDR_NORMAL    = 32,
                     ROM_ADDR_REF_START = 33,
                     ROM_ADDR_REF_END   = 35;
 
@@ -815,7 +816,11 @@ module ddr4_controller #(
     wire[BG_BITS-1:0]         wb_bg;
     wire[ROW_BITS-1:0]        wb_row;
     wire[BG_BITS+BA_BITS-1:0] wb_bank;
+    /* verilator lint_off WIDTHEXPAND */
+    /* verilator lint_off UNUSEDSIGNAL */
     wire[WB_ADDR_BITS-1:0]    wb_addr_next = i_wb_addr + FAR_LOOKAHEAD_DEPTH[$clog2(WB_ADDR_BITS+1)-1:0];
+    /* verilator lint_on UNUSEDSIGNAL */
+    /* verilator lint_on WIDTHEXPAND */
     wire[BG_BITS-1:0]         wb_next_bg;
     wire[BA_BITS-1:0]         wb_next_ba;
     wire[ROW_BITS-1:0]        wb_next_row;
@@ -879,6 +884,13 @@ module ddr4_controller #(
     reg[BG_BITS-1:0]         stage2_bg;
     reg[ROW_BITS-1:0]        stage2_row;
     reg[BG_BITS+BA_BITS-1:0] stage2_bank;
+
+    wire stage2_col_a11;
+    generate if (COL_BITS > 10) begin : gen_col_a11
+        assign stage2_col_a11 = stage2_col[10];
+    end else begin : gen_no_col_a11
+        assign stage2_col_a11 = 1'b0;
+    end endgenerate
 
     // -- tFAW sliding window -- blocks 5th ACT within the window.
     // Four timestamps record when the last four ACTs happened.
@@ -1127,6 +1139,7 @@ module ddr4_controller #(
                 // For every OTHER bank group: only-raise to tRRD_S — load
                 // tRRD_S only if larger than the current counter, so a
                 // previously loaded tRRD_L is never shortened.
+                /* verilator lint_off UNSIGNED */
                 for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
                     if (ci[BG_BITS-1:0] == stage2_bg) begin
                         rrd_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG[$clog2(MAX_RRD_DELAY):0];
@@ -1152,6 +1165,7 @@ module ddr4_controller #(
                         && delay_before_activate_counter_d[ci] < ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0])
                         delay_before_activate_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0];
                 end
+                /* verilator lint_on UNSIGNED */
                 // tFAW — Four-Activate Window: record this ACT's timestamp
                 // in the circular buffer so the sliding-window check can
                 // block a 5th ACT within the tFAW interval.
@@ -1182,6 +1196,7 @@ module ddr4_controller #(
                     // Per-BG tCCD (CAS-to-CAS) + tWTR (WR-to-RD turnaround).
                     // Same BG: unconditionally load the LONG delays.
                     // Diff BG: only-raise to SHORT delays.
+                    /* verilator lint_off UNSIGNED */
                     for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
                         if (ci[BG_BITS-1:0] == stage2_bg) begin
                             ccd_counter_d[ci] = CAS_TO_CAS_DELAY_SAME_BG[$clog2(MAX_CCD_DELAY):0];
@@ -1196,6 +1211,7 @@ module ddr4_controller #(
                             end
                         end
                     end
+                    /* verilator lint_on UNSIGNED */
                 end
 
                 // READ path.
@@ -1227,6 +1243,7 @@ module ddr4_controller #(
                         end
                     end
                     // Per-BG tCCD: same BG = LONG, diff BG = only-raise SHORT
+                    /* verilator lint_off UNSIGNED */
                     for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
                         if (ci[BG_BITS-1:0] == stage2_bg) begin
                             ccd_counter_d[ci] = CAS_TO_CAS_DELAY_SAME_BG[$clog2(MAX_CCD_DELAY):0];
@@ -1235,6 +1252,7 @@ module ddr4_controller #(
                             ccd_counter_d[ci] = CAS_TO_CAS_DELAY_DIFF_BG[$clog2(MAX_CCD_DELAY):0];
                         end
                     end
+                    /* verilator lint_on UNSIGNED */
                 end
             end
         end
@@ -1277,6 +1295,7 @@ module ddr4_controller #(
             bank_status_d[stage1_next_bank] = 1'b1;
             bank_active_row_d[stage1_next_bank] = stage1_next_row;
             // tRRD: same-BG gets tRRD_L, different-BG gets only-raise tRRD_S
+            /* verilator lint_off UNSIGNED */
             for (ci = 0; ci < NUM_BG; ci = ci + 1) begin
                 if (ci[BG_BITS-1:0] == stage1_next_bg) begin
                     rrd_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG[$clog2(MAX_RRD_DELAY):0];
@@ -1292,6 +1311,7 @@ module ddr4_controller #(
                     delay_before_activate_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0];
                 end
             end
+            /* verilator lint_on UNSIGNED */
             // tFAW: record this ACT in the sliding-window circular buffer
             activate_timestamp_d[activate_index_q] = TFAW_CYCLES[$clog2(TFAW_CYCLES):0];
         end
@@ -1544,7 +1564,7 @@ module ddr4_controller #(
                     3'b000,                // [16:14] A16:A14 = 0 (unused for col cmds)
                     1'b0,                  // [13]    A13 = 0 (reserved)
                     1'b0,                  // [12]    A12 = 0 (BL8 mode, not BC4)
-                    (COL_BITS > 10) ? stage2_col[10] : 1'b0, // [11] A11: col[10] for x4 devices
+                    stage2_col_a11,        // [11]    A11: col[10] for x4 devices
                     1'b0,                  // [10]    A10 = 0 (no auto-precharge)
                     stage2_col[9:0]        // [9:0]   A9:A0 = column address
                 };
@@ -1560,7 +1580,7 @@ module ddr4_controller #(
                     3'b000,                // [16:14] A16:A14 = 0 (unused for col cmds)
                     1'b0,                  // [13]    A13 = 0 (reserved)
                     1'b0,                  // [12]    A12 = 0 (BL8 mode, not BC4)
-                    (COL_BITS > 10) ? stage2_col[10] : 1'b0, // [11] A11: col[10] for x4 devices
+                    stage2_col_a11,        // [11]    A11: col[10] for x4 devices
                     1'b0,                  // [10]    A10 = 0 (no auto-precharge)
                     stage2_col[9:0]        // [9:0]   A9:A0 = column address
                 };
@@ -2081,8 +2101,8 @@ module ddr4_controller #(
     // Pack a timed ROM entry: issues 'cmd' with control lines 'ctl'
     // (CKE/RESET_N encoding), then waits 'timer' DFI cycles before
     // the next instruction fires. 
-    function [31:0] rom_timer(input [4:0] ctl, input [3:0] cmd, input integer timer);
-        rom_timer = {ctl[4:0], cmd[3:0], 3'b000, timer[19:0]};
+    function [31:0] rom_timer(input [4:0] ctl, input [3:0] cmd, input [19:0] timer);
+        rom_timer = {ctl[4:0], cmd[3:0], 3'b000, timer};
     endfunction
 
     // Pack an MRS (Mode Register Set) ROM entry: selects MR bank via
@@ -2105,6 +2125,7 @@ module ddr4_controller #(
     //   [26:23] CMD[3:0]         — command opcode {act_n, ras_n, cas_n, we_n}
     //   [22:20] MRS_SELECT[2:0]  — bank group + bank addr for MRS commands
     //   [19:0]  TIMER/ADDR[19:0] — delay cycle count, or MRS address bits
+    /* verilator lint_off WIDTHTRUNC */
     function [31:0] read_rom_instruction(input [5:0] addr);
         case (addr)
             // -- Power-on reset (JESD79-4D Figure 7) --
@@ -2159,6 +2180,7 @@ module ddr4_controller #(
             default: read_rom_instruction = rom_timer(CTL_TIMER, CMD_NOP, 0);
         endcase
     endfunction
+    /* verilator lint_on WIDTHTRUNC */
 
     // ==============================================================
     // Debug $display
@@ -2321,56 +2343,56 @@ module ddr4_controller #(
     // Precharge fill the remaining slots avoiding collisions.
     function [1:0] get_slot(input [3:0] cmd);
         integer delay;
-        reg [2:0] slot_number, read_slot, write_slot;
-        reg [2:0] anticipate_activate_slot, anticipate_precharge_slot;
+        reg [1:0] slot_number, read_slot, write_slot;
+        reg [1:0] anticipate_activate_slot, anticipate_precharge_slot;
         begin
             // Read slot = (0 - CL_nCK) mod 4
             slot_number = 0;
             delay = CL_nCK;
             while (delay != 0) begin
-                slot_number[1:0] = slot_number[1:0] - 1'b1;
+                slot_number = slot_number - 1'b1;
                 delay = delay - 1;
             end
-            read_slot[1:0] = slot_number[1:0];
+            read_slot = slot_number;
 
             // Write slot = (0 - CWL_nCK) mod 4
             slot_number = 0;
             delay = CWL_nCK;
             while (delay != 0) begin
-                slot_number[1:0] = slot_number[1:0] - 1'b1;
+                slot_number = slot_number - 1'b1;
                 delay = delay - 1;
             end
-            write_slot[1:0] = slot_number[1:0];
+            write_slot = slot_number;
 
             // Activate slot: back-count tRCD from the higher-latency data slot
             if (CL_nCK > CWL_nCK)
-                slot_number[1:0] = read_slot[1:0];
+                slot_number = read_slot;
             else
-                slot_number[1:0] = write_slot[1:0];
+                slot_number = write_slot;
             delay = ps_to_nCK(tRCD_ps);
             while (delay != 0) begin
-                slot_number[1:0] = slot_number[1:0] - 1'b1;
+                slot_number = slot_number - 1'b1;
                 delay = delay - 1;
             end
-            anticipate_activate_slot[1:0] = slot_number[1:0];
+            anticipate_activate_slot = slot_number;
             // resolve collisions with data slots
-            while (anticipate_activate_slot[1:0] == write_slot[1:0] ||
-                   anticipate_activate_slot[1:0] == read_slot[1:0]) begin
-                anticipate_activate_slot[1:0] = anticipate_activate_slot[1:0] - 1'b1;
+            while (anticipate_activate_slot == write_slot ||
+                   anticipate_activate_slot == read_slot) begin
+                anticipate_activate_slot = anticipate_activate_slot - 1'b1;
             end
 
             // Precharge slot: first remaining slot
             anticipate_precharge_slot = 0;
-            while (anticipate_precharge_slot[1:0] == write_slot[1:0] ||
-                   anticipate_precharge_slot[1:0] == read_slot[1:0] ||
-                   anticipate_precharge_slot[1:0] == anticipate_activate_slot[1:0])
-                anticipate_precharge_slot[1:0] = anticipate_precharge_slot[1:0] - 1'b1;
+            while (anticipate_precharge_slot == write_slot ||
+                   anticipate_precharge_slot == read_slot ||
+                   anticipate_precharge_slot == anticipate_activate_slot)
+                anticipate_precharge_slot = anticipate_precharge_slot - 1'b1;
 
             case (cmd)
-                CMD_RD:  get_slot = read_slot[1:0];
-                CMD_WR:  get_slot = write_slot[1:0];
-                CMD_ACT: get_slot = anticipate_activate_slot[1:0];
-                CMD_PRE: get_slot = anticipate_precharge_slot[1:0];
+                CMD_RD:  get_slot = read_slot;
+                CMD_WR:  get_slot = write_slot;
+                CMD_ACT: get_slot = anticipate_activate_slot;
+                CMD_PRE: get_slot = anticipate_precharge_slot;
                 default: get_slot = 2'b0;
             endcase
         end
