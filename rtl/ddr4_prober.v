@@ -665,6 +665,8 @@ module ddr4_prober #(
 
         assign o_wb_dbg_stall = 1'b0;
 
+        reg [31:0] csr_data_r;
+
         always @(posedge i_clk) begin
             if (!i_rst_n) begin
                 o_wb_dbg_ack  <= 1'b0;
@@ -674,8 +676,6 @@ module ddr4_prober #(
                 o_wb_dbg_data <= csr_data_r;
             end
         end
-
-        reg [31:0] csr_data_r;
 
         always @* begin
             case (i_wb_dbg_addr)

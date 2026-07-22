@@ -213,13 +213,10 @@ check_tools() {
 # ═══════════════════════════════════════════════════════════════════════════
 # Stage 1: Verilator Lint
 # ═══════════════════════════════════════════════════════════════════════════
-run_lint() {
-    ((STAGE++))
-    stage_reset
-    header "$STAGE" "$TOTAL" "Verilator Lint"
-
+generate_stubs() {
     mkdir -p "$LOGDIR"
     local stubs="$LOGDIR/.xilinx_stubs.v"
+    [[ -f "$stubs" ]] && return
     cat > "$stubs" << 'STUBS'
 /* verilator lint_off DECLFILENAME */
 /* verilator lint_off UNUSEDSIGNAL */
@@ -271,6 +268,15 @@ module IDELAYCTRL #(parameter SIM_DEVICE="")
     (input REFCLK, RST, output RDY);
 endmodule
 STUBS
+}
+
+run_lint() {
+    ((STAGE++))
+    stage_reset
+    header "$STAGE" "$TOTAL" "Verilator Lint"
+
+    generate_stubs
+    local stubs="$LOGDIR/.xilinx_stubs.v"
 
     for f in "${RTL_CORE[@]}"; do
         local mod log t0 t1
@@ -297,8 +303,6 @@ STUBS
             show_errors "$log"
         fi
     done
-    rm -f "$stubs"
-
     stage_record "Lint"
 }
 
@@ -310,14 +314,15 @@ run_compile() {
     stage_reset
     header "$STAGE" "$TOTAL" "Compile Checks"
 
-    mkdir -p "$LOGDIR"
+    generate_stubs
+    local stubs="$LOGDIR/.xilinx_stubs.v"
     local log t0 t1
 
     # ── Iverilog ──
     log="$LOGDIR/compile_iverilog.log"
     t0=$(date +%s)
     if iverilog -g2012 -Wall -t null \
-           -y "$UNISIMS" \
+           "$stubs" \
            "${RTL_CORE[@]}" > "$log" 2>&1; then
         t1=$(date +%s)
         pass "iverilog (core RTL)" "$(elapsed $((t1-t0)))"
@@ -330,7 +335,7 @@ run_compile() {
     # ── Yosys ──
     log="$LOGDIR/compile_yosys.log"
     t0=$(date +%s)
-    local yosys_script="read_verilog -lib -specify +/xilinx/cells_sim.v; read_verilog -sv"
+    local yosys_script="read_verilog -sv $stubs"
     for f in "${RTL_CORE[@]}"; do yosys_script+=" $f"; done
     yosys_script+="; hierarchy -top ddr4_top -check -purge_lib; proc; opt; check"
     if yosys -q -p "$yosys_script" > "$log" 2>&1; then

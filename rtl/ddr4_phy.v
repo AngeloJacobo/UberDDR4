@@ -279,6 +279,11 @@ module ddr4_phy #(
     wire idelayctrl_rdy_w;
     assign o_dfi_init_complete = idelayctrl_rdy_w;
 
+    // EN_VTC: LOW during training so IDELAYE3/ODELAYE3 tap values can be
+    // loaded without the IDELAYCTRL overwriting them. HIGH in normal operation
+    // so the IDELAYCTRL continuously compensates delay for PVT drift (UG571).
+    reg en_vtc_q;
+
     // -----------------------------------------------------------------
     // Clock Output Path
     // OSERDESE3 (DATA_WIDTH=8, constant 01010101 toggle) -> OBUFDS -> CK/CK#
@@ -558,10 +563,6 @@ module ddr4_phy #(
     // JESD79-4D §4.7.2 — controller drives DQS LOW between strobes.
     wire dqs_tristate_wl = wl_active ? 1'b0 : ~output_enable;
 
-    // EN_VTC: LOW during training so IDELAYE3/ODELAYE3 tap values can be
-    // loaded without the IDELAYCTRL overwriting them. HIGH in normal operation
-    // so the IDELAYCTRL continuously compensates delay for PVT drift (UG571).
-    reg en_vtc_q;
 
     // -----------------------------------------------------------------
     // DQ Data Path (per bit, per byte lane)
