@@ -42,7 +42,7 @@ fail() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 if [[ -z "${XILINX_VIVADO:-}" ]]; then
@@ -57,10 +57,16 @@ XSIM="$XILINX_VIVADO/bin/xsim"
 EXTRA_DEFS="${EXTRA_DEFINES:-}"
 MICRON_DENSITY="${MICRON_DENSITY:-DDR4_8G_X8}"
 MICRON_SPEED="${MICRON_SPEED:-FIXED_2400}"
+SIM_CONFIG_FILE="${SIM_CONFIG_FILE:-}"
+SIM_CONFIG_SOURCE=""
+[[ -n "$SIM_CONFIG_FILE" && -f "$SIM_CONFIG_FILE" ]] && SIM_CONFIG_SOURCE="$SIM_CONFIG_FILE"
 
-if [[ ! -L "$REPO_ROOT/UberDDR4/testbench/micron/ddr4_model.sv" ]]; then
-    fail "Micron DDR4 model symlinks not found in UberDDR4/testbench/micron/"
-    fail "Run first:  ./UberDDR4/testbench/setup_micron_model.sh"
+if [[ ! -f "$REPO_ROOT/testbench/micron/ddr4_model.sv" ]]; then
+    # On Linux setup_micron_model.sh creates symbolic links.  Git Bash may
+    # materialize ordinary files instead when Windows symlinks are disabled;
+    # both forms are valid simulation inputs.
+    fail "Micron DDR4 model sources not found in testbench/micron/"
+    fail "Run first:  bash testbench/setup_micron_model.sh"
     exit 1
 fi
 
@@ -75,10 +81,10 @@ echo -e "${DIM}Vivado: $XILINX_VIVADO${RESET}"
 step "Compiling RTL"
 "$XVLOG" -sv \
   $EXTRA_DEFS \
-  UberDDR4/rtl/ddr4_controller.v \
-  UberDDR4/rtl/ddr4_phy.v \
-  UberDDR4/rtl/ddr4_prober.v \
-  UberDDR4/rtl/ddr4_top.v
+  rtl/ddr4_controller.v \
+  rtl/ddr4_phy.v \
+  rtl/ddr4_prober.v \
+  rtl/ddr4_top.v
 
 # Micron model defines:
 #   DDR4_8G_X8   - 8Gbit x8 density/width (must match DUT DENSITY param)
@@ -93,15 +99,16 @@ fi
 step "Compiling simulation sources"
 "$XVLOG" -sv -d $MICRON_DENSITY -d $MICRON_SPEED -d ALLOW_JITTER $VCD_FLAG \
   $EXTRA_DEFS \
-  -i UberDDR4/testbench/micron \
-  UberDDR4/testbench/micron/arch_package.sv \
-  UberDDR4/testbench/micron/proj_package.sv \
-  UberDDR4/testbench/micron/interface.sv \
-  UberDDR4/testbench/micron/StateTable.sv \
-  UberDDR4/testbench/micron/StateTableCore.sv \
-  UberDDR4/testbench/micron/MemoryArray.sv \
-  UberDDR4/testbench/micron/ddr4_model.sv \
-  UberDDR4/testbench/ddr4_sim_top.sv
+  -i testbench/micron \
+  testbench/micron/arch_package.sv \
+  testbench/micron/proj_package.sv \
+  testbench/micron/interface.sv \
+  testbench/micron/StateTable.sv \
+  testbench/micron/StateTableCore.sv \
+  testbench/micron/MemoryArray.sv \
+  testbench/micron/ddr4_model.sv \
+  $SIM_CONFIG_SOURCE \
+  testbench/ddr4_sim_top.sv
 
 step "Compiling Xilinx glbl"
 "$XVLOG" "$XILINX_VIVADO"/data/verilog/src/glbl.v

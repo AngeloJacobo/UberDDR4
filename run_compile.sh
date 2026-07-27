@@ -28,13 +28,77 @@
 set -o pipefail
 
 CHILD_PID=""
-cleanup() {
-    printf "\n\033[31mInterrupted — killing child processes...\033[0m\n"
-    [[ -n "$CHILD_PID" ]] && kill -- -$CHILD_PID 2>/dev/null
-    wait 2>/dev/null
-    exit 130
+CHILD_HAS_OWN_PG=false
+# Ctrl+C is delivered to this script and, on Git Bash, to each member of the
+# foreground pipeline.  Do not let a second delivery re-enter cleanup while
+# the first handler is terminating the process tree.
+CLEANUP_RUNNING=0
+
+# Linux commonly provides setsid; Git Bash normally does not.  The test
+# commands do not require a separate session, so use one only when available.
+run_isolated() {
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$@"
+    else
+        "$@"
+    fi
 }
-trap cleanup INT TERM HUP
+
+start_background_log() {
+    local log_file="$1"
+    shift
+    CHILD_HAS_OWN_PG=false
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$@" > "$log_file" 2>&1 &
+        CHILD_HAS_OWN_PG=true
+    else
+        "$@" > "$log_file" 2>&1 &
+    fi
+    CHILD_PID=$!
+}
+
+# Terminate every descendant of a background test.  On Linux, setsid gives
+# the child a dedicated process group.  Git Bash lacks setsid, so taskkill's
+# /T option is required to terminate the Bash/pipeline/XSim process tree.
+terminate_child_tree() {
+    local pid="$1"
+    local own_pg="$2"
+    if $own_pg; then
+        kill -- -"$pid" 2>/dev/null
+    elif command -v taskkill.exe >/dev/null 2>&1; then
+        taskkill.exe /PID "$pid" /T /F >/dev/null 2>&1
+    else
+        # Portable non-Windows fallback for hosts without setsid.
+        local child
+        for child in $(pgrep -P "$pid" 2>/dev/null); do
+            terminate_child_tree "$child" false
+        done
+        kill "$pid" 2>/dev/null
+    fi
+}
+
+cleanup() {
+    local exit_code="${1:-130}"
+    if (( CLEANUP_RUNNING )); then
+        # The original handler already owns child termination.  Removing the
+        # trap before exiting prevents the repeated "Interrupted" loop seen
+        # when Git Bash broadcasts Ctrl+C to nested shell pipelines.
+        trap - INT TERM HUP
+        exit "$exit_code"
+    fi
+    CLEANUP_RUNNING=1
+    trap - INT TERM HUP
+    printf "\n\033[31mInterrupted — killing child processes...\033[0m\n"
+    if [[ -n "${CHILD_PID:-}" ]]; then
+        terminate_child_tree "$CHILD_PID" "$CHILD_HAS_OWN_PG"
+        # Wait only for the process we started.  A bare `wait` can itself be
+        # interrupted by the terminal signal and recursively invoke cleanup.
+        wait "$CHILD_PID" 2>/dev/null || true
+        CHILD_PID=""
+    fi
+    exit "$exit_code"
+}
+trap 'cleanup 130' INT TERM HUP
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -58,7 +122,7 @@ SIM_TESTS=(
     x16 x16_map0 x16_bist_full x16_flyby_4lane
     x4 x4_map0
     ddr4_1600 ddr4_1600_flyby ddr4_2133 ddr4_2133_flyby
-    density_4g train_fail
+    density_4g row_bits_14 row_bits_17 train_fail csr_reset dm_stress
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -184,8 +248,14 @@ STAGE=0
 # ═══════════════════════════════════════════════════════════════════════════
 check_tools() {
     local ok=true
+    local -a required_tools=()
+
+    $DO_LINT    && required_tools+=(verilator)
+    $DO_COMPILE && required_tools+=(iverilog yosys)
+    $DO_FORMAL  && required_tools+=(sby)
+
     printf "${DIM}  Checking tools...${RST}\n"
-    for tool in verilator iverilog yosys sby; do
+    for tool in "${required_tools[@]}"; do
         if command -v "$tool" &>/dev/null; then
             printf "  ${GRN}${OK}${RST} %-14s ${DIM}%s${RST}\n" "$tool" "$(command -v "$tool")"
         else
@@ -371,9 +441,8 @@ run_formal() {
     local log t0 t1
     log="$LOGDIR/formal.log"
     t0=$(date +%s)
-    setsid sby -f "$sby_file" > "$log" 2>&1 &
-    CHILD_PID=$!
-    wait $CHILD_PID
+    start_background_log "$log" sby -f "$sby_file"
+    wait "$CHILD_PID"
     local rc=$?
     CHILD_PID=""
     t1=$(date +%s)
@@ -450,7 +519,7 @@ run_sim() {
                 fi
                 cur_name=""
             fi
-        done < <(cd "$SCRIPT_DIR/.." && setsid bash "$SCRIPT_DIR/testbench/regression_test.sh" 2>&1)
+        done < <(cd "$SCRIPT_DIR" && run_isolated bash "$SCRIPT_DIR/testbench/regression_test.sh" 2>&1)
 
         local st1
         st1=$(date +%s)
@@ -472,13 +541,15 @@ run_sim() {
         fi
 
         mkdir -p "$LOGDIR"
-        local log="$LOGDIR/sim_${SIM_TEST}.log"
+        # The simulation launcher runs from the parent directory so the
+        # historical UberDDR4/... paths resolve.  Keep its log in this
+        # script's build_logs directory with an absolute path.
+        local log="$SCRIPT_DIR/$LOGDIR/sim_${SIM_TEST}.log"
         local st0 st1
         st0=$(date +%s)
-        cd "$SCRIPT_DIR/.."
-        setsid bash "$SCRIPT_DIR/testbench/regression_test.sh" "$idx" > "$log" 2>&1 &
-        CHILD_PID=$!
-        wait $CHILD_PID
+        cd "$SCRIPT_DIR"
+        start_background_log "$log" bash "$SCRIPT_DIR/testbench/regression_test.sh" "$idx"
+        wait "$CHILD_PID"
         local rc=$?
         CHILD_PID=""
         st1=$(date +%s)

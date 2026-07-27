@@ -97,8 +97,8 @@ module ddr4_controller #(
               T_WRLVL_EN  = 4,   // min DFI clks: wrlvl_en -> first strobe
               T_WRLVL_WW  = 16,  // min DFI clks between strobe pulses
               // DFI training timing (MC-defined, override for longer PHY write/read leveling)
-              T_RDLVL_MAX     = 8192, // timeout (DFI clks) for rdlvl_resp
-              T_WRLVL_MAX     = 4096, // timeout (DFI clks) for wrlvl_resp
+              T_RDLVL_MAX     = 65536, // timeout (DFI clks) for rdlvl_resp
+              T_WRLVL_MAX     = 65536, // timeout (DFI clks) for wrlvl_resp
               CALIB_RETRY_MAX = 3     // retries per training phase before failure
 ) (
     input wire i_controller_clk, // Controller clock with CONTROLLER_CLK_PERIOD
@@ -719,7 +719,7 @@ module ddr4_controller #(
     // -- Training pump state (driven by the calibration FSM) --
     reg [3:0] calib_state;
     reg [$clog2(max_fn(T_RDLVL_MAX, T_WRLVL_MAX)):0] calib_timer;
-    reg [$clog2(CALIB_GAP_MAX):0] calib_gap_timer;
+    (* mark_debug = "true" *) reg [$clog2(CALIB_GAP_MAX):0] calib_gap_timer;
     reg [1:0] calib_retry_count;
     reg calib_read_req;
 

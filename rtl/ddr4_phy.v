@@ -181,7 +181,8 @@ module ddr4_phy #(
                     PHY_WL_SAMPLE     = 4'd8,
                     PHY_WL_ADJUST     = 4'd9,
                     PHY_WL_CHECK      = 4'd10,
-                    PHY_WL_DONE       = 4'd11;
+                    PHY_WL_DONE       = 4'd11,
+                    PHY_WL_APPLY      = 4'd12;
 
     // MPR page 0, MPR2 register value = 8'h0F = 00001111 (JESD79-4D Table 56).
     // Serial readout sends bit[7] first: UI0=0, UI1=0, UI2=0, UI3=0,
@@ -196,7 +197,10 @@ module ddr4_phy #(
     // Stops at 508 (not 511) to avoid 9-bit overflow on the +4 addition.
     localparam [3:0] TAP_SWEEP_STEP = 4'd4;
 
-    // Write leveling: sweep ODELAYE3 DQS in steps of 4
+    // Write leveling: sweep ODELAYE3 DQS in steps of 4.  The IODELAY BISC
+    // result for DQS_INITIAL_ODELAY_PS is one quarter of tCK, so four times
+    // its measured tap count is the local, calibrated tCK estimate used to
+    // unwrap a valid 0-to-1 feedback edge.
     localparam [3:0] WL_TAP_STEP = 4'd4;
 
     // VTC settle: guard time after EN_VTC goes HIGH before normal operation.
@@ -217,10 +221,11 @@ module ddr4_phy #(
     // -----------------------------------------------------------------
     // Reset Generation (UG571 "Component Mode Reset Sequence", p.188-189)
     //
-    // All primitive RST ports (OSERDESE3, ISERDESE3, IDELAYE3, ODELAYE3,
-    // IDELAYCTRL) are ASYNCHRONOUS — they don't require any specific
-    // clock domain. We generate all resets from i_controller_clk using
-    // a simple counter, which satisfies:
+    // The IODELAY and SERDES primitive resets are generated in the controller
+    // clock domain.  IDELAYCTRL has a separate REFCLK domain, so its reset is
+    // asserted asynchronously but released through a two-flop synchronizer
+    // clocked by i_ref_clk.  This prevents a controller-clock signal from
+    // directly deasserting the IDELAYCTRL RST pin.
     //
     //   UG571 Release Reset sequence p.189:
     //     Step 2c: Release IDELAY/ODELAY/ISERDES/OSERDES resets
@@ -242,14 +247,16 @@ module ddr4_phy #(
 
     reg [$clog2(IODELAY_RST_DELAY + IDELAYCTRL_RST_EXTRA + 1):0] rst_cnt;
     reg sync_rst;
-    reg idelayctrl_rst;
+    reg idelayctrl_release_req;
+    (* ASYNC_REG = "TRUE" *) reg [1:0] idelayctrl_release_sync;
+    wire idelayctrl_rst;
 
 
     always @(posedge i_controller_clk or negedge i_rst_n) begin
         if (!i_rst_n) begin
             rst_cnt       <= 0;
             sync_rst      <= 1'b1;
-            idelayctrl_rst <= 1'b1;
+            idelayctrl_release_req <= 1'b0;
         end else begin
             if (!(&rst_cnt)) begin // count up until max (saturating)
                 rst_cnt <= rst_cnt + 1;
@@ -260,12 +267,24 @@ module ddr4_phy #(
                 sync_rst <= 1'b0;
             end
 
-            // Step 2d: release IDELAYCTRL reset AFTER sync_rst (extra margin)
+            // Step 2d: request IDELAYCTRL reset release AFTER sync_rst.
+            // The request is synchronized into i_ref_clk below.
             if (rst_cnt == RST_RELEASE_CTRL) begin
-                idelayctrl_rst <= 1'b0;
+                idelayctrl_release_req <= 1'b1;
             end
         end
     end
+
+    // IDELAYCTRL.RST may assert asynchronously, but deassertion must be clean
+    // with respect to REFCLK. Use two-flop CDC synchronizer
+    always @(posedge i_ref_clk or negedge i_rst_n) begin
+        if (!i_rst_n)
+            idelayctrl_release_sync <= 2'b00;
+        else
+            idelayctrl_release_sync <= {idelayctrl_release_sync[0],
+                                        idelayctrl_release_req};
+    end
+    assign idelayctrl_rst = ~idelayctrl_release_sync[1];
 
     // -----------------------------------------------------------------
     // DFI training request outputs
@@ -500,28 +519,30 @@ module ddr4_phy #(
     //    a single "is there a write THIS controller clock?" flag.
     //    (One controller clock already covers all 4 DDR phases.)
     //
-    // 2) A 2-stage shift register delays the flag by 1 and 2 controller
+    // 2) A 3-stage shift register delays the flag by 1, 2, and 3 controller
     //    clocks (each = 4 DDR clocks). This keeps the bus driven for
-    //    2 extra controller clocks (8 DDR clocks) after wrdata_en drops,
-    //    covering the DDR4 postamble (tWPST = 0.5 tCK) plus OSERDES +
-    //    ODELAYE3 pipeline flush time.
+    //    3 extra controller clocks (12 DDR clocks) after wrdata_en drops.
+    //    The third stage is required because the OSERDESE3 T_OUT path is
+    //    not delayed by the per-lane ODELAYE3. It guarantees that the
+    //    delayed DQS falling edge and its low tWPST postamble reach the
+    //    DRAM pin before the IOBUF/IOBUFDS goes high-Z.
     //
-    // 3) output_enable = wrdata_en_any | shift[0] | shift[1]
+    // 3) output_enable = wrdata_en_any | shift[0] | shift[1] | shift[2]
     //    Both DQ and DQS use the same enable window.
     //
     // 4) Inversion: ~enable → tristate, because T=1 means OFF in OSERDESE3.
     // -----------------------------------------------------------------
     wire wrdata_en_any = |i_dfi_wrdata_en;
 
-    reg [1:0] wrdata_en_shift;
+    reg [2:0] wrdata_en_shift;
     always @(posedge i_controller_clk) begin
         if (sync_rst)
-            wrdata_en_shift <= 2'b0;
+            wrdata_en_shift <= 3'b0;
         else
-            wrdata_en_shift <= {wrdata_en_shift[0], wrdata_en_any};
+            wrdata_en_shift <= {wrdata_en_shift[1:0], wrdata_en_any};
     end
 
-    wire output_enable = wrdata_en_any | wrdata_en_shift[0] | wrdata_en_shift[1];
+    wire output_enable = wrdata_en_any | (|wrdata_en_shift);
     wire dq_tristate   = ~output_enable;
 
     // -----------------------------------------------------------------
@@ -580,7 +601,7 @@ module ddr4_phy #(
     //   D[0] = first bit transmitted (phase 0, rise)
     //   D[7] = last bit transmitted (phase 3, fall)
     // -----------------------------------------------------------------
-    wire [7:0] iserdes_dq_q  [TOTAL_DQ-1:0];
+    (* mark_debug = "true" *)  wire [7:0] iserdes_dq_q  [TOTAL_DQ-1:0];
     // Eye training: per-lane IDELAYE3 LOAD pulse and shared tap value
     reg  idelay_load_lane [BYTE_LANES-1:0];
     reg  [8:0] idelay_cntvalue;
@@ -613,12 +634,13 @@ module ddr4_phy #(
                 };
 
                 wire oserdes_dq_out;
+                wire dq_tristate_oserdes;
                 OSERDESE3 #(
                     .DATA_WIDTH(8), .INIT(1'b0),
                     .IS_CLKDIV_INVERTED(1'b0), .IS_CLK_INVERTED(1'b0),
                     .IS_RST_INVERTED(1'b0), .SIM_DEVICE("ULTRASCALE_PLUS")
                 ) oserdes_dq (
-                    .D(dq_wr_d), .OQ(oserdes_dq_out), .T_OUT(),
+                    .D(dq_wr_d), .OQ(oserdes_dq_out), .T_OUT(dq_tristate_oserdes),
                     .CLK(i_ddr4_clk), .CLKDIV(i_controller_clk),
                     .RST(sync_rst), .T(dq_tristate)
                 );
@@ -645,7 +667,7 @@ module ddr4_phy #(
                 wire ibuf_dq_out;
                 IOBUF dq_iobuf (
                     .I(odelay_dq_out), .O(ibuf_dq_out),
-                    .IO(io_ddr4_dq[DQ_IDX]), .T(dq_tristate)
+                    .IO(io_ddr4_dq[DQ_IDX]), .T(dq_tristate_oserdes)
                 );
 
                 wire idelay_dq_out;
@@ -697,12 +719,13 @@ module ddr4_phy #(
         for (dqs_lane = 0; dqs_lane < BYTE_LANES; dqs_lane = dqs_lane + 1) begin : gen_dqs
 
             wire oserdes_dqs_out;
+            wire dqs_tristate_wl_oserdes;
             OSERDESE3 #(
                 .DATA_WIDTH(8), .INIT(1'b0),
                 .IS_CLKDIV_INVERTED(1'b0), .IS_CLK_INVERTED(1'b0),
                 .IS_RST_INVERTED(1'b0), .SIM_DEVICE("ULTRASCALE_PLUS")
             ) oserdes_dqs (
-                .D(dqs_pattern), .OQ(oserdes_dqs_out), .T_OUT(),
+                .D(dqs_pattern), .OQ(oserdes_dqs_out), .T_OUT(dqs_tristate_wl_oserdes),
                 .CLK(i_ddr4_clk), .CLKDIV(i_controller_clk),
                 .RST(sync_rst), .T(dqs_tristate_wl)
             );
@@ -736,7 +759,7 @@ module ddr4_phy #(
             ) dqs_iobufds (
                 .I(odelay_dqs_out), .O(),
                 .IO(io_ddr4_dqs_p[dqs_lane]), .IOB(io_ddr4_dqs_n[dqs_lane]),
-                .T(dqs_tristate_wl)
+                .T(dqs_tristate_wl_oserdes)
             );
 
         end
@@ -818,7 +841,7 @@ module ddr4_phy #(
 
     // PHY training FSM state registers
     reg [3:0] phy_state;
-    reg [$clog2(BYTE_LANES > 1 ? BYTE_LANES : 2)-1:0] train_lane;
+    (* mark_debug = "true" *)  reg [$clog2(BYTE_LANES > 1 ? BYTE_LANES : 2)-1:0] train_lane;
     reg [3:0] phy_timer;
 
     // Eye training registers (phase-aware range tracking)
@@ -837,10 +860,10 @@ module ddr4_phy #(
     reg [8:0] cur_width;            // running width of current range (incremented by TAP_SWEEP_STEP)
     reg [3:0] cur_offset;           // pattern offset of the current range (0-8)
     reg       in_range;             // 1 = currently inside a valid (PASS) range
-    reg [8:0] best_start;           // first tap of the widest range found so far
-    reg [8:0] best_width;           // width of the widest range found so far
+    (* mark_debug = "true" *) reg [8:0] best_start;           // first tap of the widest range found so far
+    (* mark_debug = "true" *) reg [8:0] best_width;           // width of the widest range found so far
     reg [3:0] best_offset;          // pattern offset of the widest range
-    reg       best_valid;           // 1 = at least one valid range has been recorded
+    (* mark_debug = "true" *) reg best_valid;           // 1 = at least one valid range has been recorded
     reg       pattern_found_q;      // pipeline reg: MPR pattern found at current tap (registered from comb)
     reg [3:0] pattern_offset_q;     // pipeline reg: offset where pattern was found (registered from comb)
     reg       pattern_late_q;       // pipeline reg: pattern arrived 1 CLKDIV cycle after rddata_en
@@ -858,7 +881,14 @@ module ddr4_phy #(
     reg [8:0] wl_tap        [BYTE_LANES-1:0];
     reg [8:0] wl_dq_tap     [BYTE_LANES-1:0];
 
-    reg       wl_seen_zero  [BYTE_LANES-1:0];  // 1 = have observed DQ=0; enables 0→1 detection
+    // The DRAM WL response is asynchronous to the PHY.  A tap is accepted
+    // only when the whole 8-UI ISERDES capture is unanimously low or high;
+    // a mixed capture is retried at that tap instead of becoming a false
+    // edge.  DQ[0] is the designated per-byte feedback bit (JEDEC 4.7).
+    wire wl_feedback_zero = ~(|iserdes_dq_q[train_lane * DQ_BITS]);
+    wire wl_feedback_one  =  &iserdes_dq_q[train_lane * DQ_BITS];
+
+    reg       wl_seen_zero   [BYTE_LANES-1:0]; // zero observed before current rising-edge search
     reg [8:0] dqs_initial_tap [BYTE_LANES-1:0];
     reg [7:0] vtc_settle_counter;
 
@@ -868,8 +898,19 @@ module ddr4_phy #(
     reg [BYTE_LANES-1:0] eye_train_fail;
     reg [BYTE_LANES-1:0] wl_train_fail;
 
+    // Keep the period estimate wider than a physical ODELAY setting.  This
+    // makes the comparison well defined even if an unusual BISC result is
+    // greater than 127 taps (and therefore four times it exceeds 511).
+    wire [10:0] wl_period_estimate = {dqs_initial_tap[train_lane], 2'b00};
+    wire         wl_edge_has_wrap  = ({2'b00, wl_tap[train_lane]} >=
+                                      ({2'b00, dqs_initial_tap[train_lane]} + wl_period_estimate));
+    wire [8:0]   wl_final_dqs_tap  = wl_edge_has_wrap
+                                   ? (wl_tap[train_lane] - wl_period_estimate[8:0])
+                                   :  wl_tap[train_lane];
+
     assign wl_active = (phy_state == PHY_WL_SAMPLE) || (phy_state == PHY_WL_ADJUST)
-                     || (phy_state == PHY_WL_CHECK)  || (phy_state == PHY_WL_DONE);
+                     || (phy_state == PHY_WL_APPLY)  || (phy_state == PHY_WL_CHECK)
+                     || (phy_state == PHY_WL_DONE);
 
     // -----------------------------------------------------------------
     // Bitslip Alignment (barrel-shift across two ISERDESE3 captures)
@@ -1500,63 +1541,101 @@ module ddr4_phy #(
                         end
                     end
 
-                    // Read back DRAM's WL response after strobe settles.
-                    // Detect 0→1 transition on DQ[0] (OR-reduced across bits).
-                    // Uses wl_seen_zero guard: only accept DQ=1 as a valid
-                    // transition AFTER we have explicitly observed DQ=0 at a
-                    // prior tap. This prevents two failure modes:
-                    //   1. Stale high in iserdes_dq_q from before the first strobe
-                    //   2. Genuine initial DQ=1 with wl_prev_dq0 initialized to 0
-                    // Both would falsely trigger without the guard.
+                    // WL response evaluation.
+                    //
+                    // JESD79-4D write leveling requires an actual DQS-sampled
+                    // CK 0-to-1 response; accepting the initial high level is
+                    // unsafe.  Once that transition is observed, its absolute
+                    // ODELAY count may include one complete tCK if the initial
+                    // 90-degree baseline happened to be aligned.  The BISC-
+                    // calibrated initial DQS delay is tCK/4, so 4*initial_tap
+                    // gives this lane's calibrated tCK estimate.  Removing one
+                    // such whole period from DQS and DQ preserves their pin
+                    // phase and avoids a one-clock write-data burst shift.
                     PHY_WL_ADJUST: begin
-                        if (phy_timer != 0)
+                        if (phy_timer != 0) begin
                             phy_timer <= phy_timer - 1'b1;
-                        else begin
-                            `ifndef YOSYS
-                                $display("[%0t] PHY WL sweep: lane %0d dqs_tap=%0d dq_tap=%0d DQ=%0b seen_zero=%0b", $realtime, train_lane, wl_tap[train_lane],
-                                    wl_dq_tap[train_lane], |iserdes_dq_q[train_lane * DQ_BITS], wl_seen_zero[train_lane]);
-                            `endif
-                            if (wl_seen_zero[train_lane] && |iserdes_dq_q[train_lane * DQ_BITS]) begin
-                                // Valid 0→1 transition: previously confirmed DQ=0,
-                                // now DQ=1 → DQS rising edge aligned with CK rising edge.
-                                phy_state <= PHY_WL_CHECK;
-                            end else begin
-                                // Record DQ=0 observation for future transition detection
-                                if (!(|iserdes_dq_q[train_lane * DQ_BITS]))
-                                    wl_seen_zero[train_lane] <= 1'b1;
+                        end else if (!(wl_feedback_zero || wl_feedback_one)) begin
+                            // The response changed within this 8-UI capture.
+                            // Leave the delay untouched and ask for a fresh,
+                            // fully-settled response at the same tap.
+                            phy_timer <= 4'd4;
+                            phy_state <= PHY_WL_SAMPLE;
+                        end else begin
+                            if (wl_feedback_zero)
+                                wl_seen_zero[train_lane] <= 1'b1;
 
-                                if (wl_tap[train_lane][8:2] == 7'b1111111) begin
-                                    if (!wl_seen_zero[train_lane]) begin
-                                        // DQ was 1 for the entire sweep — DQS already leads CK
-                                        // at the initial tap. Revert to initial alignment and
-                                        // pulse LOAD to physically apply the tap value.
-                                        wl_tap[train_lane] <= dqs_initial_tap[train_lane];
-                                        wl_dq_tap[train_lane] <= 9'd0;
-                                        odelay_dqs_cntvalue <= dqs_initial_tap[train_lane];
-                                        odelay_dq_cntvalue <= 9'd0;
-                                        odelay_dqs_load[train_lane] <= 1'b1;
-                                        odelay_dq_load[train_lane] <= 1'b1;
-                                        `ifndef YOSYS
-                                            $display("[%0t] PHY WL: lane %0d DQS already leads CK, using initial tap %0d",
-                                                $realtime, train_lane, dqs_initial_tap[train_lane]);
-                                        `endif
-                                    end else begin
-                                        // Saw DQ=0 but never saw 0→1 — genuine failure
-                                        wl_train_fail[train_lane] <= 1'b1;
-                                        `ifndef YOSYS
-                                            $display("[%0t] PHY WL Failed: lane %0d exhausted taps", $realtime, train_lane);
-                                        `endif
-                                    end
-                                    phy_state <= PHY_WL_CHECK;
-                                end else begin // Increment ODELAY taps and try again
-                                    wl_tap[train_lane] <= wl_tap[train_lane] + {5'b0, WL_TAP_STEP};
-                                    wl_dq_tap[train_lane] <= wl_dq_tap[train_lane] + {5'b0, WL_TAP_STEP};
-                                    odelay_dqs_cntvalue <= wl_tap[train_lane] + {5'b0, WL_TAP_STEP};
-                                    odelay_dq_cntvalue <= wl_dq_tap[train_lane] + {5'b0, WL_TAP_STEP};
+                            if (wl_seen_zero[train_lane] && wl_feedback_one) begin
+                                wl_tap[train_lane] <= wl_final_dqs_tap;
+                                wl_dq_tap[train_lane] <= wl_final_dqs_tap - dqs_initial_tap[train_lane];
+                                odelay_dqs_cntvalue <= wl_final_dqs_tap;
+                                odelay_dq_cntvalue <= wl_final_dqs_tap - dqs_initial_tap[train_lane];
+                                phy_timer <= 4'd4;
+                                phy_state <= PHY_WL_APPLY;
+                                `ifndef YOSYS
+                                    $display("[%0t] PHY WL phase: lane %0d edge=%0d estimated_tCK=%0d baseline=%0d final_dqs=%0d final_dq=%0d",
+                                        $realtime, train_lane, wl_tap[train_lane], wl_period_estimate,
+                                        dqs_initial_tap[train_lane], wl_final_dqs_tap,
+                                        wl_final_dqs_tap - dqs_initial_tap[train_lane]);
+                                `endif
+                            end else if (wl_tap[train_lane][8:2] == 7'b1111111) begin
+                                // No low was ever observed, so the entire
+                                // programmable range was inside one high
+                                // feedback interval and no new 0-to-1 edge was
+                                // reachable. Do not fail solely for that range
+                                // limit, but restore the pre-WL 90-degree DQS
+                                // baseline and zero DQ delay before continuing.
+                                // Include the current sample: wl_seen_zero is
+                                // updated non-blockingly, so a low seen on this
+                                // final tap must not be mistaken for all-high.
+                                if (!wl_seen_zero[train_lane] && !wl_feedback_zero) begin
+                                    wl_tap[train_lane] <= dqs_initial_tap[train_lane];
+                                    wl_dq_tap[train_lane] <= 9'd0;
+                                    odelay_dqs_cntvalue <= dqs_initial_tap[train_lane];
+                                    odelay_dq_cntvalue <= 9'd0;
                                     phy_timer <= 4'd4;
-                                    phy_state <= PHY_WL_SAMPLE;
+                                    phy_state <= PHY_WL_APPLY;
+                                    `ifndef YOSYS
+                                        $display("[%0t] PHY WL fallback: lane %0d had no 0-to-1 edge; restoring DQS baseline tap %0d", $realtime, train_lane, dqs_initial_tap[train_lane]);
+                                    `endif
+                                end else begin
+                                    // A low response was observed but it never
+                                    // returned high. This cannot establish WL
+                                    // phase, so fail the lane but first restore
+                                    // its pre-WL DQS baseline and zero DQ delay.
+                                    wl_train_fail[train_lane] <= 1'b1;
+                                    wl_tap[train_lane] <= dqs_initial_tap[train_lane];
+                                    wl_dq_tap[train_lane] <= 9'd0;
+                                    odelay_dqs_cntvalue <= dqs_initial_tap[train_lane];
+                                    odelay_dq_cntvalue <= 9'd0;
+                                    phy_timer <= 4'd4;
+                                    phy_state <= PHY_WL_APPLY;
+                                    `ifndef YOSYS
+                                        $display("[%0t] PHY WL failed: lane %0d saw low but no 0-to-1 edge; restoring DQS baseline tap %0d", $realtime, train_lane, dqs_initial_tap[train_lane]);
+                                    `endif
                                 end
+                            end else begin
+                                wl_tap[train_lane] <= wl_tap[train_lane] + {5'b0, WL_TAP_STEP};
+                                wl_dq_tap[train_lane] <= wl_dq_tap[train_lane] + {5'b0, WL_TAP_STEP};
+                                odelay_dqs_cntvalue <= wl_tap[train_lane] + {5'b0, WL_TAP_STEP};
+                                odelay_dq_cntvalue <= wl_dq_tap[train_lane] + {5'b0, WL_TAP_STEP};
+                                phy_timer <= 4'd4;
+                                phy_state <= PHY_WL_SAMPLE;
                             end
+                        end
+                    end
+
+                    // Apply the normalized taps after CNTVALUEIN has been
+                    // stable for a complete controller clock.
+                    PHY_WL_APPLY: begin
+                        if (phy_timer != 0) begin
+                            if (phy_timer == 4'd3) begin
+                                odelay_dqs_load[train_lane] <= 1'b1;
+                                odelay_dq_load[train_lane]  <= 1'b1;
+                            end
+                            phy_timer <= phy_timer - 1'b1;
+                        end else begin
+                            phy_state <= PHY_WL_CHECK;
                         end
                     end
 
@@ -1619,7 +1698,9 @@ module ddr4_phy #(
     // signals dfi_init_complete to the memory controller.
     // -----------------------------------------------------------------
     (* IODELAY_GROUP = "ddr4_phy_iodelay" *)
-    IDELAYCTRL idelayctrl_inst (
+    IDELAYCTRL #(
+        .SIM_DEVICE("ULTRASCALE")
+    )idelayctrl_inst (
         .REFCLK(i_ref_clk),
         .RST(idelayctrl_rst),
         .RDY(idelayctrl_rdy_w)

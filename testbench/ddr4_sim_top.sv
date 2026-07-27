@@ -21,7 +21,8 @@
 //  PHY's write-leveling and gate-training FSMs must compensate for this.
 //  DQ/DQS are point-to-point so they stay zero-delay.
 //
-//  Wave dumping: VCD when `VCD_DUMP is defined (xsim), SHM otherwise. // Q: is SHM even used in vivado????
+//  Wave dumping: VCD when `VCD_DUMP is defined. Start/end time are set
+//  near the top of the simulation module.
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -150,6 +151,38 @@ module ddr4_sim_top;
 `else
     localparam TB_DENSITY = _8G;
     localparam TB_DENSITY_GB = 8;
+`endif
+
+    // ===================================================================
+    // VCD Dump Control
+    //
+    // Enable with:
+    //   +define+VCD_DUMP
+    //
+    // Optional compile-time overrides:
+    //   +define+SIM_VCD_START_TIME=<time in ps>
+    //   +define+SIM_VCD_END_TIME=<time in ps>
+    //
+    // Example: dump only 20 us through 30 us
+    //   +define+VCD_DUMP +define+SIM_VCD_START_TIME=20_000_000 +define+SIM_VCD_END_TIME=30_000_000
+    // ===================================================================
+//    `define VCD_DUMP
+`ifdef VCD_DUMP
+    localparam bit  TB_VCD_ENABLE = 1'b1;
+`else
+    localparam bit  TB_VCD_ENABLE = 1'b0;
+`endif
+
+`ifdef SIM_VCD_START_TIME
+    localparam time TB_VCD_START_TIME = `SIM_VCD_START_TIME;
+`else
+    localparam time TB_VCD_START_TIME = 'd17_034_867;
+`endif
+
+`ifdef SIM_VCD_END_TIME
+    localparam time TB_VCD_END_TIME = `SIM_VCD_END_TIME;
+`else
+    localparam time TB_VCD_END_TIME = 'd28_361_456;
 `endif
 
     // ===================================================================
@@ -1329,10 +1362,10 @@ module ddr4_sim_top;
                 rd_err_count = rd_err_count + 1;
             end
 
-            // 1b. Read CSR[0xC] — verify auto_reset_en is 0 (default)
+            // 1b. Read CSR[0xC] — verify auto_reset_en is 1 (fail-safe default)
             wb_dbg_read(4'hC);
-            if (wb_dbg_rdata[2] !== 1'b0) begin
-                $display("[%0t] FAIL: auto_reset_en not 0 at default (CSR[C]=0x%0h)", $realtime, wb_dbg_rdata);
+            if (wb_dbg_rdata[2] !== 1'b1) begin
+                $display("[%0t] FAIL: auto_reset_en not 1 at default (CSR[C]=0x%0h)", $realtime, wb_dbg_rdata);
                 rd_err_count = rd_err_count + 1;
             end
             wb_dbg_idle;
@@ -1388,8 +1421,8 @@ module ddr4_sim_top;
             reg [31:0] csr5_val;
             integer ar_timeout;
 
-            // 2a. Enable auto-reset: write bit[2]=1 to CSR 0xC
-            $display("[%0t]   Enabling auto_reset_en (CSR 0xC bit[2])", $realtime);
+            // 2a. Retain enabled auto-reset and exercise the CSR write path
+            $display("[%0t]   Keeping auto_reset_en enabled (CSR 0xC bit[2])", $realtime);
             wb_dbg_write(4'hC, 32'h4);
             wb_dbg_idle;
             repeat (2) @(posedge controller_clk);
@@ -2716,18 +2749,29 @@ module ddr4_sim_top;
 `endif
 
     // ===================================================================
-    // Wave Dump  -  VCD for xsim, SHM for Xcelium
+    // Wave Dump
     // ===================================================================
-`ifdef VCD_DUMP
-    initial begin
-        $dumpfile("trace.vcd");
-        $dumpvars(0, ddr4_sim_top);
-    end
-`else
-    initial begin
-        $shm_open("waves.shm", 1);
-        $shm_probe(ddr4_sim_top, "ASCMT");
-    end
-`endif
+    generate
+        if (TB_VCD_ENABLE) begin : g_vcd_dump
+            initial begin
+                if (TB_VCD_END_TIME <= TB_VCD_START_TIME) begin
+                    $display("[%0t] WARNING: VCD disabled because end time (%0t) is not after start time (%0t)",
+                             $realtime, TB_VCD_END_TIME, TB_VCD_START_TIME);
+                end else begin
+                    $dumpfile("trace.vcd");
+                    $dumpvars(0, ddr4_sim_top);
+                    $dumpoff;
+
+                    #(TB_VCD_START_TIME);
+                    $display("[%0t] VCD dump enabled: trace.vcd", $realtime);
+                    $dumpon;
+
+                    #(TB_VCD_END_TIME - TB_VCD_START_TIME);
+                    $dumpoff;
+                    $display("[%0t] VCD dump disabled: trace.vcd", $realtime);
+                end
+            end
+        end
+    endgenerate
 
 endmodule

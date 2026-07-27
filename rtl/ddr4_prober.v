@@ -57,15 +57,15 @@ module ddr4_prober #(
     input  wire                     i_clk,              // System clock (same as controller clock)
     input  wire                     i_rst_n,            // Active-low synchronous reset
     // Calibration status from controller
-    input  wire                     i_calib_complete,   // Pulses high when DDR4 init + PHY training finishes successfully
-    input  wire                     i_calib_error,      // High if calibration retries exhausted (unrecoverable training failure)
+    (* mark_debug = "true" *) input  wire                     i_calib_complete,   // Pulses high when DDR4 init + PHY training finishes successfully
+    (* mark_debug = "true" *) input  wire                     i_calib_error,      // High if calibration retries exhausted (unrecoverable training failure)
     // Init status (sticky — set once after calibration + optional BIST)
-    output reg                      o_init_done,        // Latches high once calibration passes AND BIST passes (or BIST disabled)
-    output reg                      o_init_failed,      // Latches high on calibration error OR BIST data mismatch; mutually exclusive with o_init_done
+    (* mark_debug = "true" *) output reg                      o_init_done,        // Latches high once calibration passes AND BIST passes (or BIST disabled)
+    (* mark_debug = "true" *) output reg                      o_init_failed,      // Latches high on calibration error OR BIST data mismatch; mutually exclusive with o_init_done
     // BIST status
-    output wire                     o_bist_busy,        // High while BIST FSM is actively issuing/checking memory transactions
-    output reg                      o_bist_failed_reset_req,   // Auto-reset request: asserted after BIST fail when CSR auto_reset_en is set
-    output reg                      o_soft_reset_req,   // CSR-triggered one-shot: resets controller + PHY to re-run full calibration
+    (* mark_debug = "true" *) output wire                     o_bist_busy,        // High while BIST FSM is actively issuing/checking memory transactions
+    (* mark_debug = "true" *) output reg                      o_bist_failed_reset_req,   // Auto-reset request: asserted after BIST fail when CSR auto_reset_en is set
+    (* mark_debug = "true" *) output reg                      o_soft_reset_req,   // CSR-triggered one-shot: resets controller + PHY to re-run full calibration
     // Wishbone B4 Master — BIST drives this to issue R/W to the DDR4 controller
     output reg                      o_wb_cyc,           // Bus cycle active (held high for entire BIST transaction burst)
     output reg                      o_wb_stb,           // Strobe: valid request on addr/data/we this cycle
@@ -89,14 +89,14 @@ module ddr4_prober #(
     output reg                      o_wb_dbg_ack,       // Registered ACK (1-cycle latency)
     output reg  [31:0]              o_wb_dbg_data,      // CSR read data
     // Status from controller (exposed via CSR for debug visibility)
-    input  wire [3:0]               i_calib_state,      // Controller calibration FSM state (0=IDLE..13=DONE, 14=ERROR)
-    input  wire                     i_stage1_pending,   // A new WB request is latched, waiting for stage 2
-    input  wire                     i_stage2_pending,   // A decoded request is being scheduled (issuing PRE/ACT/RD/WR)
-    input  wire                     i_stage2_we,        // Stage 2 request type: 1=write, 0=read
-    input  wire                     i_refresh_idle,     // Refresh timer in idle countdown — scheduler free to issue user commands
-    input  wire [NUM_BANKS-1:0]     i_bank_status,      // Per-bank status: 1=row open (active), 0=precharged (idle)
+    (* mark_debug = "true" *) input  wire [3:0]               i_calib_state,      // Controller calibration FSM state (0=IDLE..13=DONE, 14=ERROR)
+    (* mark_debug = "true" *) input  wire                     i_stage1_pending,   // A new WB request is latched, waiting for stage 2
+    (* mark_debug = "true" *) input  wire                     i_stage2_pending,   // A decoded request is being scheduled (issuing PRE/ACT/RD/WR)
+    (* mark_debug = "true" *) input  wire                     i_stage2_we,        // Stage 2 request type: 1=write, 0=read
+    (* mark_debug = "true" *) input  wire                     i_refresh_idle,     // Refresh timer in idle countdown — scheduler free to issue user commands
+    (* mark_debug = "true" *) input  wire [NUM_BANKS-1:0]     i_bank_status,      // Per-bank status: 1=row open (active), 0=precharged (idle)
     // Status from PHY (flat packed, exposed via CSR for training debug)
-    input  wire [3:0]               i_phy_state,        // PHY training FSM state (0=IDLE, 3=GATE_DONE, 7=EYE_DONE, 11=WL_DONE)
+    (* mark_debug = "true" *) input  wire [3:0]               i_phy_state,        // PHY training FSM state (0=IDLE, 3=GATE_DONE, 7=EYE_DONE, 11=WL_DONE)
     input  wire [9*BYTE_LANES-1:0]  i_phy_idelay_center, // 9b per lane: IDELAY tap at center of read data eye
     input  wire [9*BYTE_LANES-1:0]  i_phy_wl_tap,       // 9b per lane: ODELAY tap where DQS aligns to CK at DRAM
     input  wire [4*BYTE_LANES-1:0]  i_phy_bitslip,      // 4b per lane: ISERDES barrel-shift aligning capture to burst boundary
@@ -109,13 +109,39 @@ module ddr4_prober #(
     input  wire [9*BYTE_LANES-1:0]  i_phy_dqs_initial_tap, // 9b per lane: BISC-calibrated DQS baseline (MSB truncated in CSR)
     /* verilator lint_on UNUSEDSIGNAL */
     input  wire [BYTE_LANES-1:0]    i_phy_rd_lat_extra,  // 1b per lane: read data arrives 1 CLKDIV late
-    input  wire                     i_phy_en_vtc,        // 1 = voltage-temperature compensation active
-    input  wire [5:0]               i_instruction_address, // ROM step 0-35 (init progress)
-    input  wire                     i_pause_counter,     // 1 = ROM frozen by training FSM
-    input  wire                     i_reset_done,        // 1 = init ROM completed
-    input  wire                     i_pipe_stall,        // 1 = WB pipeline stalled
-    input  wire [1:0]               i_calib_retry_count  // Training retry attempts (0-3)
+    (* mark_debug = "true" *) input  wire                     i_phy_en_vtc,        // 1 = voltage-temperature compensation active
+    (* mark_debug = "true" *) input  wire [5:0]               i_instruction_address, // ROM step 0-35 (init progress)
+    (* mark_debug = "true" *) input  wire                     i_pause_counter,     // 1 = ROM frozen by training FSM
+    (* mark_debug = "true" *) input  wire                     i_reset_done,        // 1 = init ROM completed
+    (* mark_debug = "true" *) input  wire                     i_pipe_stall,        // 1 = WB pipeline stalled
+    (* mark_debug = "true" *) input  wire [1:0]               i_calib_retry_count  // Training retry attempts (0-3)
 );
+
+    // -----------------------------------------------------------------
+    // Lane-organized PHY debug probes
+    //
+    // The PHY status ports above are compact CSR transports. Marking those
+    // packed buses directly makes ILA display one hard-to-read aggregate
+    // probe. These aliases only name individual slices; they infer no logic
+    // and preserve the CSR interface unchanged. Each generated lane appears
+    // in ILA as gen_phy_lane_debug[n].<signal>.
+    // -----------------------------------------------------------------
+    (* mark_debug = "true" *) wire [BYTE_LANES-1:0] phy_train_fail_eye = i_phy_train_fail[2*BYTE_LANES-1:BYTE_LANES];
+    (* mark_debug = "true" *) wire [BYTE_LANES-1:0] phy_train_fail_wl = i_phy_train_fail[3*BYTE_LANES-1:2*BYTE_LANES];
+
+    generate
+        genvar dbg_lane;
+        for (dbg_lane = 0; dbg_lane < BYTE_LANES; dbg_lane = dbg_lane + 1) begin : gen_phy_lane_debug
+            (* mark_debug = "true" *) wire [8:0] phy_idelay_center_lane = i_phy_idelay_center[dbg_lane*9 +: 9];
+            (* mark_debug = "true" *) wire [8:0] phy_wl_dqs_tap_lane    = i_phy_wl_tap[dbg_lane*9 +: 9];
+            (* mark_debug = "true" *) wire [8:0] phy_wl_dq_tap_lane     = i_phy_wl_dq_tap[dbg_lane*9 +: 9];
+            (* mark_debug = "true" *) wire [8:0] phy_dqs_initial_tap_lane = i_phy_dqs_initial_tap[dbg_lane*9 +: 9];
+            (* mark_debug = "true" *) wire [8:0] phy_eye_width_lane     = i_phy_best_width[dbg_lane*9 +: 9];
+            (* mark_debug = "true" *) wire [8:0] phy_eye_start_lane     = i_phy_best_start[dbg_lane*9 +: 9];
+            (* mark_debug = "true" *) wire [3:0] phy_bitslip_lane       = i_phy_bitslip[dbg_lane*4 +: 4];
+            (* mark_debug = "true" *) wire       phy_rd_lat_extra_lane  = i_phy_rd_lat_extra[dbg_lane];
+        end
+    endgenerate
 
     // -----------------------------------------------------------------
     // BIST Architecture Overview
@@ -170,12 +196,12 @@ module ddr4_prober #(
     localparam [BIST_ADDR_BITS-1:0] RANDOM_END = {1'b1, BIST_MODE[1], {(BIST_ADDR_BITS-2){1'b1}}};
     localparam [BIST_ADDR_BITS-1:0] ALT_END    = {BIST_ADDR_BITS{1'b1}};
 
-    reg [2:0]  bist_state;
-    reg [31:0] correct_count;
-    reg [31:0] error_count;
-    reg        bist_fail_sticky;
-    reg        auto_reset_en;
-    wire       bist_pass;
+    (* mark_debug = "true" *) reg [2:0]  bist_state;
+    (* mark_debug = "true" *) reg [31:0] correct_count;
+    (* mark_debug = "true" *) reg [31:0] error_count;
+    (* mark_debug = "true" *) reg        bist_fail_sticky;
+    (* mark_debug = "true" *) reg        auto_reset_en;
+    (* mark_debug = "true" *) wire       bist_pass;
 
     // Module-scope CSR write-enable decode (visible to both gen_bist and gen_csr)
     wire csr_we = i_wb_dbg_cyc && i_wb_dbg_stb && i_wb_dbg_we;
@@ -207,7 +233,7 @@ module ddr4_prober #(
                 bist_csr_start_r <= 1'b0;
                 bist_csr_start_d <= 1'b0;
                 o_soft_reset_req <= 1'b0;
-                auto_reset_en    <= 1'b0;
+                auto_reset_en    <= 1'b1;
             end else begin
                 bist_csr_start_d <= bist_csr_start_r;
                 bist_csr_start_r <= 1'b0;
@@ -294,22 +320,42 @@ module ddr4_prober #(
             end
         endfunction
 
-        // Stress address mapping: distributes counter bits across BG, BA,
-        // row, and column fields (ADDR_MAPPING=1 layout) to force
-        // precharge/activate on nearly every access.
-        //   counter[1:0] → row[1:0]  (row changes every address)
-        //   counter[3:2] → BA        (bank changes every 4)
-        //   counter[5:4] → BG        (bank group changes every 16)
-        //   counter[9:6] → col[3:0]  (column varies)
+        // Stress address mapping: a one-to-one permutation of the BIST
+        // counter for the controller's ADDR_MAPPING=1 layout:
+        //   WB[0]     (BG)       <- counter[4]    (changes every 16)
+        //   WB[8:9]   (BA)       <- counter[3:2]  (changes every 4)
+        //   WB[10:11] (row LSbs) <- counter[1:0]  (changes every access)
+        //   WB[1:7]   (column)   <- counter[11:5]
+        //   remaining row bits retain their corresponding counter bits.
+        //
+        // Every counter bit occurs exactly once in the output. A stress
+        // transform may rearrange addresses, but must never discard high
+        // bits and alias many BIST patterns onto one DRAM location. This is
+        // also safe for MICRON_SIM's smaller BIST address range: every
+        // available counter bit still maps to one unique WB bit.
         /* verilator lint_off UNUSEDSIGNAL */
         function [WB_ADDR_BITS-1:0] stress_addr;
             input [BIST_ADDR_BITS-1:0] addr;
+            integer i;
             begin
                 stress_addr = {WB_ADDR_BITS{1'b0}};
-                stress_addr[1:0]   = addr[5:4];
-                stress_addr[5:2]   = addr[9:6];
-                stress_addr[11:10] = addr[3:2];
-                stress_addr[13:12] = addr[1:0];
+                for (i = 0; i < BIST_ADDR_BITS; i = i + 1) begin
+                    case (i)
+                        0:       stress_addr[10] = addr[i];
+                        1:       stress_addr[11] = addr[i];
+                        2:       stress_addr[8]  = addr[i];
+                        3:       stress_addr[9]  = addr[i];
+                        4:       stress_addr[0]  = addr[i];
+                        5:       stress_addr[1]  = addr[i];
+                        6:       stress_addr[2]  = addr[i];
+                        7:       stress_addr[3]  = addr[i];
+                        8:       stress_addr[4]  = addr[i];
+                        9:       stress_addr[5]  = addr[i];
+                        10:      stress_addr[6]  = addr[i];
+                        11:      stress_addr[7]  = addr[i];
+                        default: stress_addr[i]   = addr[i];
+                    endcase
+                end
             end
         endfunction
         /* verilator lint_on UNUSEDSIGNAL */
@@ -625,7 +671,10 @@ module ddr4_prober #(
             correct_count        <= 32'd0;
             error_count          <= 32'd0;
             bist_fail_sticky     <= 1'b0;
-            auto_reset_en        <= 1'b0;
+            // Keep CSR 0xC's reset value consistent even when BIST is
+            // compiled out. With BIST enabled, the equivalent reset path
+            // above also defaults this fail-safe recovery feature to enabled.
+            auto_reset_en        <= 1'b1;
             o_bist_failed_reset_req <= 1'b0;
             o_soft_reset_req     <= 1'b0;
             o_wb_cyc             <= 1'b0;
@@ -658,7 +707,7 @@ module ddr4_prober #(
     //   0xA -- CONFIG:        Static readback (BYTE_LANES, BIST_MODE)
     //   0xB -- VERSION:       IP version (major.minor, currently 0.1)
     //   0xC -- CONTROL:       bit[0] BIST start (W1S), bit[1] soft reset (W1S),
-    //                         bit[2] auto-reset on BIST fail (R/W, default 0)
+    //                         bit[2] auto-reset on BIST fail (R/W, default 1)
     //   0xD -- INIT_PROGRESS: ROM step, pause, reset_done, pipe_stall
     //
     generate if (DEBUG_CSR_ENABLE) begin : gen_csr

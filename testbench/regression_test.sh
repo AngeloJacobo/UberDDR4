@@ -22,17 +22,72 @@ CYAN="\033[36m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-cleanup() {
-    echo -e "\n${RED}Interrupted — killing child processes...${RESET}"
-    [[ -n "${SIM_PID:-}" ]] && kill -- -$SIM_PID 2>/dev/null
-    wait 2>/dev/null
-    exit 130
+SIM_HAS_OWN_PG=false
+SIM_PID=""
+# Ctrl+C is broadcast to every foreground Git-Bash pipeline member.  Make the
+# handler idempotent so only one shell owns termination of the XSim tree.
+CLEANUP_RUNNING=0
+
+# setsid is available on typical Linux hosts but absent from Git Bash.  It is
+# used only for Ctrl+C process-group cleanup, not for simulation correctness.
+start_simulation() {
+    local log_file="$1"
+    shift
+    SIM_HAS_OWN_PG=false
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$@" > "$log_file" 2>&1 &
+        SIM_HAS_OWN_PG=true
+    else
+        "$@" > "$log_file" 2>&1 &
+    fi
+    SIM_PID=$!
 }
-trap cleanup INT TERM HUP
+
+# setsid lets Linux terminate an entire process group.  Git Bash has no
+# setsid, so use Windows taskkill /T to terminate Bash, pipelines, and XSim.
+terminate_simulation_tree() {
+    local pid="$1"
+    local own_pg="$2"
+    if $own_pg; then
+        kill -- -"$pid" 2>/dev/null
+    elif command -v taskkill.exe >/dev/null 2>&1; then
+        taskkill.exe /PID "$pid" /T /F >/dev/null 2>&1
+    else
+        local child
+        for child in $(pgrep -P "$pid" 2>/dev/null); do
+            terminate_simulation_tree "$child" false
+        done
+        kill "$pid" 2>/dev/null
+    fi
+}
+
+cleanup() {
+    local exit_code="${1:-130}"
+    if (( CLEANUP_RUNNING )); then
+        trap - INT TERM HUP
+        exit "$exit_code"
+    fi
+    CLEANUP_RUNNING=1
+    trap - INT TERM HUP
+    echo -e "\n${RED}Interrupted — killing child processes...${RESET}"
+    if [[ -n "${SIM_PID:-}" ]]; then
+        terminate_simulation_tree "$SIM_PID" "$SIM_HAS_OWN_PG"
+        # Never use an unqualified `wait` here: it can wait on unrelated
+        # pipeline members and is susceptible to another Ctrl+C delivery.
+        wait "$SIM_PID" 2>/dev/null || true
+        SIM_PID=""
+    fi
+    exit "$exit_code"
+}
+trap 'cleanup 130' INT TERM HUP
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-LOG_DIR="$REPO_ROOT/UberDDR4/testbench/regression_logs"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The regression changes to REPO_ROOT before each test, so keeping this
+# relative avoids Windows/Git-Bash issues with absolute paths containing
+# spaces while remaining portable on Linux.
+LOG_DIR="testbench/regression_logs"
+CONFIG_FILE="$LOG_DIR/regression_config.vh"
 
 # Each line: NAME  DDR4_CLK  DW  LANES  FLYBY  MAP  BIST  DM  DENS  ROWS  MICRON_DEF     MICRON_SPEED  SPECIAL
 #   DW = DEVICE_WIDTH (4, 8, or 16)
@@ -101,6 +156,22 @@ total=${#TESTS[@]}
 rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR"
 
+write_regression_config() {
+    {
+        printf '`define SIM_DDR4_CLK_PERIOD %s\n' "$DDR4_CLK"
+        printf '`define SIM_DEVICE_WIDTH %s\n' "$DW"
+        printf '`define SIM_BYTE_LANES %s\n' "$LANES"
+        printf '`define SIM_FLY_BY_DELAY %s\n' "$FLYBY"
+        printf '`define SIM_ADDR_MAPPING %s\n' "$MAP"
+        printf '`define SIM_BIST_MODE %s\n' "$BIST"
+        printf '`define SIM_BIST_DM_TEST %s\n' "$DM"
+        printf '`define SIM_ROW_BITS %s\n' "$ROWS"
+        [[ "$DENS" == "4" ]] && printf '`define SIM_DENSITY_4G\n'
+        [[ "$SPECIAL" == "TRAIN_FAIL" ]] && printf '`define SIM_FORCE_TRAIN_FAIL\n'
+        [[ "$SPECIAL" == "CSR_RESET" ]] && printf '`define SIM_CSR_RESET_TEST\n'
+    } > "$CONFIG_FILE"
+}
+
 echo ""
 echo -e "${BOLD}${CYAN}=== UberDDR4 Calibration Regression Suite ===${RESET}"
 echo -e "${DIM}Vivado: $XILINX_VIVADO${RESET}"
@@ -117,7 +188,11 @@ declare -a TIMES
 for entry in "${TESTS[@]}"; do
     read -r NAME DDR4_CLK DW LANES FLYBY MAP BIST DM DENS ROWS MICRON_DEF MICRON_SPD SPECIAL <<< "$entry"
 
-    DEFINES="-d SIM_DDR4_CLK_PERIOD=$DDR4_CLK"
+    # Vivado 2022.2 on Windows misparses -d NAME=<numeric-value> and
+    # treats the value as a source filename.  The baseline tCK is already
+    # the testbench default, so do not pass a redundant numeric define.
+    DEFINES=""
+    [[ "$DDR4_CLK" != "834" ]] && DEFINES="-d SIM_DDR4_CLK_PERIOD=$DDR4_CLK"
     [[ "$DW" != "8" ]]      && DEFINES="$DEFINES -d SIM_DEVICE_WIDTH=$DW"
     [[ "$LANES" != "2" ]]   && DEFINES="$DEFINES -d SIM_BYTE_LANES=$LANES"
     [[ "$FLYBY" != "0" ]]   && DEFINES="$DEFINES -d SIM_FLY_BY_DELAY=$FLYBY"
@@ -129,7 +204,10 @@ for entry in "${TESTS[@]}"; do
     [[ "$SPECIAL" == "TRAIN_FAIL" ]] && DEFINES="$DEFINES -d SIM_FORCE_TRAIN_FAIL"
     [[ "$SPECIAL" == "CSR_RESET" ]] && DEFINES="$DEFINES -d SIM_CSR_RESET_TEST"
 
+    write_regression_config
+    DEFINES=""
     export EXTRA_DEFINES="$DEFINES"
+    export SIM_CONFIG_FILE="$CONFIG_FILE"
     export MICRON_DENSITY="$MICRON_DEF"
     export MICRON_SPEED="$MICRON_SPD"
 
@@ -146,8 +224,13 @@ for entry in "${TESTS[@]}"; do
     LOG="$LOG_DIR/${NAME}.log"
 
     start_time=$(date +%s)
-    setsid bash -c 'set -o pipefail; timeout 60m bash UberDDR4/testbench/run_xsim.sh 2>&1 | sed "s/\x1b\[[0-9;]*m//g"' > "$LOG" &
-    SIM_PID=$!
+    # timeout is also a GNU/Linux utility and is not bundled with Git Bash.
+    # On Windows, let XSim run normally; Ctrl+C still terminates the child.
+    if command -v timeout >/dev/null 2>&1; then
+        start_simulation "$LOG" bash -c 'set -o pipefail; timeout 60m bash testbench/run_xsim.sh 2>&1 | sed "s/\x1b\[[0-9;]*m//g"'
+    else
+        start_simulation "$LOG" bash -c 'set -o pipefail; bash testbench/run_xsim.sh 2>&1 | sed "s/\x1b\[[0-9;]*m//g"'
+    fi
     wait $SIM_PID
     if [[ $? -eq 0 ]]; then
         sim_ok=true

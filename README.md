@@ -410,7 +410,7 @@ Total number of read comparisons that passed (0x3) or failed (0x4). A healthy sy
 | :---: | :--- | :---: | :--- |
 | [0] | BIST Start | 0 | W1S: write 1 to trigger a BIST run (self-clears). Read always returns 0. |
 | [1] | Soft Reset | 0 | W1S: write 1 to trigger soft reset + full re-calibration (self-clears). |
-| [2] | Auto Reset En | 0 | R/W: when set, a BIST failure automatically triggers soft-reset and re-calibration. |
+| [2] | Auto Reset En | 1 | R/W, reset default `1`: when set, a BIST failure automatically triggers soft-reset and re-calibration. |
 
 ---
 
