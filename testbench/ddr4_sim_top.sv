@@ -166,7 +166,7 @@ module ddr4_sim_top;
     // Example: dump only 20 us through 30 us
     //   +define+VCD_DUMP +define+SIM_VCD_START_TIME=20_000_000 +define+SIM_VCD_END_TIME=30_000_000
     // ===================================================================
-//    `define VCD_DUMP
+    `define VCD_DUMP
 `ifdef VCD_DUMP
     localparam bit  TB_VCD_ENABLE = 1'b1;
 `else
@@ -174,15 +174,15 @@ module ddr4_sim_top;
 `endif
 
 `ifdef SIM_VCD_START_TIME
-    localparam time TB_VCD_START_TIME = `SIM_VCD_START_TIME;
+    localparam time TB_VCD_START_TIME = 'd2373487;
 `else
-    localparam time TB_VCD_START_TIME = 'd17_034_867;
+    localparam time TB_VCD_START_TIME = 'd2373487;
 `endif
 
 `ifdef SIM_VCD_END_TIME
-    localparam time TB_VCD_END_TIME = `SIM_VCD_END_TIME;
+    localparam time TB_VCD_END_TIME = 'd5340154;
 `else
-    localparam time TB_VCD_END_TIME = 'd28_361_456;
+    localparam time TB_VCD_END_TIME = 'd5340154;
 `endif
 
     // ===================================================================
@@ -1126,8 +1126,8 @@ module ddr4_sim_top;
     //   wb_push_write/read()    wb_pump_all()          ACK checker
     //         │                      │                      │
     //         ▼                      │                      │
-    //   ┌──────────┐   pop front    │     on ACK: pop      │
-    //   │  txn_q   │ ────────────► bus ────────────► ┌─────────────┐
+    //   ┌──────────�?   pop front    │     on ACK: pop      │
+    //   │  txn_q   │ ────────────► bus ────────────► ┌─────────────�?
     //   │ (pending)│  when !STALL   │                │ inflight_q  │
     //   └──────────┘                │                │(waiting ACK)│
     //                               │                └─────────────┘
@@ -1199,7 +1199,7 @@ module ddr4_sim_top;
     //
     // Timing diagram (no stalls):
     //
-    //   CLK   ─┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐
+    //   CLK   ─�?  ┌──�?  ┌──�?  ┌──�?  ┌──�?  ┌──�?  ┌──�?
     //   CYC   ─────────────────────────────────────────── (high entire time)
     //   STB   ─────────────────────────────── (drops when queue empty)
     //   STALL  _____________________________________ (slave not stalling)

@@ -18,6 +18,9 @@
 # Environment:
 #   EXTRA_DEFINES  -  extra xvlog -d flags, e.g. "-d SIM_FLY_BY_DELAY=200"
 #                     (used by regression_test.sh to sweep configurations)
+#   PHY_IMPL       -  component (default) or native.  This defines the
+#                     testbench's TB_USE_NATIVE_PHY selector.  The testbench
+#                     itself textually includes exactly one implementation.
 #
 set -euo pipefail
 
@@ -55,6 +58,7 @@ XELAB="$XILINX_VIVADO/bin/xelab"
 XSIM="$XILINX_VIVADO/bin/xsim"
 
 EXTRA_DEFS="${EXTRA_DEFINES:-}"
+PHY_IMPL="${PHY_IMPL:-component}"
 MICRON_DENSITY="${MICRON_DENSITY:-DDR4_8G_X8}"
 MICRON_SPEED="${MICRON_SPEED:-FIXED_2400}"
 SIM_CONFIG_FILE="${SIM_CONFIG_FILE:-}"
@@ -78,11 +82,25 @@ fi
 echo ""
 echo -e "${DIM}Vivado: $XILINX_VIVADO${RESET}"
 
+case "$PHY_IMPL" in
+    component)
+        PHY_TB_DEFINE=()
+        ;;
+    native)
+        PHY_TB_DEFINE=(-d TB_USE_NATIVE_PHY)
+        ;;
+    *)
+        fail "Unknown PHY_IMPL='$PHY_IMPL' (use component or native)"
+        exit 1
+        ;;
+esac
+
+echo -e "${DIM}PHY implementation: $PHY_IMPL${RESET}"
+
 step "Compiling RTL"
 "$XVLOG" -sv \
   $EXTRA_DEFS \
   rtl/ddr4_controller.v \
-  rtl/ddr4_phy.v \
   rtl/ddr4_prober.v \
   rtl/ddr4_top.v
 
@@ -98,6 +116,7 @@ fi
 
 step "Compiling simulation sources"
 "$XVLOG" -sv -d $MICRON_DENSITY -d $MICRON_SPEED -d ALLOW_JITTER $VCD_FLAG \
+  "${PHY_TB_DEFINE[@]}" \
   $EXTRA_DEFS \
   -i testbench/micron \
   testbench/micron/arch_package.sv \
