@@ -150,7 +150,7 @@ elif grep -q "PASS: init_failed asserted as expected" sim_result.log; then
     pass "Training failure test PASSED (init_failed correctly detected)"
 elif grep -q "PASS: CSR reset test" sim_result.log; then
     pass "CSR reset test PASSED"
-elif grep -q "FAIL: rd_err\|FAIL: CSR reset test" sim_result.log; then
+elif grep -q "FAIL: rd_err\|FAIL: CSR reset test\|NATIVE_TX_DEBUG: FAIL" sim_result.log; then
     fail "Simulation FAILED (data mismatch)"
     exit 1
 elif grep -q "PASS:" sim_result.log; then

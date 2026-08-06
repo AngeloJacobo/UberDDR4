@@ -70,7 +70,15 @@ module ddr4_phy_native #(
     parameter SIM_DEVICE = "ULTRASCALE_PLUS",
               PHY_PROFILE = "GENERIC",
               FIFO_PACE_LANE = (BYTE_LANES > 0) ? BYTE_LANES-1 : 0,
-              FIFO_PACE_BIT  = DQ_BITS-1
+              FIFO_PACE_BIT  = DQ_BITS-1,
+    // Native RX FIFO framing is anchored by the DDR4 read-DQS preamble.
+    // The first received 8-bit word contains two preamble samples followed
+    // by BL8 data beats 0..5; the next word supplies beats 6..7.  The
+    // application-data window therefore starts two serial positions in.
+              NATIVE_RX_PREAMBLE_BITS = 2,
+    // Number of CLKDIV cycles after DFI rddata_en before the native FIFO has
+    // supplied both words required by the framing window above.
+              NATIVE_RX_RETURN_DELAY = 4
 ) (
     // Clocks and reset
     input wire                              i_controller_clk,
@@ -631,13 +639,10 @@ module ddr4_phy_native #(
     // -----------------------------------------------------------------
     // Native receive gating enable
     //
-    // PHY_RDEN is deliberately *not* derived from i_dfi_rddata_en.  That
-    // DFI signal occurs at the fabric read-data boundary, after the DRAM DQS
-    // preamble which the BITSLICE_CONTROL must use to arm its native gate.
-    // Per UG571 Native Mode Bring-up, a receive interface holds PHY_RDEN[3:0]
-    // High once VTC/interface bring-up has completed.  The BISC then handles
-    // each intermittent DQS burst at the pins.  This is independent of the
-    // controller's read-latency bookkeeping and works for all CL values.
+    // PHY_RDEN is deliberately not derived from i_dfi_rddata_en. That DFI
+    // signal occurs at the fabric return boundary, after the DRAM DQS
+    // preamble which BITSLICE_CONTROL uses to arm its native receiver. UG571
+    // requires PHY_RDEN[3:0] High once native RX bring-up is complete.
     // -----------------------------------------------------------------
     wire phy_rden_ready = rst_phy_rden;
 
@@ -687,15 +692,14 @@ module ddr4_phy_native #(
     // -----------------------------------------------------------------
     // FIFO Read Enable
     //
-    // Native RX FIFOs are written in the DQS/strobe domain.  UG571 requires
-    // FIFO_RD_EN to be paced by the FIFO furthest from the strobe receiver
-    // and clock backbone, not by an AND reduction of unrelated FIFO flags.
-    // The physical-map profile selects that bit through FIFO_PACE_LANE/BIT.
-    // Keeping the selection as a parameter makes the DFI core portable while
-    // preserving a board-specific, placement-correct native timing path.
+    // Native RX FIFOs are written by the common byte DQS clock and must be
+    // drained coherently so all DQ bits retain the same BL8 word boundary.
+    // Select one profile-defined pacing FIFO (normally the physical far end
+    // of the byte group), register its ~FIFO_EMPTY status, and replicate the
+    // enable to every DATA slice.  This matches the common FIFO_RD_EN
+    // topology used by MIG's native PHY.
     // -----------------------------------------------------------------
     wire fifo_pace_not_empty = ~fifo_empty[FIFO_PACE_LANE][FIFO_PACE_BIT];
-
     always @(posedge i_controller_clk)
         if (sync_rst) fifo_rd_en <= 1'b0;
         else          fifo_rd_en <= fifo_pace_not_empty & rst_phy_rden;
@@ -849,15 +853,13 @@ module ddr4_phy_native #(
     reg [3:0] eye_observe_offset;
     reg [1:0] eye_verify_retries;
     reg [BYTE_LANES-1:0] rd_lat_extra;
-    reg [SERDES_RATIO-1:0] rddata_en_d1;
+    reg [NATIVE_RX_RETURN_DELAY-1:0] native_rddata_en_pipe;
     reg [2*SERDES_RATIO-1:0] ontime_shadow [0:TOTAL_DQ-1];
-    // DFI does not prescribe a fixed tPHY_RDLAT.  Native RXTX FIFO output
-    // advances in the strobe clock domain, so return data is retired from
-    // that FIFO rather than at a fabricated fixed delay from rddata_en.
-    reg       fifo_rd_en_d1;
-    reg [4:0] native_read_credits;
-    wire      native_fifo_word_valid = fifo_rd_en_d1 && (native_read_credits != 0);
+    // RXTX_BITSLICE FIFO output runs continuously under the registered
+    // FIFO_EMPTY handshake above. Native word framing completes after the
+    // DFI request, so return data after the fixed FIFO window has arrived.
     wire      dfi_read_expected = |i_dfi_rddata_en;
+    wire      dfi_read_due = native_rddata_en_pipe[NATIVE_RX_RETURN_DELAY-1];
     reg [8:0] eye_center_tap [0:BYTE_LANES-1];
     reg [8:0] eye_best_width [0:BYTE_LANES-1];
     reg [8:0] eye_best_start [0:BYTE_LANES-1];
@@ -990,9 +992,7 @@ module ddr4_phy_native #(
             eye_observe_offset  <= 4'b0;
             eye_verify_retries  <= 2'b0;
             rd_lat_extra        <= {BYTE_LANES{1'b0}};
-            rddata_en_d1        <= {SERDES_RATIO{1'b0}};
-            fifo_rd_en_d1       <= 1'b0;
-            native_read_credits <= 5'b0;
+            native_rddata_en_pipe <= {NATIVE_RX_RETURN_DELAY{1'b0}};
             odelay_dqs_cntvalue <= 9'b0;
             odelay_dq_cntvalue  <= 9'b0;
             wl_dqs_strobe       <= 1'b0;
@@ -1011,25 +1011,19 @@ module ddr4_phy_native #(
             end
             wl_dqs_strobe <= 1'b0;
 
+            // The controller is allowed to wait for dfi_rddata_valid.  This
+            // fixed native-PHY return delay provides the two FIFO captures
+            // needed to replace the DQS-preamble samples with BL8 beats 6..7.
+            native_rddata_en_pipe <= {native_rddata_en_pipe[NATIVE_RX_RETURN_DELAY-2:0],
+                                      dfi_read_expected};
+
             // Update previous ISERDES outputs for bitslip window
             for (dfi_pack_idx = 0; dfi_pack_idx < TOTAL_DQ; dfi_pack_idx = dfi_pack_idx + 1)
                 prev_iserdes_q[dfi_pack_idx] <= iserdes_dq_q[dfi_pack_idx];
 
-            // FIFO_RD_EN advances every byte FIFO together.  It is registered
-            // once before sampling RX_DATA, which is the FIFO output latency
-            // specified for the native interface.  Credits are created by the
-            // controller's read expectation and consumed strictly in FIFO
-            // order, allowing a variable (but bounded) asynchronous-FIFO
-            // return latency without losing back-to-back read ordering.
-            fifo_rd_en_d1 <= fifo_rd_en;
-            case ({dfi_read_expected, native_fifo_word_valid})
-                2'b10: native_read_credits <= native_read_credits + 1'b1;
-                2'b01: native_read_credits <= native_read_credits - 1'b1;
-                default: native_read_credits <= native_read_credits;
-            endcase
 
             o_dfi_rddata_valid <= {SERDES_RATIO{1'b0}};
-            if (native_fifo_word_valid) begin
+            if (dfi_read_due) begin
                 for (dfi_pack_lane = 0; dfi_pack_lane < BYTE_LANES; dfi_pack_lane = dfi_pack_lane + 1) begin
                     for (dfi_pack_bit = 0; dfi_pack_bit < DQ_BITS; dfi_pack_bit = dfi_pack_bit + 1) begin
                         dfi_pack_idx = dfi_pack_lane * DQ_BITS + dfi_pack_bit;
@@ -1125,6 +1119,8 @@ module ddr4_phy_native #(
                             if (eye_observe_verify) begin
                                 if (eye_observe_seen | pattern_found_comb) begin
                                     pattern_found_q <= 1'b1;
+                                    pattern_offset_q <= eye_observe_seen ?
+                                                        eye_observe_offset : pattern_offset_comb;
                                     verify_mode <= 1'b1;
                                     phy_state <= PHY_EYE_LATE;
                                 end else if (eye_verify_retries != 2'd3) begin
@@ -1158,20 +1154,12 @@ module ddr4_phy_native #(
                                 cur_offset <= pattern_offset_q;
                                 cur_late <= pattern_late_q;
                                 in_range <= 1'b1;
-                            end else if (pattern_offset_q == cur_offset && pattern_late_q == cur_late) begin
-                                cur_width <= cur_width + {5'd0, TAP_SWEEP_STEP};
                             end else begin
-                                if (!best_valid || cur_width > best_width) begin
-                                    best_start <= cur_start;
-                                    best_width <= cur_width;
-                                    best_offset <= cur_offset;
-                                    best_late <= cur_late;
-                                    best_valid <= 1'b1;
-                                end
-                                cur_start <= sweep_tap;
-                                cur_width <= 9'd0;
-                                cur_offset <= pattern_offset_q;
-                                cur_late <= pattern_late_q;
+                                // RXTX FIFO word-boundary phase is independent
+                                // of the analog DQ eye.  Consecutive valid MPR
+                                // observations can report different 8-bit
+                                // offsets without any change in eye margin.
+                                cur_width <= cur_width + {5'd0, TAP_SWEEP_STEP};
                             end
                         end else begin
                             if (in_range) begin
@@ -1267,6 +1255,16 @@ module ddr4_phy_native #(
                         end else begin
                             verify_mode <= 1'b0;
                             if (pattern_found_q) begin
+                                // Centre verification is the final known MPR
+                                // return. Use its recovered serial phase for
+                                // the application-data barrel shifter.
+                                // MPR is used to find the data-eye center.  Its
+                                // repeated pattern cannot uniquely identify the
+                                // native FIFO word boundary.  That boundary is
+                                // instead fixed by the DDR4 read-DQS preamble:
+                                // skip its two serial samples to form a BL8
+                                // application-data window across two captures.
+                                bitslip_count_q[train_lane] <= NATIVE_RX_PREAMBLE_BITS[3:0];
                                 /* verilator lint_off WIDTHEXPAND */
                                 if (train_lane < BYTE_LANES - 1) begin
                                 /* verilator lint_on WIDTHEXPAND */

@@ -29,6 +29,8 @@ module ddr4_phy_native_byte #(
     // RX data (read path)
     output wire [DQ_BITS*8-1:0] o_rx_dq_data,
     output wire [DQ_BITS-1:0]   o_fifo_empty,
+    // All DQ slice FIFOs in a byte advance coherently to preserve the BL8
+    // word boundary across every DQ bit.
     input  wire                 i_fifo_rd_en,
     // RX delay control
     input  wire [8:0]  i_rx_cntvaluein,
@@ -124,10 +126,11 @@ assign tx_bit_ctrl_in6_upp = 40'd0;
 BITSLICE_CONTROL #(
     .DIV_MODE           ("DIV4"),
     .SERIAL_MODE        ("FALSE"),
-    // The byte interface presents its DQS clock 90 degrees from the DQ
-    // sample point, so the native receive clock remains unshifted here.
-    .RX_CLK_PHASE_P     ("SHIFT_0"),
-    .RX_CLK_PHASE_N     ("SHIFT_0"),
+    // For native DDR4 receives, sample DQ in the center of the DQS eye.
+    // This is the same SHIFT_90 P/N phase used by the UltraScale MIG
+    // BITSLICE_CONTROL topology; RX_CLK at each DATA slice is tied High.
+    .RX_CLK_PHASE_P     ("SHIFT_90"),
+    .RX_CLK_PHASE_N     ("SHIFT_90"),
     .EN_OTHER_PCLK      ("TRUE"),
     .EN_OTHER_NCLK      ("TRUE"),
     .SELF_CALIBRATE     ("ENABLE"),
@@ -203,8 +206,8 @@ BITSLICE_CONTROL #(
 BITSLICE_CONTROL #(
     .DIV_MODE           ("DIV4"),
     .SERIAL_MODE        ("FALSE"),
-    .RX_CLK_PHASE_P     ("SHIFT_0"),
-    .RX_CLK_PHASE_N     ("SHIFT_0"),
+    .RX_CLK_PHASE_P     ("SHIFT_90"),
+    .RX_CLK_PHASE_N     ("SHIFT_90"),
     .EN_OTHER_PCLK      ("FALSE"),
     .EN_OTHER_NCLK      ("FALSE"),
     .SELF_CALIBRATE     ("ENABLE"),
@@ -378,9 +381,14 @@ RXTX_BITSLICE #(
     .TX_DATA_WIDTH      (8),
     .RX_DELAY_FORMAT    ("COUNT"),
     .TX_DELAY_FORMAT    ("COUNT"),
-    .RX_DELAY_TYPE      ("VAR_LOAD"),
+    // DQS is the native source-synchronous receive clock.  Its RX delay is
+    // not part of the DQ eye sweep: keep it at the calibrated zero-delay
+    // reference exactly as the UltraScale MIG DQS BITSLICE does.  Moving it
+    // by an arbitrary startup count changes the receiver gate phase and can
+    // truncate a BL8 burst's final beat.
+    .RX_DELAY_TYPE      ("FIXED"),
     .TX_DELAY_TYPE      ("VAR_LOAD"),
-    .RX_DELAY_VALUE     (50),
+    .RX_DELAY_VALUE     (0),
     .TX_DELAY_VALUE     (0),
     .TX_OUTPUT_PHASE_90 ("TRUE"),
     .RX_REFCLK_FREQUENCY(REFCLK_FREQ),
@@ -396,7 +404,7 @@ RXTX_BITSLICE #(
     .TX_RST             (i_bitslice_rst),
     .RX_RST_DLY         (i_bitslice_rst),
     .TX_RST_DLY         (i_bitslice_rst),
-    .RX_CLK             (i_div_clk),
+    .RX_CLK             (1'b1),
     .TX_CLK             (i_div_clk),
     .RX_EN_VTC          (i_bitslice_en_vtc),
     .TX_EN_VTC          (i_bitslice_en_vtc),
@@ -467,7 +475,12 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
         .TX_RST             (i_bitslice_rst),
         .RX_RST_DLY         (i_bitslice_rst),
         .TX_RST_DLY         (i_bitslice_rst),
-        .RX_CLK             (i_div_clk),
+        // DATA slices are clocked by the byte's DQS through the native
+        // BITSLICE_CONTROL network.  RX_CLK must therefore be tied High;
+        // i_div_clk is only the mesochronous FIFO read clock.  This matches
+        // the UltraScale DDR4 MIG topology and prevents the first DQS sample
+        // of a BL8 read from being lost.
+        .RX_CLK             (1'b1),
         .TX_CLK             (i_div_clk),
         .RX_EN_VTC          (i_bitslice_en_vtc),
         .TX_EN_VTC          (i_bitslice_en_vtc),
@@ -549,7 +562,8 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_upper
         .TX_RST             (i_bitslice_rst),
         .RX_RST_DLY         (i_bitslice_rst),
         .TX_RST_DLY         (i_bitslice_rst),
-        .RX_CLK             (i_div_clk),
+        // See the lower-nibble DATA slice: DQS, not CLKDIV, clocks native RX.
+        .RX_CLK             (1'b1),
         .TX_CLK             (i_div_clk),
         .RX_EN_VTC          (i_bitslice_en_vtc),
         .TX_EN_VTC          (i_bitslice_en_vtc),
