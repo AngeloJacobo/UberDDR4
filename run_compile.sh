@@ -27,11 +27,11 @@
 # Engineer: Angelo C. Jacobo
 set -o pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 CHILD_PID=""
 CHILD_HAS_OWN_PG=false
-# Ctrl+C is delivered to this script and, on Git Bash, to each member of the
-# foreground pipeline.  Do not let a second delivery re-enter cleanup while
-# the first handler is terminating the process tree.
 CLEANUP_RUNNING=0
 
 # Linux commonly provides setsid; Git Bash normally does not.  The test
@@ -57,51 +57,32 @@ start_background_log() {
     CHILD_PID=$!
 }
 
-# Terminate every descendant of a background test.  On Linux, setsid gives
-# the child a dedicated process group.  Git Bash lacks setsid, so taskkill's
-# /T option is required to terminate the Bash/pipeline/XSim process tree.
-terminate_child_tree() {
-    local pid="$1"
-    local own_pg="$2"
-    if $own_pg; then
-        kill -- -"$pid" 2>/dev/null
-    elif command -v taskkill.exe >/dev/null 2>&1; then
-        taskkill.exe /PID "$pid" /T /F >/dev/null 2>&1
-    else
-        # Portable non-Windows fallback for hosts without setsid.
-        local child
-        for child in $(pgrep -P "$pid" 2>/dev/null); do
-            terminate_child_tree "$child" false
-        done
-        kill "$pid" 2>/dev/null
-    fi
-}
-
 cleanup() {
     local exit_code="${1:-130}"
-    if (( CLEANUP_RUNNING )); then
-        # The original handler already owns child termination.  Removing the
-        # trap before exiting prevents the repeated "Interrupted" loop seen
-        # when Git Bash broadcasts Ctrl+C to nested shell pipelines.
-        trap - INT TERM HUP
-        exit "$exit_code"
-    fi
+    (( CLEANUP_RUNNING )) && return
     CLEANUP_RUNNING=1
-    trap - INT TERM HUP
-    printf "\n\033[31mInterrupted — killing child processes...\033[0m\n"
+    trap '' INT TERM HUP
+    printf "\n\033[31mInterrupted — stopping child process...\033[0m\n"
     if [[ -n "${CHILD_PID:-}" ]]; then
-        terminate_child_tree "$CHILD_PID" "$CHILD_HAS_OWN_PG"
-        # Wait only for the process we started.  A bare `wait` can itself be
-        # interrupted by the terminal signal and recursively invoke cleanup.
+        if $CHILD_HAS_OWN_PG; then
+            kill -TERM -- -"$CHILD_PID" 2>/dev/null || true
+        else
+            kill -TERM "$CHILD_PID" 2>/dev/null || true
+        fi
+        local attempt
+        for attempt in {1..50}; do
+            kill -0 "$CHILD_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$CHILD_PID" 2>/dev/null; then
+            kill -KILL "$CHILD_PID" 2>/dev/null || true
+        fi
         wait "$CHILD_PID" 2>/dev/null || true
         CHILD_PID=""
     fi
     exit "$exit_code"
 }
 trap 'cleanup 130' INT TERM HUP
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -492,38 +473,22 @@ run_sim() {
 
     if $SIM_REGR; then
         header "$STAGE" "$TOTAL" "Simulation Regression (${#SIM_TESTS[@]} tests)"
-        mkdir -p "$LOGDIR"
-        local log="$LOGDIR/sim_regression.log"
-        local st0
+        local st0 st1 regression_rc=0
         st0=$(date +%s)
 
-        local strip_ansi='s/\x1b\[[0-9;]*m//g'
-        local name_re='^\[([0-9]+)/([0-9]+)\] +([^ ]+)'
-        local result_re='(PASS|FAIL) +\(([0-9]+)s\)'
-        local cur_name=""
-
-        while IFS= read -r line; do
-            echo "$line" >> "$log"
-            local clean
-            clean=$(printf '%s' "$line" | sed "$strip_ansi")
-            if [[ $clean =~ $name_re ]]; then
-                cur_name="${BASH_REMATCH[3]}"
-            fi
-            if [[ -n "$cur_name" && $clean =~ $result_re ]]; then
-                local result="${BASH_REMATCH[1]}"
-                local secs="${BASH_REMATCH[2]}"
-                if [[ "$result" == "PASS" ]]; then
-                    pass "$cur_name" "$(elapsed "$secs")"
-                else
-                    fail "$cur_name" "$(elapsed "$secs")"
-                fi
-                cur_name=""
-            fi
-        done < <(cd "$SCRIPT_DIR" && run_isolated bash "$SCRIPT_DIR/testbench/regression_test.sh" 2>&1)
-
-        local st1
+        # regression_test.sh owns the simulator lifecycle and renders its own
+        # progress.  Keep it as one directly tracked child—no coprocess or tee.
+        bash "$SCRIPT_DIR/testbench/regression_test.sh" &
+        CHILD_PID=$!
+        CHILD_HAS_OWN_PG=false
+        wait "$CHILD_PID" || regression_rc=$?
+        CHILD_PID=""
         st1=$(date +%s)
-        printf "  ${DIM}  Total sim time: %s${RST}\n" "$(elapsed $((st1-st0)))"
+        if (( regression_rc == 0 )); then
+            pass "Simulation regression" "$(elapsed $((st1-st0)))"
+        else
+            fail "Simulation regression" "$(elapsed $((st1-st0)))"
+        fi
         printf "  ${DIM}  Logs: testbench/regression_logs/${RST}\n"
     else
         header "$STAGE" "$TOTAL" "Simulation ($SIM_TEST)"

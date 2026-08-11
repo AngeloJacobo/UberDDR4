@@ -12,6 +12,9 @@ module ddr4_phy_native_byte #(
     // Reset
     input  wire        i_bsc_rst,
     input  wire        i_bitslice_rst,
+    // Clears the RX deserializer/FIFO pointers while RX_RST_DLY remains low,
+    // preserving the trained input-delay value.
+    input  wire        i_rx_fifo_rst,
     // BISC status
     output wire        o_dly_rdy,
     output wire        o_vtc_rdy,
@@ -29,9 +32,21 @@ module ddr4_phy_native_byte #(
     // RX data (read path)
     output wire [DQ_BITS*8-1:0] o_rx_dq_data,
     output wire [DQ_BITS-1:0]   o_fifo_empty,
-    // All DQ slice FIFOs in a byte advance coherently to preserve the BL8
-    // word boundary across every DQ bit.
-    input  wire                 i_fifo_rd_en,
+    // Raw DQ0 receiver level for write leveling.  The DRAM holds this level
+    // after the DQS edge; the parent synchronizes it into the DIV_CLK domain.
+    output wire                 o_wl_feedback,
+    // Each asynchronous DQ FIFO has its own registered read enable.
+    input  wire [DQ_BITS-1:0]   i_fifo_rd_en,
+    // Per-byte RIU access to the upper nibble that owns the DQS input and
+    // therefore the read-gate delay.  The lower nibble receives the upper
+    // nibble's gated PCLK/NCLK through the dedicated inter-nibble path; it
+    // must not be selected for the same RIU transaction.
+    input  wire [5:0]           i_riu_addr,
+    input  wire [15:0]          i_riu_wr_data,
+    input  wire                 i_riu_wr_en,
+    input  wire                 i_riu_nibble_sel,
+    output wire [15:0]          o_riu_rd_data,
+    output wire                 o_riu_valid,
     // RX delay control
     input  wire [8:0]  i_rx_cntvaluein,
     input  wire        i_rx_load,
@@ -99,6 +114,8 @@ wire [DQ_BITS-1:0] dq_t;
 wire dqs_to_iob, dqs_from_iob, dqs_t;
 // DM output wire
 wire dm_to_obuf;
+
+assign o_wl_feedback = dq_from_iob[0];
 // RIU wires
 wire [15:0] riu_rd_data_low, riu_rd_data_upp;
 wire        riu_rd_valid_low, riu_rd_valid_upp;
@@ -107,6 +124,8 @@ wire        riu_rd_valid_low, riu_rd_valid_upp;
 // ---------------------------------------------------------------------------
 assign o_dly_rdy = dly_rdy_low & dly_rdy_upp;
 assign o_vtc_rdy = vtc_rdy_low & vtc_rdy_upp;
+assign o_riu_rd_data = riu_rd_data_upp;
+assign o_riu_valid   = riu_rd_valid_upp;
 // ---------------------------------------------------------------------------
 // Tie off unused bit positions (position 1 and 6 in lower, position 1 and 6 in upper)
 // ---------------------------------------------------------------------------
@@ -124,18 +143,40 @@ assign tx_bit_ctrl_in6_upp = 40'd0;
 /* verilator lint_off PINCONNECTEMPTY */
 /* verilator lint_off PINMISSING */
 BITSLICE_CONTROL #(
+    // Match the generated UltraScale DDR4 PHY attributes explicitly.  These
+    // are not cosmetic: CTRL_CLK selects the RIU clock domain and dynamic
+    // ODELAY mode allows the write-leveling loads driven below to reach the
+    // native delay elements while BISC continues to track PVT.
+    .CTRL_CLK          ("EXTERNAL"),
     .DIV_MODE           ("DIV4"),
     .SERIAL_MODE        ("FALSE"),
-    // For native DDR4 receives, sample DQ in the center of the DQS eye.
-    // This is the same SHIFT_90 P/N phase used by the UltraScale MIG
-    // BITSLICE_CONTROL topology; RX_CLK at each DATA slice is tied High.
+    .EN_DYN_ODLY_MODE   ("TRUE"),
+    .IDLY_VT_TRACK      ("TRUE"),
+    .ODLY_VT_TRACK      ("TRUE"),
+    .QDLY_VT_TRACK      ("TRUE"),
+    .ROUNDING_FACTOR    (16),
+    .RXGATE_EXTEND      ("FALSE"),
+    // The generated DDR4 MIG sets both data-byte nibble controls to SHIFT_90.
+    // This is the native XiPHY FIFO framing phase; IDELAY then centers DQ
+    // within the resulting DQS sampling eye.
     .RX_CLK_PHASE_P     ("SHIFT_90"),
     .RX_CLK_PHASE_N     ("SHIFT_90"),
     .EN_OTHER_PCLK      ("TRUE"),
     .EN_OTHER_NCLK      ("TRUE"),
     .SELF_CALIBRATE     ("ENABLE"),
+`ifdef SIM_NATIVE_RX_GATE_DISABLE
+    .RX_GATING          ("DISABLE"),
+`else
     .RX_GATING          ("ENABLE"),
-    .TX_GATING          ("DISABLE"),
+`endif
+    // Match the DDR4 MIG native-PHY setting.  A zero idle count makes the
+    // gate detector close/restart inside legal back-to-back BL8 traffic and
+    // splits the final burst across an invalid FIFO word.
+    .READ_IDLE_COUNT    (31),
+    // Match the native MIG topology: TX gating is enabled while the two
+    // PHY_WRCS buses remain Low.  They are native clock-select controls,
+    // not aliases for DFI wrdata_en; byte output ownership is TBYTE_IN.
+    .TX_GATING          ("ENABLE"),
     .REFCLK_SRC         ("PLLCLK"),
     .SIM_DEVICE         (SIM_DEVICE)
 ) u_bsc_lower (
@@ -154,6 +195,13 @@ BITSLICE_CONTROL #(
     .NCLK_NIBBLE_OUT    (),
     .TBYTE_IN           (i_tbyte_dq),
     .PHY_RDEN           (i_phy_rden),
+    // Single-rank interfaces use rank 0 implicitly. MIG drives both rank
+    // selector buses Low for RANKS=1; leaving them floating corrupts the
+    // native gate state in simulation and is illegal in hardware.
+    .PHY_RDCS0          (4'b0000),
+    .PHY_RDCS1          (4'b0000),
+    .PHY_WRCS0          (4'b0000),
+    .PHY_WRCS1          (4'b0000),
     // Position 0 (DM - TX only)
     .RX_BIT_CTRL_OUT0   (rx_bit_ctrl_out0_low),
     .TX_BIT_CTRL_OUT0   (tx_bit_ctrl_out0_low),
@@ -192,10 +240,14 @@ BITSLICE_CONTROL #(
     // Tristate bus
     .TX_BIT_CTRL_OUT_TRI(tx_bit_ctrl_out_tri_low),
     .TX_BIT_CTRL_IN_TRI (tx_bit_ctrl_in_tri_low),
-    // RIU (tie off)
-    .RIU_ADDR           (6'd0),
-    .RIU_WR_DATA        (16'd0),
-    .RIU_WR_EN          (1'b0),
+    .RIU_ADDR           (i_riu_addr),
+    // NIBBLE_CTRL0 differs only in the inter-nibble clock selects: the
+    // lower nibble consumes the upper nibble's DQS clocks.
+    .RIU_WR_DATA        ((i_riu_addr == 6'h00) ?
+                         (i_riu_wr_data | 16'h0003) : i_riu_wr_data),
+    .RIU_WR_EN          (i_riu_wr_en),
+    // RIU_NIBBLE_SEL is the nibble select, not a byte-wide transaction
+    // enable.  Read-gate registers live in the DQS-owning upper nibble.
     .RIU_NIBBLE_SEL     (1'b0),
     .RIU_RD_DATA        (riu_rd_data_low),
     .RIU_VALID          (riu_rd_valid_low)
@@ -204,15 +256,27 @@ BITSLICE_CONTROL #(
 // Upper Nibble BITSLICE_CONTROL
 // ---------------------------------------------------------------------------
 BITSLICE_CONTROL #(
+    .CTRL_CLK          ("EXTERNAL"),
     .DIV_MODE           ("DIV4"),
     .SERIAL_MODE        ("FALSE"),
+    .EN_DYN_ODLY_MODE   ("TRUE"),
+    .IDLY_VT_TRACK      ("TRUE"),
+    .ODLY_VT_TRACK      ("TRUE"),
+    .QDLY_VT_TRACK      ("TRUE"),
+    .ROUNDING_FACTOR    (16),
+    .RXGATE_EXTEND      ("FALSE"),
     .RX_CLK_PHASE_P     ("SHIFT_90"),
     .RX_CLK_PHASE_N     ("SHIFT_90"),
     .EN_OTHER_PCLK      ("FALSE"),
     .EN_OTHER_NCLK      ("FALSE"),
     .SELF_CALIBRATE     ("ENABLE"),
+`ifdef SIM_NATIVE_RX_GATE_DISABLE
+    .RX_GATING          ("DISABLE"),
+`else
     .RX_GATING          ("ENABLE"),
-    .TX_GATING          ("DISABLE"),
+`endif
+    .READ_IDLE_COUNT    (31),
+    .TX_GATING          ("ENABLE"),
     .REFCLK_SRC         ("PLLCLK"),
     .SIM_DEVICE         (SIM_DEVICE)
 ) u_bsc_upper (
@@ -231,6 +295,10 @@ BITSLICE_CONTROL #(
     .NCLK_NIBBLE_OUT    (nclk_nibble_out_upp),
     .TBYTE_IN           (i_tbyte_dqs),
     .PHY_RDEN           (i_phy_rden),
+    .PHY_RDCS0          (4'b0000),
+    .PHY_RDCS1          (4'b0000),
+    .PHY_WRCS0          (4'b0000),
+    .PHY_WRCS1          (4'b0000),
     // Position 0 (DQS)
     .RX_BIT_CTRL_OUT0   (rx_bit_ctrl_out0_upp),
     .TX_BIT_CTRL_OUT0   (tx_bit_ctrl_out0_upp),
@@ -269,11 +337,10 @@ BITSLICE_CONTROL #(
     // Tristate bus
     .TX_BIT_CTRL_OUT_TRI(tx_bit_ctrl_out_tri_upp),
     .TX_BIT_CTRL_IN_TRI (tx_bit_ctrl_in_tri_upp),
-    // RIU (tie off)
-    .RIU_ADDR           (6'd0),
-    .RIU_WR_DATA        (16'd0),
-    .RIU_WR_EN          (1'b0),
-    .RIU_NIBBLE_SEL     (1'b0),
+    .RIU_ADDR           (i_riu_addr),
+    .RIU_WR_DATA        (i_riu_wr_data),
+    .RIU_WR_EN          (i_riu_wr_en),
+    .RIU_NIBBLE_SEL     (i_riu_nibble_sel),
     .RIU_RD_DATA        (riu_rd_data_upp),
     .RIU_VALID          (riu_rd_valid_upp)
 );
@@ -282,18 +349,22 @@ BITSLICE_CONTROL #(
 // ---------------------------------------------------------------------------
 TX_BITSLICE_TRI #(
     .DATA_WIDTH         (8),
+    .OUTPUT_PHASE_90    ("TRUE"),
     .INIT               (1'b1),
     .SIM_DEVICE         (SIM_DEVICE)
 ) u_tri_lower (
-    .CLK                (i_div_clk),
+    // TBYTE_IN is serialised by BITSLICE_CONTROL.  As in the generated
+    // UltraScale MIG native PHY, this resource is controlled through the
+    // BIT_CTRL bus rather than a fabric-clocked TX datapath.
+    .CLK                (1'b1),
     .RST                (i_bitslice_rst),
     .RST_DLY            (i_bitslice_rst),
-    .CE                 (1'b1),
+    .CE                 (1'b0),
     .INC                (1'b0),
     .LOAD               (1'b0),
     .CNTVALUEIN         (9'd0),
     .CNTVALUEOUT        (),
-    .EN_VTC             (i_bitslice_en_vtc),
+    .EN_VTC             (1'b1),
     .TRI_OUT            (tbyte_out_low),
     .BIT_CTRL_IN        (tx_bit_ctrl_out_tri_low),
     .BIT_CTRL_OUT       (tx_bit_ctrl_in_tri_low)
@@ -303,18 +374,19 @@ TX_BITSLICE_TRI #(
 // ---------------------------------------------------------------------------
 TX_BITSLICE_TRI #(
     .DATA_WIDTH         (8),
+    .OUTPUT_PHASE_90    ("TRUE"),
     .INIT               (1'b1),
     .SIM_DEVICE         (SIM_DEVICE)
 ) u_tri_upper (
-    .CLK                (i_div_clk),
+    .CLK                (1'b1),
     .RST                (i_bitslice_rst),
     .RST_DLY            (i_bitslice_rst),
-    .CE                 (1'b1),
+    .CE                 (1'b0),
     .INC                (1'b0),
     .LOAD               (1'b0),
     .CNTVALUEIN         (9'd0),
     .CNTVALUEOUT        (),
-    .EN_VTC             (i_bitslice_en_vtc),
+    .EN_VTC             (1'b1),
     .TRI_OUT            (tbyte_out_upp),
     .BIT_CTRL_IN        (tx_bit_ctrl_out_tri_upp),
     .BIT_CTRL_OUT       (tx_bit_ctrl_in_tri_upp)
@@ -323,6 +395,10 @@ TX_BITSLICE_TRI #(
 // RXTX_BITSLICE - DM (lower nibble position 0)
 // ---------------------------------------------------------------------------
 RXTX_BITSLICE #(
+    .FIFO_SYNC_MODE     ("FALSE"),
+    .NATIVE_ODELAY_BYPASS("FALSE"),
+    .RX_UPDATE_MODE     ("ASYNC"),
+    .TX_UPDATE_MODE     ("ASYNC"),
     .RX_DATA_TYPE       ("DATA"),
     .RX_DATA_WIDTH      (8),
     .TX_DATA_WIDTH      (8),
@@ -335,19 +411,25 @@ RXTX_BITSLICE #(
     .TX_OUTPUT_PHASE_90 ("FALSE"),
     .RX_REFCLK_FREQUENCY(REFCLK_FREQ),
     .TX_REFCLK_FREQUENCY(REFCLK_FREQ),
-    .TBYTE_CTL          ("T"),
+    .TBYTE_CTL          ("TBYTE_IN"),
     .INIT               (1'b1),
     .SIM_DEVICE         (SIM_DEVICE)
 ) u_rxtx_dm (
     .FIFO_RD_CLK        (i_div_clk),
     .FIFO_RD_EN         (1'b0),
     .FIFO_EMPTY         (),
-    .RX_RST             (i_bitslice_rst),
+    .RX_RST             (i_rx_fifo_rst),
     .TX_RST             (i_bitslice_rst),
     .RX_RST_DLY         (i_bitslice_rst),
     .TX_RST_DLY         (i_bitslice_rst),
-    .RX_CLK             (i_div_clk),
-    .TX_CLK             (i_div_clk),
+    // Native memory mode obtains the receive clock through BITSLICE_CONTROL.
+    // Even this TX-only DM position must not inject CLKDIV into that network;
+    // the generated DDR4 PHY ties RX_CLK High on every RXTX_BITSLICE.
+    .RX_CLK             (1'b1),
+    // TX is clocked through the BITSLICE_CONTROL network.  TX_CLK must be
+    // tied High (not CLKDIV): this is the UltraScale native-PHY topology and
+    // prevents the serial TX word from being delayed by fabric clocking.
+    .TX_CLK             (1'b1),
     .RX_EN_VTC          (i_bitslice_en_vtc),
     .TX_EN_VTC          (i_bitslice_en_vtc),
     .RX_CE              (1'b0),
@@ -362,7 +444,7 @@ RXTX_BITSLICE #(
     .TX_CNTVALUEOUT     (),
     .D                  (i_tx_dm_data),
     .O                  (dm_to_obuf),
-    .T                  (i_tbyte_dq[0]),
+    .T                  (1'b0),
     .TBYTE_IN           (tbyte_out_low),
     .DATAIN             (1'b0),
     .Q                  (),
@@ -376,6 +458,10 @@ RXTX_BITSLICE #(
 // RXTX_BITSLICE - DQS (upper nibble position 0)
 // ---------------------------------------------------------------------------
 RXTX_BITSLICE #(
+    .FIFO_SYNC_MODE     ("FALSE"),
+    .NATIVE_ODELAY_BYPASS("FALSE"),
+    .RX_UPDATE_MODE     ("ASYNC"),
+    .TX_UPDATE_MODE     ("ASYNC"),
     .RX_DATA_TYPE       ("DATA_AND_CLOCK"),
     .RX_DATA_WIDTH      (8),
     .TX_DATA_WIDTH      (8),
@@ -393,19 +479,22 @@ RXTX_BITSLICE #(
     .TX_OUTPUT_PHASE_90 ("TRUE"),
     .RX_REFCLK_FREQUENCY(REFCLK_FREQ),
     .TX_REFCLK_FREQUENCY(REFCLK_FREQ),
-    .TBYTE_CTL          ("T"),
+    .TBYTE_CTL          ("TBYTE_IN"),
     .INIT               (1'b1),
     .SIM_DEVICE         (SIM_DEVICE)
 ) u_rxtx_dqs (
     .FIFO_RD_CLK        (i_div_clk),
-    .FIFO_RD_EN         (1'b0),
+    // MIG advances the DATA_AND_CLOCK slice with the same common FIFO read
+    // pulse as the byte's DQ slices. Although DQS.Q is unused, this keeps the
+    // native gate monitor and byte FIFO word boundary in lockstep.
+    .FIFO_RD_EN         (i_fifo_rd_en[0]),
     .FIFO_EMPTY         (),
-    .RX_RST             (i_bitslice_rst),
+    .RX_RST             (i_rx_fifo_rst),
     .TX_RST             (i_bitslice_rst),
     .RX_RST_DLY         (i_bitslice_rst),
     .TX_RST_DLY         (i_bitslice_rst),
     .RX_CLK             (1'b1),
-    .TX_CLK             (i_div_clk),
+    .TX_CLK             (1'b1),
     .RX_EN_VTC          (i_bitslice_en_vtc),
     .TX_EN_VTC          (i_bitslice_en_vtc),
     .RX_CE              (1'b0),
@@ -420,7 +509,9 @@ RXTX_BITSLICE #(
     .TX_CNTVALUEOUT     (o_tx_dqs_cntvalueout),
     .D                  (i_tx_dqs_data),
     .O                  (dqs_to_iob),
-    .T                  (i_tbyte_dqs[0]),
+    // DATA_AND_CLOCK is the byte's master clock slice. MIG fixes T Low here;
+    // byte ownership still comes from the serialized TBYTE_IN path.
+    .T                  (1'b0),
     .TBYTE_IN           (tbyte_out_upp),
     .DATAIN             (dqs_from_iob),
     .Q                  (),
@@ -452,6 +543,10 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
                           (gi == 2) ? tx_bit_ctrl_out4_low :
                                       tx_bit_ctrl_out5_low;
     RXTX_BITSLICE #(
+        .FIFO_SYNC_MODE     ("FALSE"),
+        .NATIVE_ODELAY_BYPASS("FALSE"),
+        .RX_UPDATE_MODE     ("ASYNC"),
+        .TX_UPDATE_MODE     ("ASYNC"),
         .RX_DATA_TYPE       ("DATA"),
         .RX_DATA_WIDTH      (8),
         .TX_DATA_WIDTH      (8),
@@ -464,14 +559,14 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
         .TX_OUTPUT_PHASE_90 ("FALSE"),
         .RX_REFCLK_FREQUENCY(REFCLK_FREQ),
         .TX_REFCLK_FREQUENCY(REFCLK_FREQ),
-        .TBYTE_CTL          ("T"),
-        .INIT               (1'b0),
+        .TBYTE_CTL          ("TBYTE_IN"),
+        .INIT               (1'b1),
         .SIM_DEVICE         (SIM_DEVICE)
     ) u_rxtx_dq (
         .FIFO_RD_CLK        (i_div_clk),
-        .FIFO_RD_EN         (i_fifo_rd_en),
+        .FIFO_RD_EN         (i_fifo_rd_en[gi]),
         .FIFO_EMPTY         (o_fifo_empty[gi]),
-        .RX_RST             (i_bitslice_rst),
+        .RX_RST             (i_rx_fifo_rst),
         .TX_RST             (i_bitslice_rst),
         .RX_RST_DLY         (i_bitslice_rst),
         .TX_RST_DLY         (i_bitslice_rst),
@@ -481,7 +576,7 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
         // the UltraScale DDR4 MIG topology and prevents the first DQS sample
         // of a BL8 read from being lost.
         .RX_CLK             (1'b1),
-        .TX_CLK             (i_div_clk),
+        .TX_CLK             (1'b1),
         .RX_EN_VTC          (i_bitslice_en_vtc),
         .TX_EN_VTC          (i_bitslice_en_vtc),
         .RX_CE              (1'b0),
@@ -496,7 +591,7 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
         .TX_CNTVALUEOUT     (),
         .D                  (i_tx_dq_data[gi*8 +: 8]),
         .O                  (dq_to_iob[gi]),
-        .T                  (i_tbyte_dq[0]),
+        .T                  (1'b1),
         .TBYTE_IN           (tbyte_out_low),
         .DATAIN             (dq_from_iob[gi]),
         .Q                  (o_rx_dq_data[gi*8 +: 8]),
@@ -539,6 +634,10 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_upper
                           (gi == 2) ? tx_bit_ctrl_out4_upp :
                                       tx_bit_ctrl_out5_upp;
     RXTX_BITSLICE #(
+        .FIFO_SYNC_MODE     ("FALSE"),
+        .NATIVE_ODELAY_BYPASS("FALSE"),
+        .RX_UPDATE_MODE     ("ASYNC"),
+        .TX_UPDATE_MODE     ("ASYNC"),
         .RX_DATA_TYPE       ("DATA"),
         .RX_DATA_WIDTH      (8),
         .TX_DATA_WIDTH      (8),
@@ -551,20 +650,20 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_upper
         .TX_OUTPUT_PHASE_90 ("FALSE"),
         .RX_REFCLK_FREQUENCY(REFCLK_FREQ),
         .TX_REFCLK_FREQUENCY(REFCLK_FREQ),
-        .TBYTE_CTL          ("T"),
-        .INIT               (1'b0),
+        .TBYTE_CTL          ("TBYTE_IN"),
+        .INIT               (1'b1),
         .SIM_DEVICE         (SIM_DEVICE)
     ) u_rxtx_dq (
         .FIFO_RD_CLK        (i_div_clk),
-        .FIFO_RD_EN         (i_fifo_rd_en),
+        .FIFO_RD_EN         (i_fifo_rd_en[gi + 4]),
         .FIFO_EMPTY         (o_fifo_empty[gi + 4]),
-        .RX_RST             (i_bitslice_rst),
+        .RX_RST             (i_rx_fifo_rst),
         .TX_RST             (i_bitslice_rst),
         .RX_RST_DLY         (i_bitslice_rst),
         .TX_RST_DLY         (i_bitslice_rst),
         // See the lower-nibble DATA slice: DQS, not CLKDIV, clocks native RX.
         .RX_CLK             (1'b1),
-        .TX_CLK             (i_div_clk),
+        .TX_CLK             (1'b1),
         .RX_EN_VTC          (i_bitslice_en_vtc),
         .TX_EN_VTC          (i_bitslice_en_vtc),
         .RX_CE              (1'b0),
@@ -579,7 +678,7 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_upper
         .TX_CNTVALUEOUT     (),
         .D                  (i_tx_dq_data[(gi + 4)*8 +: 8]),
         .O                  (dq_to_iob[gi + 4]),
-        .T                  (i_tbyte_dq[0]),
+        .T                  (1'b1),
         .TBYTE_IN           (tbyte_out_upp),
         .DATAIN             (dq_from_iob[gi + 4]),
         .Q                  (o_rx_dq_data[(gi + 4)*8 +: 8]),

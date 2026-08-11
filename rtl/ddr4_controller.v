@@ -78,6 +78,16 @@ module ddr4_controller #(
     //   Auto values from JESD79-4D Table 21 (1tCK write preamble):
     //   DDR4-1600=9, DDR4-1866=10, DDR4-2133=11, DDR4-2400=12
     parameter[4:0] CWL = 0,
+    // DFI PHY write latency, in controller (1:4 DFI) clocks.  The
+    // controller advances wrdata/wrdata_en by this amount so it arrives at
+    // the DRAM exactly CWL after WRITE.  Component PHYs use 0; the native
+    // BITSLICE PHY uses 1 to cover its registered TX word.
+    parameter[1:0] TPHY_WRLAT = 0,
+    // Additional reset-exit guard, in controller clocks, between the DFI CKE
+    // assertion and the first MRS command.  This covers PHY-specific initial
+    // CA/CKE serializer fill latency which is not part of tPHY_WRLAT.  The
+    // component PHY uses 0; the native BITSLICE PHY requires 9.
+    parameter[3:0] TPHY_INIT_LAT = 0,
     // The next parameters act more like localparams but are here to simplify port declarations 
     parameter SERDES_RATIO = 4, // 4:1 controller
               BA_BITS = 2, // bank address (always 2 for DDR4)
@@ -399,6 +409,7 @@ module ddr4_controller #(
     localparam INITIAL_CKE_LOW_ps     = MICRON_SIM ? 200_000 : 500_000_000; // >=500us after RESET_n deassert (200ns min for PHY reset)
     // tXPR : Exit reset to first command (Tables 172-173)
     localparam tXPR_ps = max_fn(5 * DDR4_CLK_PERIOD, tRFC_ps + 10_000); // max(5nCK, tRFC+10ns)
+    localparam tXPR_WAIT_nCTRL = ps_to_cycles(tXPR_ps) + TPHY_INIT_LAT;
 
     // =========================================
     // Command Slot Assignment (DFI 3.1)
@@ -522,10 +533,15 @@ module ddr4_controller #(
     // Reads: inserted at [ACK_PIPE_WIDTH-1] (far end, full latency).
     // Writes: inserted at [write_ack_idx_q] (variable, min 1 = fast path).
     localparam ACK_PIPE_WIDTH = RDDATA_EN_PIPE_WIDTH + 3;
-    // Write analog: CWL -> controller cycles. No "+4", the write
-    // path has no return pipeline; OSERDES DQ/DQS latency is
-    // handled by the PHY's wrdata_en_shift register.
-    localparam WRITE_DATA_DELAY = find_delay(CWL_nCK, WRITE_SLOT, WRITE_SLOT);
+    // Write analog: CWL -> controller cycles.  A native PHY may report one
+    // additional 1:4 TX word of latency through TPHY_WRLAT; advance the DFI
+    // data bundle by that amount while keeping the physical WRITE command and
+    // every JEDEC command-to-command delay unchanged.
+    localparam integer WRITE_DATA_DELAY_UNCOMP =
+        find_delay(CWL_nCK, WRITE_SLOT, WRITE_SLOT);
+    localparam integer WRITE_DATA_DELAY =
+        (TPHY_WRLAT < WRITE_DATA_DELAY_UNCOMP)
+            ? (WRITE_DATA_DELAY_UNCOMP - TPHY_WRLAT) : 1;
 
     // ROM delay counter width -- enough for longest init timer
     localparam DELAY_COUNTER_WIDTH = 20;
@@ -2131,7 +2147,7 @@ module ddr4_controller #(
             // -- Power-on reset (JESD79-4D Figure 7) --
             6'd0:  read_rom_instruction = rom_timer(CTL_CKE0_RST0, CMD_NOP, ps_to_cycles(POWER_ON_RESET_HIGH_ps)); // RESET_n=0, CKE=0, wait >=200us
             6'd1:  read_rom_instruction = rom_timer(CTL_CKE0_RST1, CMD_NOP, ps_to_cycles(INITIAL_CKE_LOW_ps));     // RESET_n=1, CKE=0, wait >=500us
-            6'd2:  read_rom_instruction = rom_timer(CTL_TIMER,     CMD_DES, ps_to_cycles(tXPR_ps));                // CKE=1, deselect, wait tXPR
+            6'd2:  read_rom_instruction = rom_timer(CTL_TIMER,     CMD_DES, tXPR_WAIT_nCTRL);                      // CKE=1, deselect, wait tXPR plus PHY startup latency
 
             // -- Mode register writes (MR3->MR6->MR5->MR4->MR2->MR1->MR0) --
             6'd3:  read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_DIS);                          // MR3: MPR off
@@ -2235,7 +2251,8 @@ module ddr4_controller #(
         $display("  tMOD                  = %0d ps (%0d ctrl)", tMOD_ps, ps_to_cycles(tMOD_ps));
         $display("  tZQinit               = %0d nCK (%0d ctrl)", tZQinit_nCK, nCK_to_cycles(tZQinit_nCK));
         $display("  tDLLK                 = %0d nCK (%0d ctrl)", tDLLK_nCK, nCK_to_cycles(tDLLK_nCK));
-        $display("  tXPR                  = %0d ps (%0d ctrl)", tXPR_ps, ps_to_cycles(tXPR_ps));
+        $display("  tXPR                  = %0d ps (%0d ctrl + %0d PHY = %0d total)",
+                 tXPR_ps, ps_to_cycles(tXPR_ps), TPHY_INIT_LAT, tXPR_WAIT_nCTRL);
         $display("  tWLMRD                = %0d nCK (%0d ctrl)", tWLMRD_nCK, nCK_to_cycles(tWLMRD_nCK));
         $display("  POWER_ON_RESET        = %0d ps (%0d ctrl)", POWER_ON_RESET_HIGH_ps, ps_to_cycles(POWER_ON_RESET_HIGH_ps));
         $display("  INITIAL_CKE_LOW       = %0d ps (%0d ctrl)", INITIAL_CKE_LOW_ps, ps_to_cycles(INITIAL_CKE_LOW_ps));

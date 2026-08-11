@@ -59,7 +59,6 @@ endmodule
 // defines TB_USE_NATIVE_PHY only when PHY_IMPL=native is requested; component
 // mode remains the default and the two implementations are never compiled
 // into the same simulation library.
-`define TB_USE_NATIVE_PHY
 `ifdef TB_USE_NATIVE_PHY
 `include "../rtl/phy/ddr4_phy_native_reset.v"
 `include "../rtl/phy/ddr4_phy_native_byte.v"
@@ -70,6 +69,18 @@ endmodule
 `endif
 
 module ddr4_sim_top;
+
+    // Native BITSLICE timing at the DFI boundary:
+    //  - one registered 1:4 TX data word (tphy_wrlat)
+    //  - nine controller clocks of one-time CA/CKE serializer fill after reset
+    // Component mode has neither additional latency.
+`ifdef TB_USE_NATIVE_PHY
+    localparam integer TB_TPHY_WRLAT = 1;
+    localparam integer TB_TPHY_INIT_LAT = 9;
+`else
+    localparam integer TB_TPHY_WRLAT = 0;
+    localparam integer TB_TPHY_INIT_LAT = 0;
+`endif
 
     // ===================================================================
     // Parameters  -  match DUT defaults but use integer-exact clock periods
@@ -185,7 +196,6 @@ module ddr4_sim_top;
     // Example: dump only 20 us through 30 us
     //   +define+VCD_DUMP +define+SIM_VCD_START_TIME=20_000_000 +define+SIM_VCD_END_TIME=30_000_000
     // ===================================================================
-    `define VCD_DUMP
 `ifdef VCD_DUMP
     localparam bit  TB_VCD_ENABLE = 1'b1;
 `else
@@ -196,26 +206,26 @@ module ddr4_sim_top;
 // complete lifetime, including reset and calibration, so a waveform contains
 // every event that can affect the first user write.
 `ifdef SIM_NATIVE_TX_DEBUG_REDUCED_VCD
-    // Fast native-PHY diagnostic trace: covers the second half of MPR eye
-    // training, write leveling, and the directed write/read transaction.
-    // Full-lifetime capture remains the default for SIM_NATIVE_TX_DEBUG.
-    localparam time TB_VCD_START_TIME = 'd8000000;
+    // Fast native-PHY diagnostic trace: isolate the four directed reads and
+    // the native FIFO-to-DFI return path.  Full-lifetime capture remains the
+    // default for SIM_NATIVE_TX_DEBUG.
+    localparam time TB_VCD_START_TIME = 'd6100000;
 `elsif SIM_NATIVE_TX_DEBUG
     localparam time TB_VCD_START_TIME = 'd0;
 `elsif SIM_VCD_START_TIME
-    localparam time TB_VCD_START_TIME = 'd2373487;
+    localparam time TB_VCD_START_TIME = 'd0;
 `else
-    localparam time TB_VCD_START_TIME = 'd2373487;
+    localparam time TB_VCD_START_TIME = 'd0;
 `endif
 
 `ifdef SIM_NATIVE_TX_DEBUG_REDUCED_VCD
-    localparam time TB_VCD_END_TIME = 'd21000000;
+    localparam time TB_VCD_END_TIME = 'd6300000;
 `elsif SIM_NATIVE_TX_DEBUG
     localparam time TB_VCD_END_TIME = 'd50000000;
 `elsif SIM_VCD_END_TIME
-    localparam time TB_VCD_END_TIME = 'd31188000;
+    localparam time TB_VCD_END_TIME = 'd93260389;
 `else
-    localparam time TB_VCD_END_TIME = 'd31188000;
+    localparam time TB_VCD_END_TIME = 'd93260389;
 `endif
 
     // ===================================================================
@@ -328,6 +338,8 @@ module ddr4_sim_top;
         .COL_BITS              (COL_BITS),
         .BYTE_LANES            (BYTE_LANES),
         .DENSITY               (TB_DENSITY_GB),
+        .TPHY_WRLAT            (TB_TPHY_WRLAT),
+        .TPHY_INIT_LAT          (TB_TPHY_INIT_LAT),
         .MICRON_SIM            (1),
         .ADDR_MAPPING          (TB_ADDR_MAPPING),
         .BIST_MODE             (TB_BIST_MODE),
@@ -903,7 +915,11 @@ module ddr4_sim_top;
 
             // Gate training (no-op â€�? responds immediately)
             if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd1)
+`ifdef TB_USE_NATIVE_PHY
+                $display("[%0t] PHY native gate training started", $realtime);
+`else
                 $display("[%0t] PHY gate training (no-op)", $realtime);
+`endif
             if (prev_phy_state == 4'd1 && u_dut.u_phy.phy_state == 4'd0)
                 $display("[%0t] PHY gate training done", $realtime);
 
@@ -1021,17 +1037,21 @@ module ddr4_sim_top;
     always @(posedge controller_clk) begin
         if (bist_busy_int) begin
             if (|u_dut.u_controller.o_dfi_wrdata_en) begin
+            `ifndef SIM_QUIET_DFI_BURST_LOG
                 $display("[DBG-WR] #%0d p2rise=%04h full=%0h",
                     dfi_wr_seq,
                     u_dut.u_controller.o_dfi_wrdata[79:64],
                     u_dut.u_controller.o_dfi_wrdata);
+            `endif
                 dfi_wr_seq = dfi_wr_seq + 1;
             end
             if (|u_dut.u_phy.o_dfi_rddata_valid) begin
+            `ifndef SIM_QUIET_DFI_BURST_LOG
                 $display("[DBG-RD] #%0d p2rise=%04h full=%0h",
                     dfi_rd_seq,
                     u_dut.u_phy.o_dfi_rddata[79:64],
                     u_dut.u_phy.o_dfi_rddata);
+            `endif
                 dfi_rd_seq = dfi_rd_seq + 1;
             end
         end
@@ -1409,20 +1429,23 @@ module ddr4_sim_top;
         // complete BL8 DQ/DQS burst unambiguous in trace.vcd.
         // =============================================================
         begin : native_tx_debug
-            reg [WB_DATA_BITS-1:0] dbg_write_data;
+            localparam integer DBG_BURST_WORDS = 4;
+            reg [WB_DATA_BITS-1:0] dbg_write_data [0:DBG_BURST_WORDS-1];
             reg [WB_ADDR_BITS-1:0] dbg_addr;
-            integer dbg_byte;
+            reg [31:0] dbg_lfsr;
+            integer dbg_byte, dbg_word;
 
             test_phase = "NAT_TX_DBG";
             dbg_addr = {WB_ADDR_BITS{1'b0}};
-            dbg_write_data = {WB_DATA_BITS{1'b0}};
-            for (dbg_byte = 0; dbg_byte < WB_SEL_BITS; dbg_byte = dbg_byte + 1) begin
-                case (dbg_byte % 4)
-                    0: dbg_write_data[dbg_byte*8 +: 8] = 8'hC3;
-                    1: dbg_write_data[dbg_byte*8 +: 8] = 8'h3C;
-                    2: dbg_write_data[dbg_byte*8 +: 8] = 8'hA5;
-                    default: dbg_write_data[dbg_byte*8 +: 8] = 8'h5A;
-                endcase
+            dbg_lfsr = 32'h1D87_A5C3;
+            for (dbg_word = 0; dbg_word < DBG_BURST_WORDS; dbg_word = dbg_word + 1) begin
+                dbg_write_data[dbg_word] = {WB_DATA_BITS{1'b0}};
+                for (dbg_byte = 0; dbg_byte < WB_SEL_BITS; dbg_byte = dbg_byte + 1) begin
+                    dbg_write_data[dbg_word][dbg_byte*8 +: 8] = dbg_lfsr[7:0];
+                    dbg_lfsr = {dbg_lfsr[30:0],
+                                dbg_lfsr[31] ^ dbg_lfsr[21] ^
+                                dbg_lfsr[1] ^ dbg_lfsr[0]};
+                end
             end
 
             // Calibration has completed, but leave a small idle interval so
@@ -1430,15 +1453,24 @@ module ddr4_sim_top;
             repeat (10) @(posedge controller_clk);
             while (wb_stall) @(posedge controller_clk);
 
-            $display("[%0t] NATIVE_TX_DEBUG: WRITE addr=0x%0h data=0x%0h",
-                     $realtime, dbg_addr, dbg_write_data);
-            wb_push_write(dbg_addr, dbg_write_data);
+            $display("[%0t] NATIVE_TX_DEBUG: %0d contiguous writes from addr=0x%0h",
+                     $realtime, DBG_BURST_WORDS, dbg_addr);
+            for (dbg_word = 0; dbg_word < DBG_BURST_WORDS; dbg_word = dbg_word + 1)
+                wb_push_write(dbg_addr + dbg_word, dbg_write_data[dbg_word]);
             wb_pump_all;
 
-            $display("[%0t] NATIVE_TX_DEBUG: READ  addr=0x%0h expected=0x%0h",
-                     $realtime, dbg_addr, dbg_write_data);
-            wb_push_read(dbg_addr, dbg_write_data);
+            $display("[%0t] NATIVE_TX_DEBUG: %0d contiguous reads from addr=0x%0h",
+                     $realtime, DBG_BURST_WORDS, dbg_addr);
+            for (dbg_word = 0; dbg_word < DBG_BURST_WORDS; dbg_word = dbg_word + 1) begin
+                wb_push_read(dbg_addr + dbg_word, dbg_write_data[dbg_word]);
+            `ifdef SIM_NATIVE_TX_DEBUG_GAPPED_READS
+                wb_pump_all;
+                repeat (8) @(posedge controller_clk);
+            `endif
+            end
+        `ifndef SIM_NATIVE_TX_DEBUG_GAPPED_READS
             wb_pump_all;
+        `endif
 
             // Preserve a few idle cycles after capture, then stop.  The VCD
             // remains active until $finish, so it covers the whole test.
@@ -2650,32 +2682,40 @@ module ddr4_sim_top;
             for (mon_ph = 0; mon_ph < 4; mon_ph = mon_ph + 1) begin
                 if (mon_is_act[mon_ph]) begin
                     act_count = act_count + 1;
+                `ifndef SIM_QUIET_COMMAND_LOG
                     $display("[%0t] [%0s] DDR4 ACT #%0d: BG=%0d BA=%0d (slot %0d)",
                              $realtime, test_phase, act_count,
                              mon_bg[mon_ph*BG_BITS +: BG_BITS],
                              mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph);
+                `endif
                 end
                 if (mon_is_wr[mon_ph]) begin
                     wr_count = wr_count + 1;
+                `ifndef SIM_QUIET_COMMAND_LOG
                     $display("[%0t] [%0s] DDR4 WR  #%0d: BG=%0d BA=%0d (slot %0d)",
                              $realtime, test_phase, wr_count,
                              mon_bg[mon_ph*BG_BITS +: BG_BITS],
                              mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph);
+                `endif
                 end
                 if (mon_is_rd[mon_ph]) begin
                     rd_count = rd_count + 1;
+                `ifndef SIM_QUIET_COMMAND_LOG
                     $display("[%0t] [%0s] DDR4 RD  #%0d: BG=%0d BA=%0d (slot %0d) stage2_we=%0b",
                              $realtime, test_phase, rd_count,
                              mon_bg[mon_ph*BG_BITS +: BG_BITS],
                              mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph,
                              u_dut.u_controller.stage2_we);
+                `endif
                 end
                 if (mon_is_pre[mon_ph]) begin
                     pre_count = pre_count + 1;
+                `ifndef SIM_QUIET_COMMAND_LOG
                     $display("[%0t] [%0s] DDR4 PRE #%0d: BG=%0d BA=%0d (slot %0d)",
                              $realtime, test_phase, pre_count,
                              mon_bg[mon_ph*BG_BITS +: BG_BITS],
                              mon_bank[mon_ph*BA_BITS +: BA_BITS], mon_ph);
+                `endif
                 end
             end
         end
@@ -2836,8 +2876,9 @@ module ddr4_sim_top;
         $finish;
     end
 
+    localparam time TB_TIMEOUT_PS = 64'd10_000_000_000;
     initial begin
-        #10_000_000_000;
+        #TB_TIMEOUT_PS;
         $display("[%0t] TIMEOUT: simulation did not complete within 10 ms", $realtime);
         $finish;
     end

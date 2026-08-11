@@ -86,6 +86,13 @@ module ddr4_top #(
     // CAS Write Latency override (0=auto from DDR4_CLK_PERIOD)
     //   Auto values: DDR4-1600=9, DDR4-1866=10, DDR4-2133=11, DDR4-2400=12
     parameter[4:0] CWL = 0,
+    // DFI PHY write latency in controller clocks.  Set to 1 for the native
+    // UltraScale BITSLICE PHY; retain 0 for the component PHY.
+    parameter[1:0] TPHY_WRLAT = 0,
+    // Extra reset-exit CKE-to-command guard in controller clocks.  The native
+    // BITSLICE CA path uses 9 to cover its initial serializer fill; component
+    // mode retains 0.  This affects initialization only.
+    parameter[3:0] TPHY_INIT_LAT = 0,
     // BIST / debug prober configuration
     //   BIST_MODE: 0=disabled, 1=half-range, 2=full-range (all three phases always run)
     parameter[1:0] BIST_MODE = 1,
@@ -271,7 +278,9 @@ module ddr4_top #(
         .RTT_PARK(RTT_PARK),
         .DRIVE_IMP(DRIVE_IMP),
         .CL(CL),
-        .CWL(CWL)
+        .CWL(CWL),
+        .TPHY_WRLAT(TPHY_WRLAT),
+        .TPHY_INIT_LAT(TPHY_INIT_LAT)
     ) u_controller (
         .i_controller_clk(i_controller_clk),
         .i_rst_n(internal_rst_n),

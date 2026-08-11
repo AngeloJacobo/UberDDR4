@@ -48,6 +48,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
+CLEAN_XSIM=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --clean)
+            CLEAN_XSIM=true
+            ;;
+        *)
+            fail "Unknown option: $1"
+            exit 2
+            ;;
+    esac
+    shift
+done
+
 if [[ -z "${XILINX_VIVADO:-}" ]]; then
     fail "XILINX_VIVADO is not set. Source Vivado settings64.sh first."
     exit 1
@@ -74,7 +88,7 @@ if [[ ! -f "$REPO_ROOT/testbench/micron/ddr4_model.sv" ]]; then
     exit 1
 fi
 
-if [[ "${1:-}" == "--clean" ]]; then
+if $CLEAN_XSIM; then
     step "Cleaning xsim.dir"
     rm -rf xsim.dir 2>/dev/null; rm -rf xsim.dir 2>/dev/null
 fi
@@ -140,7 +154,10 @@ step "Elaborating"
   -L unisims_ver -L secureip ddr4_sim_top glbl -s sim_snapshot
 
 step "Running simulation"
-"$XSIM" sim_snapshot -runall 2>&1 | tee sim_result.log || true
+# Use Tcl batch mode explicitly.  On Windows, -runall can still launch an
+# interactive GUI session through a saved WCFG and leave regressions paused.
+"$XSIM" sim_snapshot -tclbatch testbench/xsim_batch.tcl \
+    2>&1 | tee sim_result.log || true
 
 echo ""
 if grep -q "TIMEOUT:" sim_result.log; then
@@ -150,7 +167,7 @@ elif grep -q "PASS: init_failed asserted as expected" sim_result.log; then
     pass "Training failure test PASSED (init_failed correctly detected)"
 elif grep -q "PASS: CSR reset test" sim_result.log; then
     pass "CSR reset test PASSED"
-elif grep -q "FAIL: rd_err\|FAIL: CSR reset test\|NATIVE_TX_DEBUG: FAIL" sim_result.log; then
+elif grep -q "BIST FAIL:\|FATAL: o_init_failed asserted\|FAIL: rd_err\|FAIL: CSR reset test\|NATIVE_TX_DEBUG: FAIL" sim_result.log; then
     fail "Simulation FAILED (data mismatch)"
     exit 1
 elif grep -q "PASS:" sim_result.log; then

@@ -22,67 +22,146 @@ CYAN="\033[36m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-SIM_HAS_OWN_PG=false
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WINDOWS_JOB="$SCRIPT_DIR/windows_xsim_job.ps1"
+LOCK_DIR="$REPO_ROOT/.uberddr4_xsim.lock"
+STOP_FILE="$REPO_ROOT/.uberddr4_xsim.stop"
+
 SIM_PID=""
-# Ctrl+C is broadcast to every foreground Git-Bash pipeline member.  Make the
-# handler idempotent so only one shell owns termination of the XSim tree.
+SIM_HAS_OWN_PG=false
+SIM_IS_WINDOWS=false
+LOCK_HELD=false
 CLEANUP_RUNNING=0
 
-# setsid is available on typical Linux hosts but absent from Git Bash.  It is
-# used only for Ctrl+C process-group cleanup, not for simulation correctness.
+# Keep terminal rendering in this shell.  There is no background status
+# process that can survive Ctrl+C and continue writing over the prompt.
+STATUS_TTY_FD=""
+if { exec {STATUS_TTY_FD}>/dev/tty; } 2>/dev/null; then :; else STATUS_TTY_FD=""; fi
+
+acquire_lock() {
+    local owner=""
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        LOCK_HELD=true
+        return 0
+    fi
+    [[ -r "$LOCK_DIR/pid" ]] && owner=$(<"$LOCK_DIR/pid")
+    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+        echo -e "${RED}ERROR: another XSim regression is already running (PID $owner).${RESET}" >&2
+        return 1
+    fi
+    rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+    rm -f "$STOP_FILE" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    LOCK_HELD=true
+}
+
+release_lock() {
+    rm -f "$STOP_FILE" 2>/dev/null || true
+    if $LOCK_HELD; then
+        rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        LOCK_HELD=false
+    fi
+}
+
 start_simulation() {
     local log_file="$1"
-    shift
     SIM_HAS_OWN_PG=false
-    if command -v setsid >/dev/null 2>&1; then
-        setsid "$@" > "$log_file" 2>&1 &
+    SIM_IS_WINDOWS=false
+    if command -v cygpath >/dev/null 2>&1 && command -v powershell.exe >/dev/null 2>&1; then
+        rm -f "$STOP_FILE" 2>/dev/null || true
+        MSYS2_ARG_CONV_EXCL='*' powershell.exe -NoProfile -NonInteractive \
+            -ExecutionPolicy Bypass -File "$(cygpath -w "$WINDOWS_JOB")" \
+            -RepositoryRoot "$(cygpath -w "$REPO_ROOT")" \
+            -StopFile "$(cygpath -w "$STOP_FILE")" \
+            -TimeoutSeconds "$((SIM_TIMEOUT_MINUTES * 60))" \
+            > "$log_file" 2>&1 &
+        SIM_IS_WINDOWS=true
+    elif command -v setsid >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+        setsid timeout --signal=TERM --kill-after=10s \
+            "${SIM_TIMEOUT_MINUTES}m" bash testbench/run_xsim.sh \
+            > "$log_file" 2>&1 &
+        SIM_HAS_OWN_PG=true
+    elif command -v timeout >/dev/null 2>&1; then
+        timeout --signal=TERM --kill-after=10s \
+            "${SIM_TIMEOUT_MINUTES}m" bash testbench/run_xsim.sh \
+            > "$log_file" 2>&1 &
+    elif command -v setsid >/dev/null 2>&1; then
+        setsid bash testbench/run_xsim.sh > "$log_file" 2>&1 &
         SIM_HAS_OWN_PG=true
     else
-        "$@" > "$log_file" 2>&1 &
+        bash testbench/run_xsim.sh > "$log_file" 2>&1 &
     fi
     SIM_PID=$!
 }
 
-# setsid lets Linux terminate an entire process group.  Git Bash has no
-# setsid, so use Windows taskkill /T to terminate Bash, pipelines, and XSim.
-terminate_simulation_tree() {
-    local pid="$1"
-    local own_pg="$2"
-    if $own_pg; then
-        kill -- -"$pid" 2>/dev/null
-    elif command -v taskkill.exe >/dev/null 2>&1; then
-        taskkill.exe /PID "$pid" /T /F >/dev/null 2>&1
+stop_simulation() {
+    local attempt
+    [[ -n "${SIM_PID:-}" ]] || return 0
+    if $SIM_IS_WINDOWS; then
+        # Request an orderly stop so the owner can also terminate Xilinx tools
+        # whose loader deliberately breaks them away from the Windows Job.
+        : > "$STOP_FILE"
+    elif $SIM_HAS_OWN_PG; then
+        kill -TERM -- -"$SIM_PID" 2>/dev/null || true
     else
-        local child
-        for child in $(pgrep -P "$pid" 2>/dev/null); do
-            terminate_simulation_tree "$child" false
-        done
-        kill "$pid" 2>/dev/null
+        # Portable fallback for hosts without setsid.
+        kill -TERM "$SIM_PID" 2>/dev/null || true
     fi
+    for attempt in {1..100}; do
+        kill -0 "$SIM_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$SIM_PID" 2>/dev/null; then
+        kill -KILL "$SIM_PID" 2>/dev/null || true
+    fi
+    wait "$SIM_PID" 2>/dev/null || true
+    rm -f "$STOP_FILE" 2>/dev/null || true
+    SIM_PID=""
+}
+
+show_progress() {
+    local log_file="$1"
+    local width start line elapsed frame spin=0 spinner='|/-\\'
+    local tty=false
+    [[ -n "$STATUS_TTY_FD" ]] && tty=true
+    width=$(( ${COLUMNS:-120} - 24 ))
+    (( width < 40 )) && width=40
+    start=$(date +%s)
+    while kill -0 "$SIM_PID" 2>/dev/null; do
+        if $tty; then
+            elapsed=$(( $(date +%s) - start ))
+            frame="${spinner:$((spin++ % 4)):1}"
+            line="Starting XSim..."
+            [[ -s "$log_file" ]] && line=$(tail -n 1 "$log_file")
+            line=${line//$'\r'/}
+            (( ${#line} > width )) && line="...${line: -$((width - 3))}"
+            printf '\r\033[K  [%02dm%02ds] %s %s' \
+                $((elapsed / 60)) $((elapsed % 60)) "$frame" "$line" \
+                >&"$STATUS_TTY_FD"
+        fi
+        sleep 0.5
+    done
+    $tty && printf '\r\033[K' >&"$STATUS_TTY_FD"
 }
 
 cleanup() {
     local exit_code="${1:-130}"
-    if (( CLEANUP_RUNNING )); then
-        trap - INT TERM HUP
-        exit "$exit_code"
-    fi
+    (( CLEANUP_RUNNING )) && return
     CLEANUP_RUNNING=1
-    trap - INT TERM HUP
-    echo -e "\n${RED}Interrupted — killing child processes...${RESET}"
-    if [[ -n "${SIM_PID:-}" ]]; then
-        terminate_simulation_tree "$SIM_PID" "$SIM_HAS_OWN_PG"
-        # Never use an unqualified `wait` here: it can wait on unrelated
-        # pipeline members and is susceptible to another Ctrl+C delivery.
-        wait "$SIM_PID" 2>/dev/null || true
-        SIM_PID=""
-    fi
+    trap '' INT TERM HUP
+    echo -e "\n${RED}Interrupted — stopping simulation...${RESET}"
+    stop_simulation
+    release_lock
     exit "$exit_code"
 }
-trap 'cleanup 130' INT TERM HUP
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+trap 'cleanup 130' INT TERM HUP
+trap 'release_lock' EXIT
 # The regression changes to REPO_ROOT before each test, so keeping this
 # relative avoids Windows/Git-Bash issues with absolute paths containing
 # spaces while remaining portable on Linux.
@@ -153,6 +232,27 @@ else
 fi
 
 total=${#TESTS[@]}
+
+# A regression is a functional check, not a waveform-debug session.  Keep
+# dumping opt-in so an inherited DUMP_VCD=1 cannot make every test crawl.
+export DUMP_VCD="${REGRESSION_DUMP_VCD:-0}"
+
+# The detailed native BITSLICE model performs the same complete calibration
+# sweep as hardware and is substantially slower than component-mode models.
+# Give it a safe default timeout while leaving an explicit user override.
+if [[ "${PHY_IMPL:-component}" == "native" ]]; then
+    SIM_TIMEOUT_MINUTES="${SIM_TIMEOUT_MINUTES:-240}"
+else
+    SIM_TIMEOUT_MINUTES="${SIM_TIMEOUT_MINUTES:-60}"
+fi
+if ! [[ "$SIM_TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+    echo -e "${RED}ERROR: SIM_TIMEOUT_MINUTES must be a positive integer.${RESET}"
+    exit 1
+fi
+
+if ! acquire_lock; then
+    exit 1
+fi
 rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR"
 
@@ -176,6 +276,7 @@ echo ""
 echo -e "${BOLD}${CYAN}=== UberDDR4 Calibration Regression Suite ===${RESET}"
 echo -e "${DIM}Vivado: $XILINX_VIVADO${RESET}"
 echo -e "${DIM}Tests:  $total${RESET}"
+echo -e "${DIM}Timeout per test: ${SIM_TIMEOUT_MINUTES}m${RESET}"
 echo ""
 
 pass_count=0
@@ -206,6 +307,11 @@ for entry in "${TESTS[@]}"; do
 
     write_regression_config
     DEFINES=""
+    # Preserve every production calibration operation, but avoid printing a
+    # line for every gate/WL tap. Final lane results and all failures remain.
+    if [[ "${PHY_IMPL:-component}" == "native" ]]; then
+        DEFINES="-d SIM_QUIET_TRAINING_LOG"
+    fi
     export EXTRA_DEFINES="$DEFINES"
     export SIM_CONFIG_FILE="$CONFIG_FILE"
     export MICRON_DENSITY="$MICRON_DEF"
@@ -219,20 +325,24 @@ for entry in "${TESTS[@]}"; do
     fi
 
     cd "$REPO_ROOT"
-    rm -rf xsim.dir 2>/dev/null; rm -rf xsim.dir 2>/dev/null
+    # regression_config.vh is a compilation source and changes per case.
+    # Rebuild from a clean XSim library so every test receives its exact
+    # DDR4/device/fly-by configuration rather than a stale prior one.
+    rm -rf xsim.dir 2>/dev/null
 
     LOG="$LOG_DIR/${NAME}.log"
 
     start_time=$(date +%s)
-    # timeout is also a GNU/Linux utility and is not bundled with Git Bash.
-    # On Windows, let XSim run normally; Ctrl+C still terminates the child.
-    if command -v timeout >/dev/null 2>&1; then
-        start_simulation "$LOG" bash -c 'set -o pipefail; timeout 60m bash testbench/run_xsim.sh 2>&1 | sed "s/\x1b\[[0-9;]*m//g"'
-    else
-        start_simulation "$LOG" bash -c 'set -o pipefail; bash testbench/run_xsim.sh 2>&1 | sed "s/\x1b\[[0-9;]*m//g"'
+    start_simulation "$LOG"
+    show_progress "$LOG"
+    wait "$SIM_PID"
+    sim_exit=$?
+    SIM_PID=""
+    if [[ $sim_exit -eq 124 ]] && ! grep -q "TIMEOUT:" "$LOG"; then
+        printf 'TIMEOUT: simulation exceeded %s minutes\n' \
+            "$SIM_TIMEOUT_MINUTES" >> "$LOG"
     fi
-    wait $SIM_PID
-    if [[ $? -eq 0 ]]; then
+    if [[ $sim_exit -eq 0 ]]; then
         sim_ok=true
     else
         sim_ok=false
