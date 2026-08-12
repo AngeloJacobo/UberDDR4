@@ -889,21 +889,29 @@ module ddr4_phy_native #(
     wire calibration_mode = calibration_request || calibration_session;
     wire app_account_mode = !calibration_mode && !rx_fifo_flush;
     wire app_mode = app_account_mode && !rx_write_discard;
+    reg [7:0] app_read_pending;
+    // Every DQ bit owns an asynchronous native FIFO. Their synchronized EMPTY
+    // flags can resolve on adjacent DIV_CLK cycles after the same DQS burst;
+    // pacing the bus from one arbitrary bit tears a DFI word across lanes.
+    // Advance none of the FIFOs until a complete word exists in all of them.
+    wire fifo_pace_not_empty = ~(|fifo_empty_flat);
     generate
         genvar fifo_drive_lane;
         for (fifo_drive_lane = 0; fifo_drive_lane < BYTE_LANES;
              fifo_drive_lane = fifo_drive_lane + 1) begin : gen_fifo_rd_drive
-            // DFI rddata_en is the controller's command-derived receive
-            // schedule. Drive it directly to the native FIFO in application
-            // mode; registering it here delays the pop by one full 1:4 word
-            // and overflows the two-entry FIFO on back-to-back BL8 reads.
+            // In application mode a READ command reserves one native FIFO
+            // word in app_read_pending.  Pop that word only after every DQ
+            // FIFO reports non-empty.  DFI rddata_en is a predicted return
+            // time, not proof that asynchronous per-bit FIFO flags have all
+            // crossed into DIV_CLK; using it directly can tear the first
+            // BL8 word across byte lanes when board/package skew is present.
             assign fifo_rd_en_drive[fifo_drive_lane] = calibration_mode ?
                 fifo_rd_en[fifo_drive_lane] :
-                ((app_mode && dfi_read_expected) ? {DQ_BITS{1'b1}} :
-                                                   {DQ_BITS{1'b0}});
+                ((app_mode && fifo_pace_not_empty &&
+                  (app_read_pending != 0)) ? {DQ_BITS{1'b1}} :
+                                             {DQ_BITS{1'b0}});
         end
     endgenerate
-    reg [7:0] app_read_pending;
     reg       fifo_word_valid_q;
     // RXTX_BITSLICE updates Q after the active FIFO_RD_CLK edge. Capture the
     // settled word on the opposite edge so a back-to-back pop cannot advance
@@ -934,12 +942,6 @@ module ddr4_phy_native #(
         {8'd0, app_fifo_pop_fire};
     wire app_returns_queued = (app_pending_after_fifo_pop != 0) ||
                               app_rddata_half_valid;
-    // Every DQ bit owns an asynchronous native FIFO. Their synchronized EMPTY
-    // flags can resolve on adjacent DIV_CLK cycles after the same DQS burst;
-    // pacing the bus from one arbitrary bit tears a DFI word across lanes.
-    // Advance none of the FIFOs until a complete word exists in all of them.
-    wire fifo_pace_not_empty = ~(|fifo_empty_flat);
-
     integer fifo_lane, fifo_bit;
 
     always @(posedge i_controller_clk) begin
@@ -1127,22 +1129,27 @@ module ddr4_phy_native #(
     // Native DQS-gate calibration sub-FSM.  As in MIG, gate training scans
     // the legal mCL coarse-latency range (RL-3 through RL+4), while RIU is
     // used only to clear and inspect BITSLICE_CONTROL's DQS edge monitor.
-    localparam [3:0] GATE_WRITE_ALL = 4'd0,
-                     GATE_WAIT_WRITE = 4'd1,
-                     GATE_WAIT_READ = 4'd2,
-                     GATE_OBSERVE = 4'd3,
-                     GATE_NEXT_TAP = 4'd4,
-                     GATE_FINALIZE = 4'd5,
-                     GATE_WRITE_LANE = 4'd6,
-                     GATE_WAIT_LANE = 4'd7,
-                     GATE_COMPLETE = 4'd8,
-                     GATE_CLEAR = 4'd9,
-                     GATE_WAIT_CLEAR = 4'd10,
-                     GATE_READ_STATUS = 4'd11,
-                     GATE_WAIT_STATUS = 4'd12,
-                     GATE_RELEASE_CLEAR = 4'd13,
-                     GATE_WAIT_RELEASE = 4'd14;
-    reg [3:0] gate_phase;
+    localparam [4:0] GATE_WRITE_ALL = 5'd0,
+                     GATE_WAIT_WRITE = 5'd1,
+                     GATE_WAIT_READ = 5'd2,
+                     GATE_OBSERVE = 5'd3,
+                     GATE_NEXT_TAP = 5'd4,
+                     GATE_FINALIZE = 5'd5,
+                     GATE_WRITE_LANE = 5'd6,
+                     GATE_WAIT_LANE = 5'd7,
+                     GATE_COMPLETE = 5'd8,
+                     GATE_CLEAR = 5'd9,
+                     GATE_WAIT_CLEAR = 5'd10,
+                     GATE_READ_STATUS = 5'd11,
+                     GATE_WAIT_STATUS = 5'd12,
+                     GATE_RELEASE_CLEAR = 5'd13,
+                     GATE_WAIT_RELEASE = 5'd14,
+                     GATE_RESTORE_CLEAR = 5'd15,
+                     GATE_RESTORE_WAIT_CLEAR = 5'd16,
+                     GATE_RESTORE_RELEASE = 5'd17,
+                     GATE_RESTORE_WAIT_RELEASE = 5'd18,
+                     GATE_FLUSH_WAIT = 5'd19;
+    reg [4:0] gate_phase;
     reg [3:0] gate_observe_count;
     reg [BYTE_LANES-1:0] gate_fresh_seen;
     reg [BYTE_LANES-1:0] gate_match_seen;
@@ -1153,6 +1160,7 @@ module ddr4_phy_native #(
     reg [8:0] gate_best_start [0:BYTE_LANES-1];
     reg [8:0] gate_best_width [0:BYTE_LANES-1];
     reg [8:0] gate_center [0:BYTE_LANES-1];
+    reg [8:0] gate_restore_tap;
 
     // Eye training registers (phase-aware range tracking)
     reg [8:0] sweep_tap;
@@ -1288,59 +1296,45 @@ module ddr4_phy_native #(
     end
 
     // -----------------------------------------------------------------
-    // Eye Training: Combinational Pattern Search
+    // Eye Training: Fixed-boundary MPR comparison
     // -----------------------------------------------------------------
-    wire [15:0] train_window;
-    assign train_window = {iserdes_dq_q[train_lane * DQ_BITS],
-                           prev_iserdes_q[train_lane * DQ_BITS]};
-
-    wire [8:0] offset_match;
+    // Gate training establishes the native FIFO's BL8 word boundary before
+    // the DQ eye sweep begins.  The eye scan must therefore compare the
+    // current FIFO word at that fixed boundary.  Searching the periodic MPR
+    // value anywhere in {current, previous} aliases almost every delay tap
+    // and can combine samples captured under two different tap settings.
+    wire [DQ_BITS-1:0] lane_mpr_bit_match [0:BYTE_LANES-1];
+    wire [BYTE_LANES-1:0] lane_mpr_word_match;
     generate
-        genvar om;
-        for (om = 0; om <= 8; om = om + 1) begin : gen_offset_cmp
-            assign offset_match[om] = (train_window[om +: 8] === MPR_PATTERN);
+        genvar mpr_lane, mpr_bit;
+        for (mpr_lane = 0; mpr_lane < BYTE_LANES;
+             mpr_lane = mpr_lane + 1) begin : gen_mpr_lane
+            for (mpr_bit = 0; mpr_bit < DQ_BITS;
+                 mpr_bit = mpr_bit + 1) begin : gen_mpr_bit
+                assign lane_mpr_bit_match[mpr_lane][mpr_bit] =
+                    (iserdes_dq_q[mpr_lane * DQ_BITS + mpr_bit] ===
+                     MPR_PATTERN);
+            end
+            assign lane_mpr_word_match[mpr_lane] =
+                &lane_mpr_bit_match[mpr_lane];
         end
     endgenerate
 
-    wire pattern_found_comb = |offset_match;
-    reg [3:0] pattern_offset_comb;
-    always @* begin
-        case (1'b1)
-            offset_match[0]: pattern_offset_comb = 4'd0;
-            offset_match[1]: pattern_offset_comb = 4'd1;
-            offset_match[2]: pattern_offset_comb = 4'd2;
-            offset_match[3]: pattern_offset_comb = 4'd3;
-            offset_match[4]: pattern_offset_comb = 4'd4;
-            offset_match[5]: pattern_offset_comb = 4'd5;
-            offset_match[6]: pattern_offset_comb = 4'd6;
-            offset_match[7]: pattern_offset_comb = 4'd7;
-            default:         pattern_offset_comb = 4'd8;
-        endcase
-    end
+    // A byte lane has one DQS gate and one shared DQ-delay control in this
+    // generic native PHY.  Use DQ[0] as the lane timing reference, matching
+    // the established component-PHY calibration algorithm.  Requiring all
+    // eight primitive Q words to be bit-identical rejects a valid common DQS
+    // eye because individual RXTX_BITSLICE FIFO phases are independent.
+    wire pattern_found_comb =
+        lane_mpr_bit_match[train_lane][0];
+    wire [3:0] pattern_offset_comb = 4'd8;
 
-    // Gate training only needs to prove that a freshly popped FIFO word is
-    // composed entirely of the known MPR pattern. Search both sides of the
-    // native word boundary because the subsequent eye scan owns bitslip.
+    // Gate training proves that the current, freshly popped FIFO word is a
+    // complete BL8 MPR return.  Do not search prev_iserdes_q here: that word
+    // can belong to the preceding RL_DLY candidate and would create a false
+    // gate window at a tap that clips the actual burst.
     wire [BYTE_LANES-1:0] gate_pattern_found;
-    generate
-        genvar gate_lane;
-        for (gate_lane = 0; gate_lane < BYTE_LANES; gate_lane = gate_lane + 1) begin : gen_gate_pattern
-            wire [15:0] gate_window = {
-                iserdes_dq_q[gate_lane * DQ_BITS],
-                prev_iserdes_q[gate_lane * DQ_BITS]
-            };
-            assign gate_pattern_found[gate_lane] =
-                (gate_window[0 +: 8] === MPR_PATTERN) ||
-                (gate_window[1 +: 8] === MPR_PATTERN) ||
-                (gate_window[2 +: 8] === MPR_PATTERN) ||
-                (gate_window[3 +: 8] === MPR_PATTERN) ||
-                (gate_window[4 +: 8] === MPR_PATTERN) ||
-                (gate_window[5 +: 8] === MPR_PATTERN) ||
-                (gate_window[6 +: 8] === MPR_PATTERN) ||
-                (gate_window[7 +: 8] === MPR_PATTERN) ||
-                (gate_window[8 +: 8] === MPR_PATTERN);
-        end
-    endgenerate
+    assign gate_pattern_found = lane_mpr_word_match;
 
     // -----------------------------------------------------------------
     // DFI Read Data Packing + rddata_valid + Training FSM
@@ -1436,6 +1430,7 @@ module ddr4_phy_native #(
             wl_train_fail       <= {BYTE_LANES{1'b0}};
             gate_phase          <= GATE_WRITE_ALL;
             gate_sweep_tap      <= 9'd0;
+            gate_restore_tap    <= 9'd0;
             gate_observe_count  <= 4'd0;
             gate_fresh_seen     <= {BYTE_LANES{1'b0}};
             gate_match_seen     <= {BYTE_LANES{1'b0}};
@@ -1706,7 +1701,7 @@ module ddr4_phy_native #(
                                 for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1) begin
                                     if (|fifo_rd_en[dfi_pack_idx])
                                         gate_fresh_seen[dfi_pack_idx] <= 1'b1;
-                                    if (gate_fresh_seen[dfi_pack_idx] &&
+                                    if (fifo_word_valid_q &&
                                         gate_pattern_found[dfi_pack_idx])
                                         gate_match_seen[dfi_pack_idx] <= 1'b1;
                                 end
@@ -1777,8 +1772,14 @@ module ddr4_phy_native #(
                                                                             GATE_TAP_STEP;
                                         end
                                     end else if (gate_in_range[dfi_pack_idx]) begin
-                                        if (!gate_best_valid[dfi_pack_idx] ||
-                                            (gate_cur_width[dfi_pack_idx] > gate_best_width[dfi_pack_idx])) begin
+                                        // RL_DLY can span more than one DQS
+                                        // period, so later taps may expose a
+                                        // wider periodic copy of the same MPR
+                                        // burst. Keep the first complete
+                                        // window tied to the scheduled READ
+                                        // mask; selecting a later copy adds a
+                                        // whole-cycle receive ambiguity.
+                                        if (!gate_best_valid[dfi_pack_idx]) begin
                                             gate_best_start[dfi_pack_idx] <= gate_cur_start[dfi_pack_idx];
                                             gate_best_width[dfi_pack_idx] <= gate_cur_width[dfi_pack_idx];
                                             gate_best_valid[dfi_pack_idx] <= 1'b1;
@@ -1801,14 +1802,20 @@ module ddr4_phy_native #(
                                 // observes the committed best-range registers.
                                 for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1) begin
                                     if (gate_in_range[dfi_pack_idx] &&
-                                        (!gate_best_valid[dfi_pack_idx] ||
-                                         (gate_cur_width[dfi_pack_idx] > gate_best_width[dfi_pack_idx]))) begin
+                                        !gate_best_valid[dfi_pack_idx]) begin
                                         gate_best_start[dfi_pack_idx] <= gate_cur_start[dfi_pack_idx];
                                         gate_best_width[dfi_pack_idx] <= gate_cur_width[dfi_pack_idx];
                                         gate_best_valid[dfi_pack_idx] <= 1'b1;
                                     end
                                 end
                                 train_lane <= 0;
+                                // Every byte is still programmed to the final
+                                // broadcast sweep tap.  Walk each byte back to
+                                // its selected centre in legal delay-update
+                                // increments instead of issuing a 511-to-low
+                                // discontinuity that can leave the native gate
+                                // state/read FIFO unusable despite RIU readback.
+                                gate_restore_tap <= gate_sweep_tap;
                                 gate_phase <= GATE_WRITE_LANE;
                             end
 
@@ -1828,15 +1835,25 @@ module ddr4_phy_native #(
                                     gate_trained_mcl[train_lane] <= NATIVE_GATE_MCL;
                                 end
                                 // Program the selected fine delay back into the
-                                // byte currently being finalized.  Without this
-                                // write the last sweep candidate (tap 496/511)
-                                // remained active even when calibration chose
-                                // tap zero, corrupting all following reads.
+                                // byte currently being finalized. Native delay
+                                // controls permit at most an eight-tap change
+                                // per update, so a full 0..511 scan must not
+                                // jump directly from its final candidate to a
+                                // low-valued centre.
                                 native_riu_addr <= 6'h30;
-                                native_riu_wr_data <= gate_best_valid[train_lane] ?
-                                    {7'd0, gate_best_start[train_lane] +
-                                           (gate_best_width[train_lane] >> 1)} :
-                                    16'd0;
+                                native_riu_wr_data <= {7'd0,
+                                    delay_step_toward(
+                                        gate_restore_tap,
+                                        gate_best_valid[train_lane] ?
+                                            gate_best_start[train_lane] +
+                                            (gate_best_width[train_lane] >> 1) :
+                                            9'd0)};
+                                gate_restore_tap <= delay_step_toward(
+                                    gate_restore_tap,
+                                    gate_best_valid[train_lane] ?
+                                        gate_best_start[train_lane] +
+                                        (gate_best_width[train_lane] >> 1) :
+                                        9'd0);
                                 native_riu_wr_en <= 1'b1;
                                 native_riu_sel <= ({{(BYTE_LANES-1){1'b0}}, 1'b1}
                                                    << train_lane);
@@ -1852,25 +1869,98 @@ module ddr4_phy_native #(
                                     phy_timer <= phy_timer - 1'b1;
                                 end else if (native_riu_valid[train_lane] &&
                                              (native_riu_rd_data[train_lane][8:0] ==
-                                              gate_center[train_lane])) begin
-                                    `ifndef YOSYS
-                                        $display("[%0t] PHY gate: lane %0d start_tap=%0d width=%0d center_tap=%0d mCL=%0d fail=%0b",
-                                            $realtime, train_lane,
-                                            gate_best_start[train_lane],
-                                            gate_best_width[train_lane],
-                                            gate_center[train_lane],
-                                            gate_trained_mcl[train_lane], gate_train_fail[train_lane]);
-                                    `endif
-                                    if (train_lane < BYTE_LANES - 1) begin
-                                        train_lane <= train_lane + 1'b1;
+                                              gate_restore_tap)) begin
+                                    if (gate_restore_tap !=
+                                        gate_center[train_lane]) begin
                                         gate_phase <= GATE_WRITE_LANE;
                                     end else begin
-                                        en_vtc_q <= 1'b1;
-                                        bitslice_en_vtc_q <= 1'b0;
-                                        gate_phase <= GATE_COMPLETE;
+                                        // RL_DLY readback proves that the
+                                        // register changed, but the native
+                                        // DQS gate still retains state from
+                                        // the last sweep candidate. Re-arm
+                                        // this byte at its final center before
+                                        // any eye-training READ is accepted.
+                                        gate_phase <= GATE_RESTORE_CLEAR;
                                     end
                                 end else begin
                                     phy_timer <= 4'd15;
+                                end
+                            end
+
+                            GATE_RESTORE_CLEAR: begin
+                                native_riu_addr <= 6'h00;
+                                native_riu_wr_data <= 16'h0130;
+                                native_riu_wr_en <= 1'b1;
+                                native_riu_sel <= ({{(BYTE_LANES-1){1'b0}}, 1'b1}
+                                                   << train_lane);
+                                phy_timer <= 4'd15;
+                                gate_phase <= GATE_RESTORE_WAIT_CLEAR;
+                            end
+
+                            GATE_RESTORE_WAIT_CLEAR: begin
+                                native_riu_addr <= 6'h00;
+                                native_riu_sel <= ({{(BYTE_LANES-1){1'b0}}, 1'b1}
+                                                   << train_lane);
+                                if (phy_timer != 0)
+                                    phy_timer <= phy_timer - 1'b1;
+                                else if (native_riu_valid[train_lane])
+                                    gate_phase <= GATE_RESTORE_RELEASE;
+                                else
+                                    phy_timer <= 4'd15;
+                            end
+
+                            GATE_RESTORE_RELEASE: begin
+                                native_riu_addr <= 6'h00;
+                                native_riu_wr_data <= 16'h0030;
+                                native_riu_wr_en <= 1'b1;
+                                native_riu_sel <= ({{(BYTE_LANES-1){1'b0}}, 1'b1}
+                                                   << train_lane);
+                                phy_timer <= 4'd15;
+                                gate_phase <= GATE_RESTORE_WAIT_RELEASE;
+                            end
+
+                            GATE_RESTORE_WAIT_RELEASE: begin
+                                native_riu_addr <= 6'h00;
+                                native_riu_sel <= ({{(BYTE_LANES-1){1'b0}}, 1'b1}
+                                                   << train_lane);
+                                if (phy_timer != 0) begin
+                                    phy_timer <= phy_timer - 1'b1;
+                                end else if (native_riu_valid[train_lane]) begin
+`ifndef YOSYS
+                                    $display("[%0t] PHY gate: lane %0d start_tap=%0d width=%0d center_tap=%0d mCL=%0d fail=%0b",
+                                        $realtime, train_lane,
+                                        gate_best_start[train_lane],
+                                        gate_best_width[train_lane],
+                                        gate_center[train_lane],
+                                        gate_trained_mcl[train_lane],
+                                        gate_train_fail[train_lane]);
+`endif
+                                    if (train_lane < BYTE_LANES - 1) begin
+                                        train_lane <= train_lane + 1'b1;
+                                        gate_restore_tap <= gate_sweep_tap;
+                                        gate_phase <= GATE_WRITE_LANE;
+                                    end else begin
+                                        // The complete sweep deliberately
+                                        // captures words at many invalid and
+                                        // periodic gate positions. Flush all
+                                        // native RX FIFOs after restoring the
+                                        // final per-lane centers so eye
+                                        // training cannot inherit a stale
+                                        // word or pointer phase from a later
+                                        // sweep candidate.
+                                        rx_fifo_flush_count <= 5'd16;
+                                        gate_phase <= GATE_FLUSH_WAIT;
+                                    end
+                                end else begin
+                                    phy_timer <= 4'd15;
+                                end
+                            end
+
+                            GATE_FLUSH_WAIT: begin
+                                if (rx_fifo_flush_count == 0) begin
+                                    en_vtc_q <= 1'b1;
+                                    bitslice_en_vtc_q <= 1'b0;
+                                    gate_phase <= GATE_COMPLETE;
                                 end
                             end
 
@@ -1903,7 +1993,8 @@ module ddr4_phy_native #(
                     // first exact match is retained so an X during DQS
                     // preamble/postamble cannot overwrite a valid MPR word.
                     PHY_EYE_OBSERVE: begin
-                        if (pattern_found_comb && !eye_observe_seen) begin
+                        if (fifo_word_valid_q && pattern_found_comb &&
+                            !eye_observe_seen) begin
                             eye_observe_seen <= 1'b1;
                             eye_observe_offset <= pattern_offset_comb;
                         end
@@ -1921,7 +2012,8 @@ module ddr4_phy_native #(
                                 iserdes_dq_q[train_lane * DQ_BITS]);
 `endif
                             if (eye_observe_verify) begin
-                                if (eye_observe_seen | pattern_found_comb) begin
+                                if (eye_observe_seen |
+                                    (fifo_word_valid_q && pattern_found_comb)) begin
                                     pattern_found_q <= 1'b1;
                                     pattern_offset_q <= eye_observe_seen ?
                                                         eye_observe_offset : pattern_offset_comb;
@@ -1939,7 +2031,9 @@ module ddr4_phy_native #(
                                     phy_state <= PHY_EYE_LATE;
                                 end
                             end else begin
-                                pattern_found_q <= eye_observe_seen | pattern_found_comb;
+                                pattern_found_q <= eye_observe_seen |
+                                                   (fifo_word_valid_q &&
+                                                    pattern_found_comb);
                                 pattern_offset_q <= eye_observe_seen ?
                                                     eye_observe_offset : pattern_offset_comb;
                                 pattern_late_q <= 1'b0;
