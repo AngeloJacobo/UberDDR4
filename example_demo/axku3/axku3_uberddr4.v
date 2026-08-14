@@ -154,6 +154,10 @@ module axku3_uberddr4 (
         .COL_BITS              (10),
         .BYTE_LANES            (4),    // two x16 devices = four byte lanes
         .DENSITY               (8),
+        // Safe for both PHYs and required by the native BITSLICE PHY: its
+        // initial CKE transition reaches the pins nine controller clocks
+        // later than the steady-state CA command path.
+        .TPHY_INIT_LAT         (9),
         .BIST_MODE             (2),
         .BIST_DM_TEST          (0),
         .DEBUG_CSR_ENABLE      (0)

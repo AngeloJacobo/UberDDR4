@@ -1,3 +1,13 @@
+////////////////////////////////////////////////////////////////////////////////
+// Native PHY primitive-reset sequencer
+//
+// The order and wait counts follow the UltraScale/UltraScale+ native PHY
+// startup requirements. Keep the sequence cycle-exact: controller start-up
+// timing accounts for this fixed PHY latency.
+////////////////////////////////////////////////////////////////////////////////
+
+`default_nettype none
+
 module ddr4_phy_native_reset (
     input  wire       i_clk,
     input  wire       i_rst_n,
@@ -14,7 +24,7 @@ module ddr4_phy_native_reset (
     output reg        o_init_complete,
     output wire [3:0] o_phy_state
 );
-/* State encoding */
+// State encoding is exposed through o_phy_state for implementation debug.
 localparam [3:0] RST_IDLE       = 4'd0,
                  RST_PLL_WAIT   = 4'd1,
                  RST_RELEASE    = 4'd2,
@@ -25,24 +35,37 @@ localparam [3:0] RST_IDLE       = 4'd0,
                  RST_TBYTE      = 4'd7,
                  RST_PHY_RDEN   = 4'd8,
                  RST_DONE       = 4'd9;
-/* State and counter registers */
+
+// Cycle counts are inclusive because each state starts with cnt == 0.
+localparam [6:0] BSC_RELEASE_LAST = 7'd63,
+                 CLKOUTPHY_LAST   = 7'd15,
+                 TBYTE_LAST       = 7'd3,
+                 PHY_RDEN_LAST    = 7'd3;
+
+// State and counter registers
 reg [3:0] state;
 reg [6:0] cnt;
-/* EN_VTC 2-FF synchronizer */
-reg       en_vtc_meta;
-reg       en_vtc_sync;
+
+// EN_VTC qualification pipeline. o_en_vtc is generated in this same clock
+// domain; two registered observations ensure the primitive control has been
+// asserted before VTC_RDY is accepted.
+reg en_vtc_q;
+reg en_vtc_qq;
+
 assign o_phy_state = state;
-/* Synchronizer for EN_VTC */
+
 always @(posedge i_clk or negedge i_rst_n) begin
     if (!i_rst_n) begin
-        en_vtc_meta <= 1'b0;
-        en_vtc_sync <= 1'b0;
+        en_vtc_q  <= 1'b0;
+        en_vtc_qq <= 1'b0;
     end else begin
-        en_vtc_meta <= o_en_vtc;
-        en_vtc_sync <= en_vtc_meta;
+        en_vtc_q  <= o_en_vtc;
+        en_vtc_qq <= en_vtc_q;
     end
 end
-/* Main state machine */
+
+// Restart the complete primitive sequence if PLL lock is lost after it was
+// first acquired. This leaves every BITSLICE control in a known safe state.
 always @(posedge i_clk or negedge i_rst_n) begin
     if (!i_rst_n) begin
         state          <= RST_IDLE;
@@ -90,7 +113,7 @@ always @(posedge i_clk or negedge i_rst_n) begin
             RST_RELEASE: begin
                 o_bsc_rst      <= 1'b0;
                 o_bitslice_rst <= 1'b0;
-                if (cnt == 7'd63) begin
+                if (cnt == BSC_RELEASE_LAST) begin
                     state <= RST_CLKOUTPHY;
                     cnt   <= 7'd0;
                 end else begin
@@ -99,7 +122,7 @@ always @(posedge i_clk or negedge i_rst_n) begin
             end
             RST_CLKOUTPHY: begin
                 o_clkoutphy_en <= 1'b1;
-                if (cnt == 7'd15) begin
+                if (cnt == CLKOUTPHY_LAST) begin
                     state <= RST_DLY_WAIT;
                     cnt   <= 7'd0;
                 end else begin
@@ -116,14 +139,14 @@ always @(posedge i_clk or negedge i_rst_n) begin
                 state    <= RST_VTC_WAIT;
             end
             RST_VTC_WAIT: begin
-                if (i_vtc_rdy && en_vtc_sync) begin
+                if (i_vtc_rdy && en_vtc_qq) begin
                     state <= RST_TBYTE;
                     cnt   <= 7'd0;
                 end
             end
             RST_TBYTE: begin
                 o_tbyte_en <= 1'b1;
-                if (cnt == 7'd3) begin
+                if (cnt == TBYTE_LAST) begin
                     state <= RST_PHY_RDEN;
                     cnt   <= 7'd0;
                 end else begin
@@ -132,7 +155,7 @@ always @(posedge i_clk or negedge i_rst_n) begin
             end
             RST_PHY_RDEN: begin
                 o_phy_rden <= 1'b1;
-                if (cnt == 7'd3) begin
+                if (cnt == PHY_RDEN_LAST) begin
                     state <= RST_DONE;
                 end else begin
                     cnt <= cnt + 7'd1;
@@ -148,3 +171,5 @@ always @(posedge i_clk or negedge i_rst_n) begin
     end
 end
 endmodule
+
+`default_nettype wire

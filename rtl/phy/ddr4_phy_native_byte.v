@@ -1,6 +1,11 @@
 // ddr4_phy_native_byte.v
-// One byte lane (8 DQ + 1 DQS pair + 1 DM) for native-mode DDR4 PHY on UltraScale+.
-// Instantiates RXTX_BITSLICE, TX_BITSLICE_TRI, BITSLICE_CONTROL, RIU_OR.
+// One byte lane (8 DQ + 1 DQS pair + 1 DM) for the native-mode DDR4 PHY on
+// UltraScale and UltraScale+ devices. The explicit lower/upper-nibble
+// structure mirrors the physical BITSLICE layout and is intentionally kept
+// visible for placement review against an implemented design.
+
+`default_nettype none
+
 module ddr4_phy_native_byte #(
     parameter DQ_BITS     = 8,
     parameter REFCLK_FREQ = 300.0,
@@ -116,9 +121,11 @@ wire dqs_to_iob, dqs_from_iob, dqs_t;
 wire dm_to_obuf;
 
 assign o_wl_feedback = dq_from_iob[0];
-// RIU wires
-wire [15:0] riu_rd_data_low, riu_rd_data_upp;
-wire        riu_rd_valid_low, riu_rd_valid_upp;
+// Only the DQS-owning upper nibble participates in parent RIU transactions.
+// The lower nibble still receives the broadcast address/write controls, but
+// its readback is intentionally left unused.
+wire [15:0] riu_rd_data_upp;
+wire        riu_rd_valid_upp;
 // ---------------------------------------------------------------------------
 // Status outputs
 // ---------------------------------------------------------------------------
@@ -249,8 +256,8 @@ BITSLICE_CONTROL #(
     // RIU_NIBBLE_SEL is the nibble select, not a byte-wide transaction
     // enable.  Read-gate registers live in the DQS-owning upper nibble.
     .RIU_NIBBLE_SEL     (1'b0),
-    .RIU_RD_DATA        (riu_rd_data_low),
-    .RIU_VALID          (riu_rd_valid_low)
+    .RIU_RD_DATA        (),
+    .RIU_VALID          ()
 );
 // ---------------------------------------------------------------------------
 // Upper Nibble BITSLICE_CONTROL
@@ -704,17 +711,6 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_upper
 end
 endgenerate
 // ---------------------------------------------------------------------------
-// RIU_OR - Combine upper and lower nibble RIU
-// ---------------------------------------------------------------------------
-RIU_OR u_riu_or (
-    .RIU_RD_DATA        (),
-    .RIU_RD_VALID       (),
-    .RIU_RD_DATA_LOW    (riu_rd_data_low),
-    .RIU_RD_DATA_UPP    (riu_rd_data_upp),
-    .RIU_RD_VALID_LOW   (riu_rd_valid_low),
-    .RIU_RD_VALID_UPP   (riu_rd_valid_upp)
-);
-// ---------------------------------------------------------------------------
 // IOBs - DQ[7:0]
 // ---------------------------------------------------------------------------
 generate
@@ -749,3 +745,5 @@ OBUF u_obuf_dm (
 /* verilator lint_on PINMISSING */
 /* verilator lint_on PINCONNECTEMPTY */
 endmodule
+
+`default_nettype wire

@@ -750,9 +750,32 @@ module ddr4_controller #(
     assign rom_cmd_is_mrs  = (rom_instruction[26:23] == CMD_MRS);
     assign rom_use_timer   = rom_instruction[ROM_USE_TIMER];
 
+    // Do not start the JEDEC initialization sequence until the PHY reports
+    // that its clocking, delay, and serializer resources are ready. This is
+    // especially important for native BITSLICE PHYs when simulation uses
+    // shortened power-on delays. Otherwise CKE can reach the memory pins
+    // after the controller has already started the tXPR timer.
+    //
+    // After initialization, reset_done keeps the refresh ROM enabled even if
+    // a PHY implementation does not hold init_complete indefinitely.
+    // Treat the status input as asynchronous here. Native implementations
+    // generate it on the controller clock, while a component PHY can derive
+    // it from IDELAYCTRL.RDY in the reference-clock domain. Synchronizing it
+    // avoids using an asynchronous status directly in the ROM fire enable.
+    (* ASYNC_REG = "TRUE" *) reg [1:0] dfi_init_complete_sync;
+    wire phy_init_ready = reset_done || dfi_init_complete_sync[1];
+
+    always @(posedge i_controller_clk or negedge i_rst_n) begin
+        if (!i_rst_n)
+            dfi_init_complete_sync <= 2'b00;
+        else
+            dfi_init_complete_sync <= {dfi_init_complete_sync[0],
+                                       i_dfi_init_complete};
+    end
+
     // CKE/RESET_n mux: use ROM value when firing, else hold previous.
-    // MRS commands force both high. 
-    wire init_firing  = delay_counter_is_zero && !pause_counter;
+    // MRS commands force both high.
+    wire init_firing  = delay_counter_is_zero && !pause_counter && phy_init_ready;
     wire init_cke     = init_firing ? (rom_cmd_is_mrs ? 1'b1 : rom_instruction[ROM_CKE])     : rom_cke_hold;
     wire init_reset_n = init_firing ? (rom_cmd_is_mrs ? 1'b1 : rom_instruction[ROM_RESET_N]) : rom_reset_n_hold;
 
@@ -956,7 +979,7 @@ module ddr4_controller #(
     // rom_firing        = ROM ready to issue (delay done, not paused, not held)
     // rom_precharge_all = PRE ALL actually fires this cycle
     wire rom_prea_hold = rom_is_prea && any_precharge_pending && reset_done;
-    wire rom_firing = delay_counter_is_zero && !pause_counter && !rom_prea_hold;
+    wire rom_firing = init_firing && !rom_prea_hold;
     wire rom_precharge_all = rom_firing && rom_is_prea;
 
     wire wb_accept = i_wb_cyc && i_wb_stb && !o_wb_stall;

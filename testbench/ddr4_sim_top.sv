@@ -1577,19 +1577,23 @@ module ddr4_sim_top;
             end
             wb_dbg_idle;
 
-            // 2c. Trigger BIST, then force DFI cs_n=1 briefly during write phase
-            //     to make the DRAM ignore some write commands. When BIST reads
-            //     back those addresses, it gets stale data â†’ mismatch â†’ fail.
+            // 2c. Trigger BIST, then corrupt data only while DFI marks write
+            //     data valid. This leaves the command/read paths intact.
+            //     Several zeroed words guarantee a mismatch even when DRAM
+            //     still contains the expected pattern from an earlier BIST.
             wb_dbg_write(4'hC, 32'h5); // bit[0]=1 (BIST start) + bit[2]=1 (keep auto_reset_en)
             wb_dbg_idle;
-            // Wait into BIST write phase (~200 cycles in)
-            repeat (200) @(posedge controller_clk);
-            $display("[%0t]   Forcing dfi_cs_n=1 to make DRAM ignore writes", $realtime);
-            force u_dut.dfi_cs_n = {4{1'b1}};
-            repeat (100) @(posedge controller_clk);
-            release u_dut.dfi_cs_n;
-            $display("[%0t]   Released dfi_cs_n â€�? some writes were dropped", $realtime);
-
+            wait (u_dut.u_prober.bist_state == 3'd1); // BIST_BURST_WRITE
+            wait (|u_dut.dfi_wrdata_en);
+            $display("[%0t]   Forcing valid DFI write data to zero", $realtime);
+            force u_dut.dfi_wrdata = '0;
+            repeat (8) @(posedge controller_clk);
+            release u_dut.dfi_wrdata;
+            $display("[%0t]   Released DFI write data corruption", $realtime);
+            if (u_dut.u_prober.bist_state !== 3'd1) begin
+                $display("[%0t] FAIL: write-data fault escaped the BIST write phase", $realtime);
+                rd_err_count = rd_err_count + 1;
+            end
             // 2d. Wait for init_done to drop (BIST finishes â†’ auto-reset fires)
             ar_timeout = 0;
             while (init_done && ar_timeout < 200000) begin
