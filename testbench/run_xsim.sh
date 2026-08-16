@@ -19,8 +19,8 @@
 #   EXTRA_DEFINES  -  extra xvlog -d flags, e.g. "-d SIM_FLY_BY_DELAY=200"
 #                     (used by regression_test.sh to sweep configurations)
 #   PHY_IMPL       -  component (default) or native.  This defines the
-#                     testbench's TB_USE_NATIVE_PHY selector.  The testbench
-#                     itself textually includes exactly one implementation.
+#                     testbench's TB_USE_NATIVE_PHY selector, which drives
+#                     ddr4_top.PHY_IMPL. Both implementations are compiled.
 #
 set -euo pipefail
 

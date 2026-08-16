@@ -142,11 +142,13 @@ set_property DATA_RATE DDR [get_ports {ddr4_ck_p ddr4_ck_n {ddr4_dqs_p[*]} {ddr4
 ############################ Bitstream settings ##############################
 set_property BITSTREAM.CONFIG.SPI_BUSWIDTH 4 [current_design]
 set_property CONFIG_MODE SPIx4 [current_design]
-set_property BITSTREAM.CONFIG.CONFIGRATE 50 [current_design]
+set_property BITSTREAM.CONFIG.CONFIGRATE 51.0 [current_design]
 set_property BITSTREAM.GENERAL.COMPRESS TRUE [current_design]
 set_property BITSTREAM.CONFIG.UNUSEDPIN Pullup [current_design]
-set_property CFGBVS VCCO [current_design]
-set_property CONFIG_VOLTAGE 3.3 [current_design]
+# AXKU3 VCCO_0 and its MT25QU256 QSPI devices use the 1.8 V rail.  KU3P
+# therefore supports only the grounded CFGBVS selection for this package.
+set_property CFGBVS GND [current_design]
+set_property CONFIG_VOLTAGE 1.8 [current_design]
 
 # The only controller-to-ref_clk crossing is the monotonic IDELAYCTRL release
 # request.  rtl/ddr4_phy.v receives it with an ASYNC_REG two-flop synchronizer;

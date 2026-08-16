@@ -86,13 +86,14 @@ module ddr4_top #(
     // CAS Write Latency override (0=auto from DDR4_CLK_PERIOD)
     //   Auto values: DDR4-1600=9, DDR4-1866=10, DDR4-2133=11, DDR4-2400=12
     parameter[4:0] CWL = 0,
-    // DFI PHY write latency in controller clocks.  Set to 1 for the native
-    // UltraScale BITSLICE PHY; retain 0 for the component PHY.
-    parameter[1:0] TPHY_WRLAT = 0,
-    // Extra reset-exit CKE-to-command guard in controller clocks.  The native
-    // BITSLICE CA path uses 9 to cover its initial serializer fill; component
-    // mode retains 0.  This affects initialization only.
-    parameter[3:0] TPHY_INIT_LAT = 0,
+    // PHY implementation:
+    //   0 = component PHY (rtl/ddr4_phy.v, portable reference implementation)
+    //   1 = native UltraScale/UltraScale+ BITSLICE PHY
+    //
+    // The controller-facing timing compensation is derived from this choice.
+    // Keeping those values private prevents a PHY/controller mismatch caused
+    // by a board-level instantiation overriding only one of them.
+    parameter[0:0] PHY_IMPL = 0,
     // BIST / debug prober configuration
     //   BIST_MODE: 0=disabled, 1=half-range, 2=full-range (all three phases always run)
     parameter[1:0] BIST_MODE = 1,
@@ -105,6 +106,18 @@ module ddr4_top #(
     parameter BA_BITS = 2,
               BG_BITS = (DEVICE_WIDTH == 16) ? 1 : 2,
               DQ_BITS = 8,
+    // Native-PHY package topology.  These are ignored by the component PHY.
+    // One ACMD byte is {physical_nibble[4:0], position[2:0]}; one DQ nibble
+    // is {upper_nibble, position[2:0]}.  All ones selects the canonical
+    // simulation layout.  Hardware wrappers must use their XDC pin topology.
+              PHY_ACMD_NIBBLE_COUNT = 0,
+    parameter [255:0] PHY_ACMD_PIN_MAP = {256{1'b1}},
+    parameter [4*DQ_BITS*BYTE_LANES-1:0] PHY_DQ_PIN_MAP =
+              {4*DQ_BITS*BYTE_LANES{1'b1}},
+              PHY_PLL_COUNT = 1,
+    parameter [95:0] PHY_ACMD_PLL_MAP = 96'd0,
+    parameter [3*BYTE_LANES-1:0] PHY_BYTE_PLL_MAP =
+              {3*BYTE_LANES{1'b0}},
     // Derived (for port widths)
     parameter SERDES_RATIO = 4,
               NUM_BG = (1 << BG_BITS),
@@ -146,6 +159,13 @@ module ddr4_top #(
     // Status
     output wire o_init_done, o_init_failed
 );
+
+    // Native PHY timing is architectural, rather than board-specific:
+    // one 1:4 TX word is registered before serialization, and the first CKE
+    // transition needs nine controller clocks to fill the CA serializer.
+    // The component PHY has neither latency.
+    localparam [1:0] PHY_TPHY_WRLAT   = PHY_IMPL ? 2'd1 : 2'd0;
+    localparam [3:0] PHY_TPHY_INIT_LAT = PHY_IMPL ? 4'd9 : 4'd0;
 
     // -----------------------------------------------------------------
     // DFI 3.1 Internal Bus
@@ -279,8 +299,8 @@ module ddr4_top #(
         .DRIVE_IMP(DRIVE_IMP),
         .CL(CL),
         .CWL(CWL),
-        .TPHY_WRLAT(TPHY_WRLAT),
-        .TPHY_INIT_LAT(TPHY_INIT_LAT)
+        .TPHY_WRLAT(PHY_TPHY_WRLAT),
+        .TPHY_INIT_LAT(PHY_TPHY_INIT_LAT)
     ) u_controller (
         .i_controller_clk(i_controller_clk),
         .i_rst_n(internal_rst_n),
@@ -348,8 +368,10 @@ module ddr4_top #(
     // -----------------------------------------------------------------
     // PHY Instantiation
     // -----------------------------------------------------------------
-    // Xilinx UltraScale+ PHY: ISERDESE3/OSERDESE3, IDELAYE3/ODELAYE3,
-    // write-leveling, read gate training.  Directly drives DDR4 I/O.
+    // Select the PHY at elaboration.  Both implementations use the same DFI
+    // interface and export identical prober status signals.
+    generate
+    if (!PHY_IMPL) begin : gen_component_phy
     ddr4_phy #(
         .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),
         .DDR4_CLK_PERIOD(DDR4_CLK_PERIOD),
@@ -424,6 +446,83 @@ module ddr4_top #(
         .o_phy_rd_lat_extra(phy_rd_lat_extra),
         .o_phy_en_vtc(phy_en_vtc)
     );
+    end else begin : gen_native_phy
+    ddr4_phy_native_adapter #(
+        .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),
+        .DDR4_CLK_PERIOD(DDR4_CLK_PERIOD),
+        .DEVICE_WIDTH(DEVICE_WIDTH),
+        .BYTE_LANES(BYTE_LANES),
+        .ACMD_NIBBLE_COUNT(PHY_ACMD_NIBBLE_COUNT),
+        .ACMD_PIN_MAP(PHY_ACMD_PIN_MAP),
+        .DQ_PIN_MAP(PHY_DQ_PIN_MAP),
+        .PLL_COUNT(PHY_PLL_COUNT),
+        .ACMD_PLL_MAP(PHY_ACMD_PLL_MAP),
+        .BYTE_PLL_MAP(PHY_BYTE_PLL_MAP)
+    ) u_phy (
+        .i_controller_clk(i_controller_clk),
+        .i_ddr4_clk(i_ddr4_clk),
+        .i_ref_clk(i_ref_clk),
+        .i_rst_n(internal_rst_n),
+        .i_dfi_address(dfi_address),
+        .i_dfi_bank(dfi_bank),
+        .i_dfi_bg(dfi_bg),
+        .i_dfi_cs_n(dfi_cs_n),
+        .i_dfi_act_n(dfi_act_n),
+        .i_dfi_ras_n(dfi_ras_n),
+        .i_dfi_cas_n(dfi_cas_n),
+        .i_dfi_we_n(dfi_we_n),
+        .i_dfi_cke(dfi_cke),
+        .i_dfi_odt(dfi_odt),
+        .i_dfi_reset_n(dfi_reset_n),
+        .i_dfi_wrdata(dfi_wrdata),
+        .i_dfi_wrdata_en(dfi_wrdata_en),
+        .i_dfi_wrdata_mask(dfi_wrdata_mask),
+        .o_dfi_rddata(dfi_rddata),
+        .o_dfi_rddata_valid(dfi_rddata_valid),
+        .i_dfi_rddata_en(dfi_rddata_en),
+        .i_dfi_init_start(dfi_init_start),
+        .o_dfi_init_complete(dfi_init_complete),
+        .i_dfi_rdlvl_en(dfi_rdlvl_en),
+        .i_dfi_rdlvl_gate_en(dfi_rdlvl_gate_en),
+        .i_dfi_wrlvl_en(dfi_wrlvl_en),
+        .i_dfi_wrlvl_strobe(dfi_wrlvl_strobe),
+        .i_dfi_lvl_pattern(dfi_lvl_pattern),
+        .i_dfi_lvl_periodic(dfi_lvl_periodic),
+        .o_dfi_rdlvl_resp(dfi_rdlvl_resp),
+        .o_dfi_wrlvl_resp(dfi_wrlvl_resp),
+        .o_dfi_rdlvl_req(dfi_rdlvl_req),
+        .o_dfi_rdlvl_gate_req(dfi_rdlvl_gate_req),
+        .o_dfi_wrlvl_req(dfi_wrlvl_req),
+        .o_ddr4_ck_p(o_ddr4_ck_p),
+        .o_ddr4_ck_n(o_ddr4_ck_n),
+        .o_ddr4_reset_n(o_ddr4_reset_n),
+        .o_ddr4_cke(o_ddr4_cke),
+        .o_ddr4_cs_n(o_ddr4_cs_n),
+        .o_ddr4_act_n(o_ddr4_act_n),
+        .o_ddr4_addr(o_ddr4_addr),
+        .o_ddr4_ba(o_ddr4_ba),
+        .o_ddr4_bg(o_ddr4_bg),
+        .o_ddr4_odt(o_ddr4_odt),
+        .o_ddr4_dm_n(o_ddr4_dm_n),
+        .io_ddr4_dq(io_ddr4_dq),
+        .io_ddr4_dqs_p(io_ddr4_dqs_p),
+        .io_ddr4_dqs_n(io_ddr4_dqs_n),
+        .o_phy_state(phy_train_state),
+        .o_phy_idelay_center(phy_idelay_center),
+        .o_phy_wl_tap(phy_wl_tap),
+        .o_phy_bitslip(phy_bitslip),
+        .o_phy_train_fail_gate(phy_train_fail_gate),
+        .o_phy_train_fail_eye(phy_train_fail_eye),
+        .o_phy_train_fail_wl(phy_train_fail_wl),
+        .o_phy_best_width(phy_best_width),
+        .o_phy_best_start(phy_best_start),
+        .o_phy_wl_dq_tap(phy_wl_dq_tap),
+        .o_phy_dqs_initial_tap(phy_dqs_initial_tap),
+        .o_phy_rd_lat_extra(phy_rd_lat_extra),
+        .o_phy_en_vtc(phy_en_vtc)
+    );
+    end
+    endgenerate
 
     // -----------------------------------------------------------------
     // Prober Instantiation (BIST + Debug CSR)

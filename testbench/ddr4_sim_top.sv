@@ -55,31 +55,26 @@ endmodule
 
 `default_nettype none
 
-// Select one DFI-compatible PHY implementation for XSim.  run_xsim.sh
-// defines TB_USE_NATIVE_PHY only when PHY_IMPL=native is requested; component
-// mode remains the default and the two implementations are never compiled
-// into the same simulation library.
-`ifdef TB_USE_NATIVE_PHY
+// Compile both DFI-compatible PHYs, then select one with ddr4_top.PHY_IMPL.
+// run_xsim.sh defines TB_USE_NATIVE_PHY only to select the testbench's top
+// parameter; this makes the simulation use the same public selection API as
+// a hardware design.
+`include "../rtl/ddr4_phy.v"
 `include "../rtl/phy/ddr4_phy_native_reset.v"
 `include "../rtl/phy/ddr4_phy_native_byte.v"
 `include "../rtl/phy/ddr4_phy_native.v"
 `include "../rtl/phy/ddr4_phy_native_adapter.v"
-`else
-`include "../rtl/ddr4_phy.v"
-`endif
 
 module ddr4_sim_top;
 
-    // Native BITSLICE timing at the DFI boundary:
-    //  - one registered 1:4 TX data word (tphy_wrlat)
-    //  - nine controller clocks of one-time CA/CKE serializer fill after reset
-    // Component mode has neither additional latency.
+    // This is intentionally the only PHY choice the testbench makes.  ddr4_top
+    // owns the implementation-specific DFI timing compensation.
 `ifdef TB_USE_NATIVE_PHY
-    localparam integer TB_TPHY_WRLAT = 1;
-    localparam integer TB_TPHY_INIT_LAT = 9;
+    localparam [0:0] TB_PHY_IMPL = 1'b1;
+    `define TB_PHY_HIER u_dut.gen_native_phy.u_phy
 `else
-    localparam integer TB_TPHY_WRLAT = 0;
-    localparam integer TB_TPHY_INIT_LAT = 0;
+    localparam [0:0] TB_PHY_IMPL = 1'b0;
+    `define TB_PHY_HIER u_dut.gen_component_phy.u_phy
 `endif
 
     // ===================================================================
@@ -338,8 +333,7 @@ module ddr4_sim_top;
         .COL_BITS              (COL_BITS),
         .BYTE_LANES            (BYTE_LANES),
         .DENSITY               (TB_DENSITY_GB),
-        .TPHY_WRLAT            (TB_TPHY_WRLAT),
-        .TPHY_INIT_LAT          (TB_TPHY_INIT_LAT),
+        .PHY_IMPL               (TB_PHY_IMPL),
         .MICRON_SIM            (1),
         .ADDR_MAPPING          (TB_ADDR_MAPPING),
         .BIST_MODE             (TB_BIST_MODE),
@@ -396,17 +390,17 @@ module ddr4_sim_top;
     // by the all-high fallback.  This changes neither synthesizable RTL nor
     // the post-training TX datapath.
     initial begin : native_tx_debug_fast_wl
-        wait (u_dut.u_phy.u_native.phy_state == 4'd8 &&
-              u_dut.u_phy.u_native.train_lane == 0);
-        force u_dut.u_phy.u_native.phy_state = 4'd12;
+        wait (`TB_PHY_HIER.u_native.phy_state == 4'd8 &&
+              `TB_PHY_HIER.u_native.train_lane == 0);
+        force `TB_PHY_HIER.u_native.phy_state = 4'd12;
         repeat (6) @(posedge controller_clk);
-        release u_dut.u_phy.u_native.phy_state;
+        release `TB_PHY_HIER.u_native.phy_state;
 
-        wait (u_dut.u_phy.u_native.phy_state == 4'd8 &&
-              u_dut.u_phy.u_native.train_lane == 1);
-        force u_dut.u_phy.u_native.phy_state = 4'd12;
+        wait (`TB_PHY_HIER.u_native.phy_state == 4'd8 &&
+              `TB_PHY_HIER.u_native.train_lane == 1);
+        force `TB_PHY_HIER.u_native.phy_state = 4'd12;
         repeat (6) @(posedge controller_clk);
-        release u_dut.u_phy.u_native.phy_state;
+        release `TB_PHY_HIER.u_native.phy_state;
     end
 `endif
 
@@ -911,45 +905,45 @@ module ddr4_sim_top;
 
     always @(posedge controller_clk) begin
         if (rst_n) begin
-            prev_phy_state <= u_dut.u_phy.phy_state;
+            prev_phy_state <= `TB_PHY_HIER.phy_state;
 
             // Gate training (no-op â€�? responds immediately)
-            if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd1)
+            if (prev_phy_state == 4'd0 && `TB_PHY_HIER.phy_state == 4'd1)
 `ifdef TB_USE_NATIVE_PHY
                 $display("[%0t] PHY native gate training started", $realtime);
 `else
                 $display("[%0t] PHY gate training (no-op)", $realtime);
 `endif
-            if (prev_phy_state == 4'd1 && u_dut.u_phy.phy_state == 4'd0)
+            if (prev_phy_state == 4'd1 && `TB_PHY_HIER.phy_state == 4'd0)
                 $display("[%0t] PHY gate training done", $realtime);
 
             // Eye training
-            if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd2)
+            if (prev_phy_state == 4'd0 && `TB_PHY_HIER.phy_state == 4'd2)
                 $display("[%0t] PHY eye training started", $realtime);
-            if (u_dut.u_phy.phy_state == 4'd7 && prev_phy_state != 4'd7)
+            if (`TB_PHY_HIER.phy_state == 4'd7 && prev_phy_state != 4'd7)
                 if (BYTE_LANES > 1)
                     $display("[%0t] PHY eye training done (lane0 center=%0d bs=%0d late=%0d, lane1 center=%0d bs=%0d late=%0d)",
                         $realtime,
-                        u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0], u_dut.u_phy.rd_lat_extra[0],
-                        u_dut.u_phy.eye_center_tap[1], u_dut.u_phy.bitslip_count_q[1], u_dut.u_phy.rd_lat_extra[1]);
+                        `TB_PHY_HIER.eye_center_tap[0], `TB_PHY_HIER.bitslip_count_q[0], `TB_PHY_HIER.rd_lat_extra[0],
+                        `TB_PHY_HIER.eye_center_tap[1], `TB_PHY_HIER.bitslip_count_q[1], `TB_PHY_HIER.rd_lat_extra[1]);
                 else
                     $display("[%0t] PHY eye training done (lane0 center=%0d bs=%0d late=%0d)",
                         $realtime,
-                        u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0], u_dut.u_phy.rd_lat_extra[0]);
+                        `TB_PHY_HIER.eye_center_tap[0], `TB_PHY_HIER.bitslip_count_q[0], `TB_PHY_HIER.rd_lat_extra[0]);
 
             // Write leveling
-            if (prev_phy_state == 4'd0 && u_dut.u_phy.phy_state == 4'd8)
+            if (prev_phy_state == 4'd0 && `TB_PHY_HIER.phy_state == 4'd8)
                 $display("[%0t] PHY write leveling started", $realtime);
-            if (u_dut.u_phy.phy_state == 4'd11 && prev_phy_state != 4'd11)
+            if (`TB_PHY_HIER.phy_state == 4'd11 && prev_phy_state != 4'd11)
                 if (BYTE_LANES > 1)
                     $display("[%0t] PHY write leveling done (lane0 dqs_tap=%0d, lane1 dqs_tap=%0d)",
                         $realtime,
-                        u_dut.u_phy.wl_tap[0],
-                        u_dut.u_phy.wl_tap[1]);
+                        `TB_PHY_HIER.wl_tap[0],
+                        `TB_PHY_HIER.wl_tap[1]);
                 else
                     $display("[%0t] PHY write leveling done (lane0 dqs_tap=%0d)",
                         $realtime,
-                        u_dut.u_phy.wl_tap[0]);
+                        `TB_PHY_HIER.wl_tap[0]);
         end
     end
 
@@ -965,37 +959,37 @@ module ddr4_sim_top;
             if (BYTE_LANES > 1)
                 $display("[%0t]   Gate: lane0 bs=%0d, lane1 bs=%0d",
                     $realtime,
-                    u_dut.u_phy.bitslip_count_q[0],
-                    u_dut.u_phy.bitslip_count_q[1]);
+                    `TB_PHY_HIER.bitslip_count_q[0],
+                    `TB_PHY_HIER.bitslip_count_q[1]);
             else
                 $display("[%0t]   Gate: lane0 bs=%0d",
                     $realtime,
-                    u_dut.u_phy.bitslip_count_q[0]);
+                    `TB_PHY_HIER.bitslip_count_q[0]);
             if (BYTE_LANES > 1)
                 $display("[%0t]   Eye:  lane0 center=%0d bs=%0d late=%0d, lane1 center=%0d bs=%0d late=%0d",
                     $realtime,
-                    u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0], u_dut.u_phy.rd_lat_extra[0],
-                    u_dut.u_phy.eye_center_tap[1], u_dut.u_phy.bitslip_count_q[1], u_dut.u_phy.rd_lat_extra[1]);
+                    `TB_PHY_HIER.eye_center_tap[0], `TB_PHY_HIER.bitslip_count_q[0], `TB_PHY_HIER.rd_lat_extra[0],
+                    `TB_PHY_HIER.eye_center_tap[1], `TB_PHY_HIER.bitslip_count_q[1], `TB_PHY_HIER.rd_lat_extra[1]);
             else
                 $display("[%0t]   Eye:  lane0 center=%0d bs=%0d late=%0d",
                     $realtime,
-                    u_dut.u_phy.eye_center_tap[0], u_dut.u_phy.bitslip_count_q[0], u_dut.u_phy.rd_lat_extra[0]);
+                    `TB_PHY_HIER.eye_center_tap[0], `TB_PHY_HIER.bitslip_count_q[0], `TB_PHY_HIER.rd_lat_extra[0]);
             if (BYTE_LANES > 1)
                 $display("[%0t]   WL:   lane0 dqs_tap=%0d dq_tap=%0d, lane1 dqs_tap=%0d dq_tap=%0d",
                     $realtime,
-                    u_dut.u_phy.wl_tap[0], u_dut.u_phy.wl_dq_tap[0],
-                    u_dut.u_phy.wl_tap[1], u_dut.u_phy.wl_dq_tap[1]);
+                    `TB_PHY_HIER.wl_tap[0], `TB_PHY_HIER.wl_dq_tap[0],
+                    `TB_PHY_HIER.wl_tap[1], `TB_PHY_HIER.wl_dq_tap[1]);
             else
                 $display("[%0t]   WL:   lane0 dqs_tap=%0d dq_tap=%0d",
                     $realtime,
-                    u_dut.u_phy.wl_tap[0], u_dut.u_phy.wl_dq_tap[0]);
+                    `TB_PHY_HIER.wl_tap[0], `TB_PHY_HIER.wl_dq_tap[0]);
             if (BYTE_LANES > 1 && FLY_BY >= 100) begin
-                if (u_dut.u_phy.wl_tap[0] == u_dut.u_phy.wl_tap[1])
+                if (`TB_PHY_HIER.wl_tap[0] == `TB_PHY_HIER.wl_tap[1])
                     $display("[%0t]   WARNING: WL taps identical despite FLY_BY=%0dps  -  expected asymmetry",
                         $realtime, FLY_BY);
                 else
                     $display("[%0t]   OK: WL taps differ (lane0=%0d, lane1=%0d)  -  fly-by compensation working",
-                        $realtime, u_dut.u_phy.wl_tap[0], u_dut.u_phy.wl_tap[1]);
+                        $realtime, `TB_PHY_HIER.wl_tap[0], `TB_PHY_HIER.wl_tap[1]);
             end
         end
     end
@@ -1045,12 +1039,12 @@ module ddr4_sim_top;
             `endif
                 dfi_wr_seq = dfi_wr_seq + 1;
             end
-            if (|u_dut.u_phy.o_dfi_rddata_valid) begin
+            if (|`TB_PHY_HIER.o_dfi_rddata_valid) begin
             `ifndef SIM_QUIET_DFI_BURST_LOG
                 $display("[DBG-RD] #%0d p2rise=%04h full=%0h",
                     dfi_rd_seq,
-                    u_dut.u_phy.o_dfi_rddata[79:64],
-                    u_dut.u_phy.o_dfi_rddata);
+                    `TB_PHY_HIER.o_dfi_rddata[79:64],
+                    `TB_PHY_HIER.o_dfi_rddata);
             `endif
                 dfi_rd_seq = dfi_rd_seq + 1;
             end

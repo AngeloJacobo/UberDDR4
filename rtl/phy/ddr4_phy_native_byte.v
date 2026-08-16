@@ -4,12 +4,17 @@
 // structure mirrors the physical BITSLICE layout and is intentionally kept
 // visible for placement review against an implemented design.
 
+`timescale 1ps / 1ps
 `default_nettype none
 
 module ddr4_phy_native_byte #(
     parameter DQ_BITS     = 8,
     parameter REFCLK_FREQ = 300.0,
-    parameter SIM_DEVICE  = "ULTRASCALE_PLUS"
+    parameter SIM_DEVICE  = "ULTRASCALE_PLUS",
+    // One four-bit entry per logical DQ: {upper_nibble, position[2:0]}.
+    // Valid data positions are lower/upper 2..5.  All ones selects the
+    // canonical simulation map (DQ0..3 lower, DQ4..7 upper).
+    parameter [4*DQ_BITS-1:0] DQ_PIN_MAP = {4*DQ_BITS{1'b1}}
 )(
     // Clocks
     input  wire        i_pll_clkoutphy,
@@ -37,9 +42,6 @@ module ddr4_phy_native_byte #(
     // RX data (read path)
     output wire [DQ_BITS*8-1:0] o_rx_dq_data,
     output wire [DQ_BITS-1:0]   o_fifo_empty,
-    // Raw DQ0 receiver level for write leveling.  The DRAM holds this level
-    // after the DQS edge; the parent synchronizes it into the DIV_CLK domain.
-    output wire                 o_wl_feedback,
     // Each asynchronous DQ FIFO has its own registered read enable.
     input  wire [DQ_BITS-1:0]   i_fifo_rd_en,
     // Per-byte RIU access to the upper nibble that owns the DQS input and
@@ -69,6 +71,98 @@ module ddr4_phy_native_byte #(
     inout  wire               io_ddr4_dqs_n,
     output wire               o_ddr4_dm_n
 );
+// ---------------------------------------------------------------------------
+// Physical DQ placement within this byte
+// ---------------------------------------------------------------------------
+function [3:0] dq_map_entry;
+    input integer logical_dq;
+    begin
+        if (&DQ_PIN_MAP) begin
+            dq_map_entry[3]   = (logical_dq >= 4);
+            dq_map_entry[2:0] = (logical_dq % 4) + 2;
+        end else begin
+            dq_map_entry = DQ_PIN_MAP[logical_dq*4 +: 4];
+        end
+    end
+endfunction
+
+function integer dq_pin_at;
+    input integer upper_nibble;
+    input integer position;
+    integer logical_dq;
+    begin
+        dq_pin_at = -1;
+        for (logical_dq = 0; logical_dq < DQ_BITS;
+             logical_dq = logical_dq + 1)
+            if (dq_map_entry(logical_dq) ==
+                ((upper_nibble ? 4'h8 : 4'h0) | position))
+                dq_pin_at = logical_dq;
+    end
+endfunction
+
+function integer dq_slot_occupancy;
+    input integer upper_nibble;
+    input integer position;
+    integer logical_dq;
+    begin
+        dq_slot_occupancy = 0;
+        for (logical_dq = 0; logical_dq < DQ_BITS;
+             logical_dq = logical_dq + 1)
+            if (dq_map_entry(logical_dq) ==
+                ((upper_nibble ? 4'h8 : 4'h0) | position))
+                dq_slot_occupancy = dq_slot_occupancy + 1;
+    end
+endfunction
+
+`ifndef SYNTHESIS
+integer dq_check_pin;
+integer dq_check_pos;
+initial begin
+    if (DQ_BITS != 8)
+        $error("Native byte PHY requires eight DQ bits per byte lane");
+    for (dq_check_pin = 0; dq_check_pin < DQ_BITS;
+         dq_check_pin = dq_check_pin + 1)
+        if (((dq_map_entry(dq_check_pin) & 4'h7) < 4'd2) ||
+            ((dq_map_entry(dq_check_pin) & 4'h7) > 4'd5))
+            $error("Native PHY DQ%0d has invalid byte map entry 0x%01x",
+                   dq_check_pin, dq_map_entry(dq_check_pin));
+    for (dq_check_pos = 2; dq_check_pos <= 5;
+         dq_check_pos = dq_check_pos + 1) begin
+        if (dq_slot_occupancy(0, dq_check_pos) != 1)
+            $error("Native PHY lower-nibble position %0d must map exactly one DQ",
+                   dq_check_pos);
+        if (dq_slot_occupancy(1, dq_check_pos) != 1)
+            $error("Native PHY upper-nibble position %0d must map exactly one DQ",
+                   dq_check_pos);
+    end
+end
+`endif
+
+// A byte has one physical CLB-to-RIU ingress bus shared by its two nibble
+// controls (UG571, RIU_OR topology).  Register a byte-local copy to prevent
+// cross-byte fanout onto that dedicated route.  Only the upper nibble is
+// selected: it owns DQS and its gate delay/status; the lower nibble receives
+// the upper nibble's trained P/N clocks through EN_OTHER_PCLK/NCLK.
+(* DONT_TOUCH = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [5:0]  riu_addr_q;
+(* DONT_TOUCH = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [15:0] riu_wr_data_q;
+(* DONT_TOUCH = "TRUE", SHREG_EXTRACT = "NO" *)
+reg        riu_wr_en_q, riu_nibble_sel_q;
+
+always @(posedge i_div_clk) begin
+    if (i_bsc_rst) begin
+        riu_addr_q       <= 6'd0;
+        riu_wr_data_q    <= 16'd0;
+        riu_wr_en_q      <= 1'b0;
+        riu_nibble_sel_q <= 1'b0;
+    end else begin
+        riu_addr_q       <= i_riu_addr;
+        riu_wr_data_q    <= i_riu_wr_data;
+        riu_wr_en_q      <= i_riu_wr_en;
+        riu_nibble_sel_q <= i_riu_nibble_sel;
+    end
+end
 // ---------------------------------------------------------------------------
 // Internal wires - BIT_CTRL buses (40-bit each)
 // ---------------------------------------------------------------------------
@@ -120,7 +214,6 @@ wire dqs_to_iob, dqs_from_iob, dqs_t;
 // DM output wire
 wire dm_to_obuf;
 
-assign o_wl_feedback = dq_from_iob[0];
 // Only the DQS-owning upper nibble participates in parent RIU transactions.
 // The lower nibble still receives the broadcast address/write controls, but
 // its readback is intentionally left unused.
@@ -247,14 +340,12 @@ BITSLICE_CONTROL #(
     // Tristate bus
     .TX_BIT_CTRL_OUT_TRI(tx_bit_ctrl_out_tri_low),
     .TX_BIT_CTRL_IN_TRI (tx_bit_ctrl_in_tri_low),
-    .RIU_ADDR           (i_riu_addr),
-    // NIBBLE_CTRL0 differs only in the inter-nibble clock selects: the
-    // lower nibble consumes the upper nibble's DQS clocks.
-    .RIU_WR_DATA        ((i_riu_addr == 6'h00) ?
-                         (i_riu_wr_data | 16'h0003) : i_riu_wr_data),
-    .RIU_WR_EN          (i_riu_wr_en),
-    // RIU_NIBBLE_SEL is the nibble select, not a byte-wide transaction
-    // enable.  Read-gate registers live in the DQS-owning upper nibble.
+    .RIU_ADDR           (riu_addr_q),
+    .RIU_WR_DATA        (riu_wr_data_q),
+    .RIU_WR_EN          (riu_wr_en_q),
+    // No RIU transaction targets this nibble.  Its source-clock selection is
+    // established by EN_OTHER_PCLK/NCLK and must not be overwritten while
+    // training the DQS-owning upper nibble.
     .RIU_NIBBLE_SEL     (1'b0),
     .RIU_RD_DATA        (),
     .RIU_VALID          ()
@@ -344,10 +435,10 @@ BITSLICE_CONTROL #(
     // Tristate bus
     .TX_BIT_CTRL_OUT_TRI(tx_bit_ctrl_out_tri_upp),
     .TX_BIT_CTRL_IN_TRI (tx_bit_ctrl_in_tri_upp),
-    .RIU_ADDR           (i_riu_addr),
-    .RIU_WR_DATA        (i_riu_wr_data),
-    .RIU_WR_EN          (i_riu_wr_en),
-    .RIU_NIBBLE_SEL     (i_riu_nibble_sel),
+    .RIU_ADDR           (riu_addr_q),
+    .RIU_WR_DATA        (riu_wr_data_q),
+    .RIU_WR_EN          (riu_wr_en_q),
+    .RIU_NIBBLE_SEL     (riu_nibble_sel_q),
     .RIU_RD_DATA        (riu_rd_data_upp),
     .RIU_VALID          (riu_rd_valid_upp)
 );
@@ -529,13 +620,15 @@ RXTX_BITSLICE #(
     .T_OUT              (dqs_t)
 );
 // ---------------------------------------------------------------------------
-// RXTX_BITSLICE - DQ[0:3] (lower nibble positions 2-5)
+// RXTX_BITSLICE - physical lower-nibble positions 2-5
+// LOGICAL_DQ inverts DQ_PIN_MAP, preserving the external/DFI bit number.
 // ---------------------------------------------------------------------------
 wire [8:0] rx_cntvalueout_dq [0:DQ_BITS-1];
 assign o_rx_cntvalueout_dq0 = rx_cntvalueout_dq[0];
 genvar gi;
 generate
 for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
+    localparam integer LOGICAL_DQ = dq_pin_at(0, gi + 2);
     wire [39:0] rx_ctrl_out_w;
     wire [39:0] tx_ctrl_out_w;
     wire [39:0] rx_ctrl_in_w;
@@ -571,8 +664,8 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
         .SIM_DEVICE         (SIM_DEVICE)
     ) u_rxtx_dq (
         .FIFO_RD_CLK        (i_div_clk),
-        .FIFO_RD_EN         (i_fifo_rd_en[gi]),
-        .FIFO_EMPTY         (o_fifo_empty[gi]),
+        .FIFO_RD_EN         (i_fifo_rd_en[LOGICAL_DQ]),
+        .FIFO_EMPTY         (o_fifo_empty[LOGICAL_DQ]),
         .RX_RST             (i_rx_fifo_rst),
         .TX_RST             (i_bitslice_rst),
         .RX_RST_DLY         (i_bitslice_rst),
@@ -592,21 +685,21 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
         .TX_INC             (1'b0),
         .RX_CNTVALUEIN      (i_rx_cntvaluein),
         .RX_LOAD            (i_rx_load),
-        .RX_CNTVALUEOUT     (rx_cntvalueout_dq[gi]),
+        .RX_CNTVALUEOUT     (rx_cntvalueout_dq[LOGICAL_DQ]),
         .TX_CNTVALUEIN      (i_tx_dq_cntvaluein),
         .TX_LOAD            (i_tx_dq_load),
         .TX_CNTVALUEOUT     (),
-        .D                  (i_tx_dq_data[gi*8 +: 8]),
-        .O                  (dq_to_iob[gi]),
+        .D                  (i_tx_dq_data[LOGICAL_DQ*8 +: 8]),
+        .O                  (dq_to_iob[LOGICAL_DQ]),
         .T                  (1'b1),
         .TBYTE_IN           (tbyte_out_low),
-        .DATAIN             (dq_from_iob[gi]),
-        .Q                  (o_rx_dq_data[gi*8 +: 8]),
+        .DATAIN             (dq_from_iob[LOGICAL_DQ]),
+        .Q                  (o_rx_dq_data[LOGICAL_DQ*8 +: 8]),
         .RX_BIT_CTRL_IN     (rx_ctrl_in_w),
         .RX_BIT_CTRL_OUT    (rx_ctrl_out_w),
         .TX_BIT_CTRL_IN     (tx_ctrl_in_w),
         .TX_BIT_CTRL_OUT    (tx_ctrl_out_w),
-        .T_OUT              (dq_t[gi])
+        .T_OUT              (dq_t[LOGICAL_DQ])
     );
     if (gi == 0) begin : assign_pos2
         assign rx_bit_ctrl_in2_low = rx_ctrl_out_w;
@@ -624,10 +717,11 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
 end
 endgenerate
 // ---------------------------------------------------------------------------
-// RXTX_BITSLICE - DQ[4:7] (upper nibble positions 2-5)
+// RXTX_BITSLICE - physical upper-nibble positions 2-5
 // ---------------------------------------------------------------------------
 generate
 for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_upper
+    localparam integer LOGICAL_DQ = dq_pin_at(1, gi + 2);
     wire [39:0] rx_ctrl_out_w;
     wire [39:0] tx_ctrl_out_w;
     wire [39:0] rx_ctrl_in_w;
@@ -662,8 +756,8 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_upper
         .SIM_DEVICE         (SIM_DEVICE)
     ) u_rxtx_dq (
         .FIFO_RD_CLK        (i_div_clk),
-        .FIFO_RD_EN         (i_fifo_rd_en[gi + 4]),
-        .FIFO_EMPTY         (o_fifo_empty[gi + 4]),
+        .FIFO_RD_EN         (i_fifo_rd_en[LOGICAL_DQ]),
+        .FIFO_EMPTY         (o_fifo_empty[LOGICAL_DQ]),
         .RX_RST             (i_rx_fifo_rst),
         .TX_RST             (i_bitslice_rst),
         .RX_RST_DLY         (i_bitslice_rst),
@@ -679,21 +773,21 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_upper
         .TX_INC             (1'b0),
         .RX_CNTVALUEIN      (i_rx_cntvaluein),
         .RX_LOAD            (i_rx_load),
-        .RX_CNTVALUEOUT     (rx_cntvalueout_dq[gi + 4]),
+        .RX_CNTVALUEOUT     (rx_cntvalueout_dq[LOGICAL_DQ]),
         .TX_CNTVALUEIN      (i_tx_dq_cntvaluein),
         .TX_LOAD            (i_tx_dq_load),
         .TX_CNTVALUEOUT     (),
-        .D                  (i_tx_dq_data[(gi + 4)*8 +: 8]),
-        .O                  (dq_to_iob[gi + 4]),
+        .D                  (i_tx_dq_data[LOGICAL_DQ*8 +: 8]),
+        .O                  (dq_to_iob[LOGICAL_DQ]),
         .T                  (1'b1),
         .TBYTE_IN           (tbyte_out_upp),
-        .DATAIN             (dq_from_iob[gi + 4]),
-        .Q                  (o_rx_dq_data[(gi + 4)*8 +: 8]),
+        .DATAIN             (dq_from_iob[LOGICAL_DQ]),
+        .Q                  (o_rx_dq_data[LOGICAL_DQ*8 +: 8]),
         .RX_BIT_CTRL_IN     (rx_ctrl_in_w),
         .RX_BIT_CTRL_OUT    (rx_ctrl_out_w),
         .TX_BIT_CTRL_IN     (tx_ctrl_in_w),
         .TX_BIT_CTRL_OUT    (tx_ctrl_out_w),
-        .T_OUT              (dq_t[gi + 4])
+        .T_OUT              (dq_t[LOGICAL_DQ])
     );
     if (gi == 0) begin : assign_pos2
         assign rx_bit_ctrl_in2_upp = rx_ctrl_out_w;
@@ -727,7 +821,9 @@ endgenerate
 // IOB - DQS differential pair
 // ---------------------------------------------------------------------------
 IOBUFDS #(
-    .DQS_BIAS ("TRUE")
+    // Match the generated DDR4 MIG I/O byte.  The memory's differential
+    // termination establishes the idle DQS level during read ownership.
+    .DQS_BIAS ("FALSE")
 ) u_iobufds_dqs (
     .O   (dqs_from_iob),
     .IO  (io_ddr4_dqs_p),

@@ -1,16 +1,16 @@
 ////////////////////////////////////////////////////////////////////////////////
 // UberDDR4 native-PHY build adapter
 //
-// Compile this file, ddr4_phy_native.v, ddr4_phy_native_byte.v, and
-// ddr4_phy_native_reset.v INSTEAD OF rtl/ddr4_phy.v to select the native
-// UltraScale/UltraScale+ PHY without changing ddr4_top.v or the controller.
-// Do not compile both modules named ddr4_phy in the same Vivado fileset.
+// This adapter gives the native UltraScale/UltraScale+ PHY the same DFI and
+// prober-facing ports as rtl/ddr4_phy.v.  It has a distinct module name so
+// both PHY implementations may be compiled together and selected by the
+// ddr4_top PHY_IMPL parameter.
 ////////////////////////////////////////////////////////////////////////////////
 
 `default_nettype none
 `timescale 1ps / 1ps
 
-module ddr4_phy #(
+module ddr4_phy_native_adapter #(
     parameter CONTROLLER_CLK_PERIOD = 3_333,
               DDR4_CLK_PERIOD       = 833,
               DEVICE_WIDTH          = 8,
@@ -23,7 +23,15 @@ module ddr4_phy #(
     parameter SIM_DEVICE = "ULTRASCALE_PLUS",
               PHY_PROFILE = "GENERIC",
               FIFO_PACE_LANE = (BYTE_LANES > 0) ? BYTE_LANES-1 : 0,
-              FIFO_PACE_BIT  = DQ_BITS-1
+              FIFO_PACE_BIT  = DQ_BITS-1,
+              ACMD_NIBBLE_COUNT = 0,
+    parameter [255:0] ACMD_PIN_MAP = {256{1'b1}},
+    parameter [4*DQ_BITS*BYTE_LANES-1:0] DQ_PIN_MAP =
+              {4*DQ_BITS*BYTE_LANES{1'b1}},
+              PLL_COUNT = 1,
+    parameter [95:0] ACMD_PLL_MAP = 96'd0,
+    parameter [3*BYTE_LANES-1:0] BYTE_PLL_MAP =
+              {3*BYTE_LANES{1'b0}}
 ) (
     input wire i_controller_clk, input wire i_ddr4_clk, input wire i_ref_clk,
     input wire i_rst_n,
@@ -100,7 +108,11 @@ module ddr4_phy #(
         .BA_BITS(BA_BITS), .BG_BITS(BG_BITS), .DQ_BITS(DQ_BITS),
         .SERDES_RATIO(SERDES_RATIO), .DFI_DATA_WIDTH(DFI_DATA_WIDTH),
         .SIM_DEVICE(SIM_DEVICE), .PHY_PROFILE(PHY_PROFILE),
-        .FIFO_PACE_LANE(FIFO_PACE_LANE), .FIFO_PACE_BIT(FIFO_PACE_BIT)
+        .FIFO_PACE_LANE(FIFO_PACE_LANE), .FIFO_PACE_BIT(FIFO_PACE_BIT),
+        .ACMD_NIBBLE_COUNT(ACMD_NIBBLE_COUNT),
+        .ACMD_PIN_MAP(ACMD_PIN_MAP), .DQ_PIN_MAP(DQ_PIN_MAP),
+        .PLL_COUNT(PLL_COUNT), .ACMD_PLL_MAP(ACMD_PLL_MAP),
+        .BYTE_PLL_MAP(BYTE_PLL_MAP)
     ) u_native (
         .i_controller_clk(i_controller_clk), .i_ddr4_clk(i_ddr4_clk),
         .i_ref_clk(i_ref_clk), .i_rst_n(i_rst_n),

@@ -194,6 +194,8 @@ ALL_TESTS=(
     "x4                834  4   2  0    1  1  0  8  16  DDR4_8G_X4   FIXED_2400  -"
     "x4_map0           834  4   2  0    0  1  0  8  16  DDR4_8G_X4   FIXED_2400  -"
     # Speed grade sweep
+    # tCK=1.600ns exercises the native PLL's x8/VCO low-frequency path.
+    "ddr4_1250         1600 8   2  0    1  1  0  8  16  DDR4_8G_X8   FIXED_1600  -"
     "ddr4_1600         1250 8   2  0    1  1  0  8  16  DDR4_8G_X8   FIXED_1600  -"
     "ddr4_1600_flyby   1250 8   2  200  1  1  0  8  16  DDR4_8G_X8   FIXED_1600  -"
     "ddr4_2133         937  8   2  0    1  1  0  8  16  DDR4_8G_X8   FIXED_2133  -"

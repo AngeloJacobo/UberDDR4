@@ -73,6 +73,23 @@ module ddr4_phy_native #(
               PHY_PROFILE = "GENERIC",
               FIFO_PACE_LANE = (BYTE_LANES > 0) ? BYTE_LANES-1 : 0,
               FIFO_PACE_BIT  = DQ_BITS-1,
+    // UltraScale BIT_CTRL buses are dedicated physical nibble routes.  A
+    // board wrapper must describe how its logical DDR pins occupy them:
+    //   ACMD_PIN_MAP: one byte per logical CA pin, {nibble[4:0], position[2:0]}
+    //   DQ_PIN_MAP:   one nibble per logical DQ, {upper_nibble, position[2:0]}
+    // An all-ones map selects the canonical simulation layout.  Position 7
+    // is deliberately invalid and therefore makes a safe auto-map sentinel.
+              ACMD_NIBBLE_COUNT = 0,
+    parameter [255:0] ACMD_PIN_MAP = {256{1'b1}},
+    parameter [4*DQ_BITS*BYTE_LANES-1:0] DQ_PIN_MAP =
+              {4*DQ_BITS*BYTE_LANES{1'b1}},
+    // One PLL/CLKOUTPHY is required per clock region occupied by native
+    // BITSLICE_CONTROLs.  Maps contain a three-bit PLL index per physical
+    // ACMD nibble or byte lane.  The default is one region (all index zero).
+              PLL_COUNT = 1,
+    parameter [95:0] ACMD_PLL_MAP = 96'd0,
+    parameter [3*BYTE_LANES-1:0] BYTE_PLL_MAP =
+              {3*BYTE_LANES{1'b0}},
     // Retained for source compatibility with early native-PHY experiments.
     // The trained DQS gate now establishes the BL8 boundary directly.
               NATIVE_RX_PREAMBLE_BITS = 2
@@ -164,15 +181,75 @@ module ddr4_phy_native #(
     // component-PHY delay reference clock.  This preserves an exact integer
     // relationship between DFI words and the bit-slice serializer even when
     // DDR4_CLK_PERIOD is a rounded integer number of picoseconds (e.g. 937ps).
-    // For the required 4:1 native DIV4 interface, VCO = 4 * controller_clk
-    // and CLKOUTPHY in VCO_2X mode is the DDR transfer rate.
-    localparam integer PLL_MULT = SERDES_RATIO;
+    // For the required 4:1 native DIV4 interface, CLKOUTPHY must equal the
+    // DDR transfer rate (2/tCK).  The PLL supports three dedicated-PHY output
+    // modes, so select a legal VCO without changing that output frequency:
+    //
+    //   tCK <= 1.333 ns: VCO = 4 * controller_clk, CLKOUTPHY = VCO_2X
+    //   tCK >= 1.334 ns: VCO = 8 * controller_clk, CLKOUTPHY = VCO
+    //
+    // The second form is required by slower interfaces such as the AXKU3
+    // tCK=1.600 ns configuration.  Using the first form there would produce
+    // a 625 MHz VCO, below the PLLE3/PLLE4 750 MHz minimum.  Both forms still
+    // deliver the identical 1.25 GHz CLKOUTPHY required at tCK=1.600 ns.
+    localparam integer PLL_USE_VCO_MODE = (DDR4_CLK_PERIOD >= 1_334);
+    localparam integer PLL_MULT = PLL_USE_VCO_MODE ?
+                                  (2 * SERDES_RATIO) : SERDES_RATIO;
+    // Match the legal UltraScale MIG PLL tuple.  CLKOUT0 is unused by this
+    // PHY, but its divider is part of the validated VCO/VCO_2X configuration
+    // and must track CLKOUTPHY_MODE (1 for VCO_2X, 2 for VCO).
+    localparam integer PLL_CLKOUT0_DIVIDE = PLL_USE_VCO_MODE ? 2 : 1;
+    localparam PLL_CLKOUTPHY_MODE = PLL_USE_VCO_MODE ? "VCO" : "VCO_2X";
 
     // -----------------------------------------------------------------
-    // Address/Command pin count and nibble count
+    // Address/Command pin count and physical nibble topology
     // -----------------------------------------------------------------
     localparam ACMD_PINS = 17 + BA_BITS + BG_BITS + 5 + 1; // addr+ba+bg+ctrl+ck
-    localparam ACMD_NIBBLES = (ACMD_PINS + 5) / 6;         // ceil(pins/6)
+    localparam ACMD_AUTO_NIBBLES = (ACMD_PINS + 5) / 6;
+    localparam ACMD_NIBBLES = (ACMD_NIBBLE_COUNT == 0) ?
+                              ACMD_AUTO_NIBBLES : ACMD_NIBBLE_COUNT;
+
+    // Resolve one logical CA pin to its physical BITSLICE_CONTROL nibble and
+    // position.  The automatic layout is useful for device-independent
+    // simulation; implemented designs pass the map obtained from their XDC
+    // pinout because package-pin placement cannot be inferred by Verilog.
+    function [7:0] acmd_map_entry;
+        input integer logical_pin;
+        begin
+            if (&ACMD_PIN_MAP) begin
+                acmd_map_entry[7:3] = logical_pin / 6;
+                acmd_map_entry[2:0] = logical_pin % 6;
+            end else
+                acmd_map_entry = ACMD_PIN_MAP[logical_pin*8 +: 8];
+        end
+    endfunction
+
+    // Invert the logical-to-physical map at elaboration so every physical
+    // slot has at most one TX_BITSLICE and every logical output keeps its
+    // original DDR4/DFI index.
+    function integer acmd_pin_at_slot;
+        input integer nibble;
+        input integer position;
+        integer map_pin;
+        begin
+            acmd_pin_at_slot = -1;
+            for (map_pin = 0; map_pin < ACMD_PINS; map_pin = map_pin + 1)
+                if (acmd_map_entry(map_pin) == (nibble*8 + position))
+                    acmd_pin_at_slot = map_pin;
+        end
+    endfunction
+
+    function integer acmd_slot_occupancy;
+        input integer nibble;
+        input integer position;
+        integer map_pin;
+        begin
+            acmd_slot_occupancy = 0;
+            for (map_pin = 0; map_pin < ACMD_PINS; map_pin = map_pin + 1)
+                if (acmd_map_entry(map_pin) == (nibble*8 + position))
+                    acmd_slot_occupancy = acmd_slot_occupancy + 1;
+        end
+    endfunction
 
     // -----------------------------------------------------------------
     // PHY Training FSM state encoding (same as component-mode PHY)
@@ -202,8 +279,27 @@ module ddr4_phy_native #(
 
     // Eye training sweep parameters
     localparam [3:0] TAP_SWEEP_STEP = 4'd4;
-    localparam [3:0] WL_TAP_STEP = 4'd4;
 `ifdef SIM_NATIVE_TX_DEBUG_FAST_EYE
+    // Directed XSim debug only: retain enough WL resolution to distinguish
+    // an edge while avoiding a 128-command scan of an all-high model range.
+    localparam [4:0] WL_TAP_STEP = 5'd16;
+`else
+    localparam [3:0] WL_TAP_STEP = 4'd4;
+`endif
+    // Last representable tap that can be reached exactly by the selected
+    // stride.  Deriving this endpoint prevents a diagnostic (or future)
+    // power-of-two stride from wrapping the nine-bit counter back to zero.
+    localparam [8:0] WL_SWEEP_LAST = 9'h1ff - WL_TAP_STEP + 1'b1;
+`ifdef SIM_NATIVE_GATE_DEBUG_EARLY
+    // Short single-tap sweep used only while debugging the first gate window.
+    localparam [4:0] GATE_TAP_STEP = 5'd1;
+    localparam [8:0] GATE_SWEEP_LAST = 9'd15;
+`elsif SIM_NATIVE_GATE_DEBUG_FAST
+    // Full-range diagnostic gate scan at four-tap resolution.  Production
+    // builds and regressions leave this undefined and test every tap.
+    localparam [4:0] GATE_TAP_STEP = 5'd4;
+    localparam [8:0] GATE_SWEEP_LAST = 9'd508;
+`elsif SIM_NATIVE_TX_DEBUG_FAST_EYE
     // Keep the directed primitive debug run short. Production calibration
     // scans the complete RL_DLY transfer function at single-tap resolution.
     localparam [4:0] GATE_TAP_STEP = 5'd16;
@@ -234,6 +330,7 @@ module ddr4_phy_native #(
 `ifndef SYNTHESIS
     // Fail early on configurations that cannot match the fixed 1:4 native
     // BITSLICE datapath. These checks do not add hardware.
+    integer pll_check_lane;
     initial begin
         if (SERDES_RATIO != 4)
             $error("ddr4_phy_native requires SERDES_RATIO=4");
@@ -241,27 +338,36 @@ module ddr4_phy_native #(
             $error("ddr4_phy_native requires eight DQ bits per byte lane");
         if (BYTE_LANES < 1)
             $error("ddr4_phy_native requires at least one byte lane");
+        if ((PLL_COUNT < 1) || (PLL_COUNT > 8))
+            $error("ddr4_phy_native PLL_COUNT must be in the range 1..8");
         if ((DEVICE_WIDTH != 4) && (DEVICE_WIDTH != 8) &&
             (DEVICE_WIDTH != 16))
             $error("ddr4_phy_native DEVICE_WIDTH must be x4, x8, or x16");
         if ((SIM_DEVICE != "ULTRASCALE") &&
             (SIM_DEVICE != "ULTRASCALE_PLUS"))
             $error("ddr4_phy_native SIM_DEVICE must select UltraScale or UltraScale+");
+        for (pll_check_lane = 0; pll_check_lane < BYTE_LANES;
+             pll_check_lane = pll_check_lane + 1)
+            if (BYTE_PLL_MAP[pll_check_lane*3 +: 3] >= PLL_COUNT)
+                $error("Native PHY byte %0d selects unavailable PLL %0d",
+                       pll_check_lane,
+                       BYTE_PLL_MAP[pll_check_lane*3 +: 3]);
     end
 `endif
 
     // -----------------------------------------------------------------
-    // PLL Instance (PLLE4_ADV)
-    // Generates CLKOUTPHY for bitslice serialization.
+    // PLL instances (one per occupied I/O clock region)
+    // Generate CLKOUTPHY for bitslice serialization.
     // CLKIN = i_controller_clk.  For DDR4-1600 this is 200 MHz, yielding
-    // VCO=800 MHz and CLKOUTPHY=1600 MHz.  CLKOUTPHY stays on the dedicated
-    // XPHY route; it is never promoted to a fabric/global 800 MHz clock.
+    // VCO=800 MHz and CLKOUTPHY=1600 MHz in VCO_2X mode.  For the AXKU3
+    // tCK=1.600 ns design it is 156.25 MHz, yielding VCO=CLKOUTPHY=1250 MHz
+    // in VCO mode.  CLKOUTPHY stays on the dedicated XPHY route; it is never
+    // promoted to a fabric/global high-speed clock.
     // i_ref_clk remains in the public port list for DFI/top compatibility,
     // but native BITSLICE_CONTROL uses REFCLK_SRC=PLLCLK.
     // -----------------------------------------------------------------
-    wire pll_clkoutphy;
-    wire pll_clkfbout;
-    wire pll_clkfbin;
+    wire [PLL_COUNT-1:0] pll_clkoutphy;
+    wire [PLL_COUNT-1:0] pll_locked_i;
     wire pll_locked;
     wire pll_rst;
     wire clkoutphy_en;
@@ -270,6 +376,12 @@ module ddr4_phy_native #(
     // PLLE3_ADV is required by UltraScale; PLLE4_ADV is required by
     // UltraScale+.  Both expose the dedicated CLKOUTPHY path used below.
     generate
+        genvar pll_region;
+        for (pll_region = 0; pll_region < PLL_COUNT;
+             pll_region = pll_region + 1) begin : gen_pll_region
+        wire pll_clkfbout_i;
+        wire pll_clkfbin_i;
+        assign pll_clkfbin_i = pll_clkfbout_i;
         if (SIM_DEVICE == "ULTRASCALE") begin : gen_plle3
             PLLE3_ADV #(
                 .CLKFBOUT_MULT   (PLL_MULT),
@@ -279,19 +391,21 @@ module ddr4_phy_native #(
                 // serialized data phase boundaries land on complete UI.
                 .CLKFBOUT_PHASE  (90.000),
                 .CLKIN_PERIOD    (CONTROLLER_CLK_PERIOD / 1000.0),
-                .CLKOUT0_DIVIDE  (1),
+                .CLKOUT0_DIVIDE  (PLL_CLKOUT0_DIVIDE),
                 .CLKOUT0_DUTY_CYCLE (0.500),
                 .CLKOUT0_PHASE   (0.000),
-                .CLKOUTPHY_MODE  ("VCO_2X"),
+                .CLKOUTPHY_MODE  (PLL_CLKOUTPHY_MODE),
                 .COMPENSATION    ("INTERNAL"),
                 .DIVCLK_DIVIDE   (1),
                 .REF_JITTER      (0.010),
                 .STARTUP_WAIT    ("FALSE")
             ) u_pll (
-                .CLKIN        (i_controller_clk), .CLKFBIN(pll_clkfbin),
-                .CLKFBOUT     (pll_clkfbout), .CLKOUT0(), .CLKOUT0B(),
-                .CLKOUT1      (), .CLKOUT1B(), .CLKOUTPHY(pll_clkoutphy),
-                .LOCKED       (pll_locked), .CLKOUTPHYEN(clkoutphy_en),
+                .CLKIN        (i_controller_clk), .CLKFBIN(pll_clkfbin_i),
+                .CLKFBOUT     (pll_clkfbout_i), .CLKOUT0(), .CLKOUT0B(),
+                .CLKOUT1      (), .CLKOUT1B(),
+                .CLKOUTPHY    (pll_clkoutphy[pll_region]),
+                .LOCKED       (pll_locked_i[pll_region]),
+                .CLKOUTPHYEN  (clkoutphy_en),
                 .PWRDWN       (1'b0), .RST(pll_rst), .DADDR(7'd0),
                 .DCLK         (1'b0), .DEN(1'b0), .DI(16'd0), .DO(),
                 .DRDY         (), .DWE(1'b0)
@@ -301,28 +415,30 @@ module ddr4_phy_native #(
                 .CLKFBOUT_MULT   (PLL_MULT),
                 .CLKFBOUT_PHASE  (90.000),
                 .CLKIN_PERIOD    (CONTROLLER_CLK_PERIOD / 1000.0),
-                .CLKOUT0_DIVIDE  (1),
+                .CLKOUT0_DIVIDE  (PLL_CLKOUT0_DIVIDE),
                 .CLKOUT0_DUTY_CYCLE (0.500),
                 .CLKOUT0_PHASE   (0.000),
-                .CLKOUTPHY_MODE  ("VCO_2X"),
+                .CLKOUTPHY_MODE  (PLL_CLKOUTPHY_MODE),
                 .COMPENSATION    ("INTERNAL"),
                 .DIVCLK_DIVIDE   (1),
                 .REF_JITTER      (0.010),
                 .STARTUP_WAIT    ("FALSE")
             ) u_pll (
-                .CLKIN        (i_controller_clk), .CLKFBIN(pll_clkfbin),
-                .CLKFBOUT     (pll_clkfbout), .CLKOUT0(), .CLKOUT1(),
-                .CLKOUTPHY    (pll_clkoutphy), .LOCKED(pll_locked),
+                .CLKIN        (i_controller_clk), .CLKFBIN(pll_clkfbin_i),
+                .CLKFBOUT     (pll_clkfbout_i), .CLKOUT0(), .CLKOUT1(),
+                .CLKOUTPHY    (pll_clkoutphy[pll_region]),
+                .LOCKED       (pll_locked_i[pll_region]),
                 .CLKOUTPHYEN  (clkoutphy_en), .PWRDWN(1'b0), .RST(pll_rst),
                 .DADDR        (7'd0), .DCLK(1'b0), .DEN(1'b0), .DI(16'd0),
                 .DO           (), .DRDY(), .DWE(1'b0)
             );
         end
+        end
     endgenerate
     /* verilator lint_on PINCONNECTEMPTY */
 
-    // Internal feedback
-    assign pll_clkfbin = pll_clkfbout;
+    // Do not release native calibration until every clock region is locked.
+    assign pll_locked = &pll_locked_i;
 
     // -----------------------------------------------------------------
     // Reset Sequencer
@@ -496,29 +612,34 @@ module ddr4_phy_native #(
     assign acmd_data[CK_PIN_IDX*8 +: 8] = 8'b01_01_01_01;
 
     // -----------------------------------------------------------------
-    // Address/Command TX_BITSLICE + BITSLICE_CONTROL (per nibble)
-    // Each nibble has up to 6 TX_BITSLICEs (positions 0-5, position 6 unused).
-    // No RX path needed for address/command.
+    // Address/Command TX_BITSLICE + BITSLICE_CONTROL (per physical nibble)
+    //
+    // BIT_CTRL routing is dedicated silicon, not general fabric routing.
+    // Consequently a BITSLICE_CONTROL may connect only to TX_BITSLICEs in
+    // its own physical nibble.  Logical DDR pin order is unrelated to package
+    // nibble order, and an upper nibble can use all seven positions (0..6).
+    // ACMD_PIN_MAP provides that board/package topology without changing the
+    // controller-facing signal order.
     // -----------------------------------------------------------------
     /* verilator lint_off PINCONNECTEMPTY */
     /* verilator lint_off PINMISSING */
     generate
         genvar nib, pos;
         for (nib = 0; nib < ACMD_NIBBLES; nib = nib + 1) begin : gen_acmd_nibble
-            // Number of pins in this nibble (last nibble may be partial)
-            localparam integer PINS_THIS_NIB = (nib < ACMD_NIBBLES - 1) ? 6 :
-                                              (ACMD_PINS - nib * 6);
-
+            localparam [2:0] ACMD_PLL_INDEX =
+                ACMD_PLL_MAP[nib*3 +: 3];
             // BIT_CTRL buses for this nibble
             wire [39:0] rx_bctrl_out [0:6];
             wire [39:0] tx_bctrl_out [0:6];
             wire [39:0] rx_bctrl_in  [0:6];
             wire [39:0] tx_bctrl_in  [0:6];
 
-            // Tie off all inputs by default
+            // Every unused physical slot returns an idle bus to its control.
+            // Active slots are driven exactly once by the slice below.
             genvar tiepos;
             for (tiepos = 0; tiepos < 7; tiepos = tiepos + 1) begin : gen_tie_default
-                if (tiepos >= PINS_THIS_NIB || tiepos == 6) begin : tie_unused
+                localparam integer SLOT_PIN = acmd_pin_at_slot(nib, tiepos);
+                if (SLOT_PIN < 0) begin : tie_unused
                     assign rx_bctrl_in[tiepos] = 40'd0;
                     assign tx_bctrl_in[tiepos] = 40'd0;
                 end
@@ -537,7 +658,7 @@ module ddr4_phy_native #(
                 .TX_GATING          ("DISABLE"),
                 .SIM_DEVICE         (SIM_DEVICE)
             ) u_bsc_acmd (
-                .PLL_CLK            (pll_clkoutphy),
+                .PLL_CLK            (pll_clkoutphy[ACMD_PLL_INDEX]),
                 .REFCLK             (1'b0),
                 .RIU_CLK            (i_controller_clk),
                 .RST                (bsc_rst),
@@ -595,10 +716,12 @@ module ddr4_phy_native #(
                 .RIU_VALID          ()
             );
 
-            // TX_BITSLICE instances for each pin in this nibble
-            for (pos = 0; pos < 6; pos = pos + 1) begin : gen_acmd_txbs
-                localparam integer GLOBAL_PIN = nib * 6 + pos;
-                if (GLOBAL_PIN < ACMD_PINS) begin : active_pin
+            // TX_BITSLICE instances for occupied physical positions.  The
+            // primitive output reconnects to the original logical pin index,
+            // so this placement mapping never permutes DDR commands.
+            for (pos = 0; pos < 7; pos = pos + 1) begin : gen_acmd_txbs
+                localparam integer LOGICAL_PIN = acmd_pin_at_slot(nib, pos);
+                if (LOGICAL_PIN >= 0) begin : active_pin
                     TX_BITSLICE #(
                         .DATA_WIDTH     (8),
                         .DELAY_FORMAT   ("COUNT"),
@@ -616,8 +739,8 @@ module ddr4_phy_native #(
                         .CNTVALUEIN     (9'd0),
                         .LOAD           (1'b0),
                         .CNTVALUEOUT    (),
-                        .D              (acmd_data[GLOBAL_PIN*8 +: 8]),
-                        .O              (acmd_out[GLOBAL_PIN]),
+                        .D              (acmd_data[LOGICAL_PIN*8 +: 8]),
+                        .O              (acmd_out[LOGICAL_PIN]),
                         .T              (1'b0),
                         .TBYTE_IN       (1'b0),
                         .TX_BIT_CTRL_IN (tx_bctrl_out[pos]),
@@ -629,6 +752,40 @@ module ddr4_phy_native #(
             end
         end
     endgenerate
+
+`ifndef SYNTHESIS
+    // Fail early in simulation if a board profile is malformed.  Hardware
+    // implementation would otherwise report a much less useful dedicated-
+    // route placement error after a long synthesis run.
+    integer acmd_check_pin;
+    integer acmd_check_nib;
+    integer acmd_check_pos;
+    initial begin
+        if ((ACMD_NIBBLES < 1) || (ACMD_NIBBLES > 31))
+            $error("Native PHY ACMD_NIBBLE_COUNT=%0d is outside 1..31",
+                   ACMD_NIBBLES);
+        for (acmd_check_pin = 0; acmd_check_pin < ACMD_PINS;
+             acmd_check_pin = acmd_check_pin + 1) begin
+            if (((acmd_map_entry(acmd_check_pin) >> 3) >= ACMD_NIBBLES) ||
+                ((acmd_map_entry(acmd_check_pin) & 8'h07) > 8'd6))
+                $error("Native PHY ACMD pin %0d has invalid map entry 0x%02x",
+                       acmd_check_pin, acmd_map_entry(acmd_check_pin));
+        end
+        for (acmd_check_nib = 0; acmd_check_nib < ACMD_NIBBLES;
+             acmd_check_nib = acmd_check_nib + 1) begin
+            if (ACMD_PLL_MAP[acmd_check_nib*3 +: 3] >= PLL_COUNT)
+                $error("Native PHY ACMD nibble %0d selects unavailable PLL %0d",
+                       acmd_check_nib,
+                       ACMD_PLL_MAP[acmd_check_nib*3 +: 3]);
+            for (acmd_check_pos = 0; acmd_check_pos < 7;
+                 acmd_check_pos = acmd_check_pos + 1)
+                if (acmd_slot_occupancy(acmd_check_nib,
+                                        acmd_check_pos) > 1)
+                    $error("Native PHY ACMD nibble %0d position %0d is mapped more than once",
+                           acmd_check_nib, acmd_check_pos);
+        end
+    end
+`endif
     /* verilator lint_on PINMISSING */
     /* verilator lint_on PINCONNECTEMPTY */
 
@@ -698,12 +855,12 @@ module ddr4_phy_native #(
     // RX data from FIFO
     wire [DQ_BITS*8-1:0] rx_dq_data [0:BYTE_LANES-1];
     wire [DQ_BITS-1:0] fifo_empty [0:BYTE_LANES-1];
-    wire [BYTE_LANES-1:0] wl_feedback_raw;
     reg calibration_fifo_pop_q;
     wire [DQ_BITS-1:0] fifo_rd_en_drive [0:BYTE_LANES-1];
 
-    // RIU is used only by native DQS-gate training. A write is broadcast
-    // while sweeping, then the selected center is written per byte lane.
+    // RIU is used only by native DQS-gate training.  The state machine owns
+    // the logical transaction; each byte below registers a physical copy so
+    // the dedicated CLB-to-RIU routes never receive a cross-byte fanout.
     reg [5:0] native_riu_addr;
     reg [15:0] native_riu_wr_data;
     reg native_riu_wr_en;
@@ -745,7 +902,13 @@ module ddr4_phy_native #(
     function [5:0] native_auto_cl;
         input integer clock_period_ps;
         begin
-            native_auto_cl = (clock_period_ps >= 1250) ? 6'd12 :
+            // Keep the PHY's nominal read latency identical to the CL that
+            // ddr4_controller programs into MR0.  The DDR4-1333 bin is easy
+            // to miss because the original native PHY targeted DDR4-1600
+            // and faster; treating tCK=1.600 ns as CL=12 opens PHY_RDEN three
+            // memory clocks after the DRAM's CL=9 return.
+            native_auto_cl = (clock_period_ps >= 1500) ? 6'd9  :
+                             (clock_period_ps >= 1250) ? 6'd12 :
                              (clock_period_ps >= 1071) ? 6'd14 :
                              (clock_period_ps >=  937) ? 6'd16 : 6'd18;
         end
@@ -753,14 +916,38 @@ module ddr4_phy_native #(
 
     localparam integer RD_GATE_PIPE_BITS = 64;
     localparam [5:0] NATIVE_CL_NCK = native_auto_cl(DDR4_CLK_PERIOD);
-    // The DFI command vector is registered at the controller/PHY boundary
-    // two memory clocks later than MIG's internal rdCAS event.  Compensate
-    // that fixed pipeline once here and retain the same coarse point through
-    // gate training, eye training, and normal reads.
-    localparam [5:0] NATIVE_GATE_MCL = NATIVE_CL_NCK - 6'd2;
+    // CLKOUTPHY_MODE changes the phase relationship between the DIV4 DFI
+    // bundle and the dedicated high-speed serializer.  In VCO_2X mode the
+    // registered DFI command is two memory clocks later than MIG's internal
+    // rdCAS reference and needs the established two-tCK compensation.  The
+    // slower VCO mode needs one memory-clock of compensation.  Using the
+    // unadjusted CL opens the four-tCK mask one cycle late: the first two
+    // transfers land in the preceding FIFO word and the raw MPR word is
+    // rotated.  Per-byte RL_DLY then centers the valid gate window without
+    // changing the trained coarse point.
+    // Keep this coarse point identical through gate training, eye training,
+    // and normal traffic; per-byte RL_DLY supplies the fine adjustment.
+    localparam [5:0] NATIVE_GATE_MCL = NATIVE_CL_NCK -
+        (PLL_USE_VCO_MODE ? 6'd1 : 6'd2);
     // Directed XSim tests may override the post-training coarse gate point.
     // Production builds always select NATIVE_GATE_MCL.
-`ifdef SIM_NATIVE_GATE_MCL_15
+`ifdef SIM_NATIVE_GATE_MCL_7
+    localparam [5:0] NATIVE_GATE_MCL_INITIAL = 6'd7;
+`elsif SIM_NATIVE_GATE_MCL_8
+    localparam [5:0] NATIVE_GATE_MCL_INITIAL = 6'd8;
+`elsif SIM_NATIVE_GATE_MCL_9
+    localparam [5:0] NATIVE_GATE_MCL_INITIAL = 6'd9;
+`elsif SIM_NATIVE_GATE_MCL_10
+    localparam [5:0] NATIVE_GATE_MCL_INITIAL = 6'd10;
+`elsif SIM_NATIVE_GATE_MCL_11
+    localparam [5:0] NATIVE_GATE_MCL_INITIAL = 6'd11;
+`elsif SIM_NATIVE_GATE_MCL_12
+    localparam [5:0] NATIVE_GATE_MCL_INITIAL = 6'd12;
+`elsif SIM_NATIVE_GATE_MCL_13
+    localparam [5:0] NATIVE_GATE_MCL_INITIAL = 6'd13;
+`elsif SIM_NATIVE_GATE_MCL_14
+    localparam [5:0] NATIVE_GATE_MCL_INITIAL = 6'd14;
+`elsif SIM_NATIVE_GATE_MCL_15
     localparam [5:0] NATIVE_GATE_MCL_INITIAL = 6'd15;
 `elsif SIM_NATIVE_GATE_MCL_16
     localparam [5:0] NATIVE_GATE_MCL_INITIAL = 6'd16;
@@ -788,9 +975,14 @@ module ddr4_phy_native #(
     // while that delay is swept; moving both controls together makes
     // GT_STATUS ambiguous.
     wire [5:0] active_read_mcl = i_dfi_rdlvl_gate_en ?
-        NATIVE_GATE_MCL : gate_trained_mcl[0];
+        NATIVE_GATE_MCL_INITIAL : gate_trained_mcl[0];
     reg [RD_GATE_PIPE_BITS-1:0] read_gate_pipe;
     reg [RD_GATE_PIPE_BITS-1:0] read_gate_pipe_next;
+    // Gate calibration must associate exactly one command-timed mask with
+    // each RL_DLY candidate.  MPR data is periodic, so allowing masks from
+    // adjacent candidates to reach the bit slices can combine two clipped
+    // half-bursts into one apparently valid FIFO word.
+    reg gate_capture_enable;
     integer read_gate_phase, read_gate_ui;
     integer read_gate_start;
 
@@ -798,7 +990,8 @@ module ddr4_phy_native #(
         read_gate_pipe_next = read_gate_pipe >> SERDES_RATIO;
         for (read_gate_phase = 0; read_gate_phase < SERDES_RATIO;
             read_gate_phase = read_gate_phase + 1) begin
-            if (dfi_read_command[read_gate_phase]) begin
+            if (dfi_read_command[read_gate_phase] &&
+                (!i_dfi_rdlvl_gate_en || gate_capture_enable)) begin
                 // Match MIG rs2mask placement: a phase/slot-2 CAS shifts the
                 // four-tCK gate mask two tCK later than a slot-0 CAS.
                 // dfi_read_command is observed at the registered DFI/PHY
@@ -808,9 +1001,9 @@ module ddr4_phy_native #(
                 // RL-3..RL+4 mCL placement.
                 read_gate_start = active_read_mcl - 7 +
                                   ((read_gate_phase >= 2) ? 2 : 0);
-                // PHY_RDEN is the four-tCK BL8 mask consumed by the native
-                // gate state machine. Extending it changes the gate restart
-                // cadence and merges two BL8 words into one FIFO frame.
+                // A BL8 return contains exactly four tCK (eight transfers).
+                // Extending this mask by a whole tCK lets ten transfers enter
+                // the native FIFO and rotates consecutive burst boundaries.
                 for (read_gate_ui = 0; read_gate_ui < SERDES_RATIO;
                      read_gate_ui = read_gate_ui + 1)
                     read_gate_pipe_next[read_gate_start + read_gate_ui] = 1'b1;
@@ -833,11 +1026,15 @@ module ddr4_phy_native #(
     // The acceleration bypass skips the RIU DQS-gate sweep, so keep the MPR
     // receiver open during the following eye scan. Application traffic still
     // exercises the command-timed mask exactly as hardware does.
-    wire [SERDES_RATIO-1:0] phy_rden_mask = i_dfi_rdlvl_en ?
+    wire [SERDES_RATIO-1:0] phy_rden_mask =
+        (i_dfi_rdlvl_en || i_dfi_wrlvl_en) ?
         {SERDES_RATIO{1'b1}} : read_gate_pipe[SERDES_RATIO-1:0];
 `else
-    wire [SERDES_RATIO-1:0] phy_rden_mask =
-        read_gate_pipe[SERDES_RATIO-1:0];
+    // During write leveling the PHY itself supplies the bounded DQS capture
+    // burst, so its native read gate must remain open independently of READ
+    // command timing. In all other modes the trained command mask owns it.
+    wire [SERDES_RATIO-1:0] phy_rden_mask = i_dfi_wrlvl_en ?
+        {SERDES_RATIO{1'b1}} : read_gate_pipe[SERDES_RATIO-1:0];
 `endif
     wire [SERDES_RATIO-1:0] phy_rden_ready = phy_rden_mask &
         {SERDES_RATIO{rst_phy_rden & ~output_enable}};
@@ -845,23 +1042,30 @@ module ddr4_phy_native #(
     generate
         genvar lane;
         for (lane = 0; lane < BYTE_LANES; lane = lane + 1) begin : gen_byte_lane
+            localparam [2:0] BYTE_PLL_INDEX =
+                BYTE_PLL_MAP[lane*3 +: 3];
             ddr4_phy_native_byte #(
                 .DQ_BITS(DQ_BITS),
-                .REFCLK_FREQ(1000000.0 / CONTROLLER_CLK_PERIOD),
-                .SIM_DEVICE(SIM_DEVICE)
+                // The public PHY contract supplies the same 300 MHz delay
+                // reference used by the component PHY.  This attribute sets
+                // the calibrated TIME-mode tap scale; it is not the serial
+                // CLKOUTPHY frequency.  Keep it at 300 MHz exactly as the
+                // generated UltraScale DDR4 MIG does for its XiPHY slices.
+                .REFCLK_FREQ(300.0),
+                .SIM_DEVICE(SIM_DEVICE),
+                .DQ_PIN_MAP(DQ_PIN_MAP[lane*DQ_BITS*4 +: DQ_BITS*4])
             ) u_byte (
-                .i_pll_clkoutphy   (pll_clkoutphy),
+                .i_pll_clkoutphy   (pll_clkoutphy[BYTE_PLL_INDEX]),
                 .i_div_clk         (i_controller_clk),
                 .i_bsc_rst         (bsc_rst),
                 .i_bitslice_rst    (bitslice_rst),
                 // RXTX_BITSLICE can observe its own transmitted DQS through
-                // the IOB even while the read gate is closed.  Hold only the
-                // receive FIFO in reset for the complete write ownership
-                // interval so echoed write words cannot precede the next
-                // DRAM return.  TX serialization and trained delays are not
-                // reset by this path.
+                // the IOB even while the read gate is closed. Hold only the
+                // receive FIFO in reset for writes and while a fresh native
+                // write-level capture is being prepared. TX serialization
+                // and the trained delay lines are not reset by this path.
                 .i_rx_fifo_rst     (bitslice_rst | rx_fifo_flush |
-                                    output_enable),
+                                    output_enable | wl_rx_fifo_reset),
                 .o_dly_rdy         (byte_dly_rdy[lane]),
                 .o_vtc_rdy         (byte_vtc_rdy[lane]),
                 .i_bsc_en_vtc      (bsc_en_vtc),
@@ -874,11 +1078,13 @@ module ddr4_phy_native #(
                 .i_phy_rden        (phy_rden_ready),
                 .o_rx_dq_data      (rx_dq_data[lane]),
                 .o_fifo_empty      (fifo_empty[lane]),
-                .o_wl_feedback     (wl_feedback_raw[lane]),
                 .i_fifo_rd_en      (fifo_rd_en_drive[lane]),
                 .i_riu_addr        (native_riu_addr),
                 .i_riu_wr_data     (native_riu_wr_data),
-                .i_riu_wr_en       (native_riu_wr_en),
+                // native_riu_sel is a byte-lane transaction mask.  Each
+                // selected byte targets only its DQS-owning upper nibble;
+                // the lower nibble consumes the forwarded trained DQS clocks.
+                .i_riu_wr_en       (native_riu_wr_en & native_riu_sel[lane]),
                 .i_riu_nibble_sel  (native_riu_sel[lane]),
                 .o_riu_rd_data     (native_riu_rd_data[lane]),
                 .o_riu_valid       (native_riu_valid[lane]),
@@ -918,10 +1124,14 @@ module ddr4_phy_native #(
     wire [TOTAL_DQ-1:0] fifo_empty_flat;
     generate
         genvar fifo_flat_lane, fifo_flat_bit;
-        for (fifo_flat_lane = 0; fifo_flat_lane < BYTE_LANES; fifo_flat_lane = fifo_flat_lane + 1)
-            for (fifo_flat_bit = 0; fifo_flat_bit < DQ_BITS; fifo_flat_bit = fifo_flat_bit + 1)
+        for (fifo_flat_lane = 0; fifo_flat_lane < BYTE_LANES;
+             fifo_flat_lane = fifo_flat_lane + 1) begin : gen_fifo_empty_lane
+            for (fifo_flat_bit = 0; fifo_flat_bit < DQ_BITS;
+                 fifo_flat_bit = fifo_flat_bit + 1) begin : gen_fifo_empty_bit
                 assign fifo_empty_flat[fifo_flat_lane*DQ_BITS + fifo_flat_bit] =
                     fifo_empty[fifo_flat_lane][fifo_flat_bit];
+            end
+        end
     endgenerate
     wire calibration_request = i_dfi_rdlvl_gate_en || i_dfi_rdlvl_en ||
                                i_dfi_wrlvl_en;
@@ -1046,9 +1256,11 @@ module ddr4_phy_native #(
     // Write Tri-State Control
     //
     // wrdata_en_any = OR of all 4 DFI phase enables.
-    // A 2-stage shift register keeps the bus driven for 2 extra controller
-    // clocks (8 DDR clocks) after wrdata_en drops, covering DDR4 postamble.
-    // output_enable = wrdata_en_any | shift[0] | shift[1]
+    // The delayed enable aligns ownership with tx_wrdata_pipe0 and retains it
+    // through the serialized postamble word.  Do not retain ownership for the
+    // following all-zero word: on a legal write-to-read turnaround that extra
+    // controller cycle overlaps the first READ's four-tCK PHY_RDEN mask and
+    // suppresses its leading phase, clipping the returned BL8 FIFO word.
     //
     // TBYTE_IN carries one active-high byte-enable bit per DFI phase.
     // BITSLICE_CONTROL serialises these controls alongside the matching 8:1
@@ -1067,7 +1279,7 @@ module ddr4_phy_native #(
     end
 
     assign output_enable = wrdata_en_any | wrdata_en_shift[0] |
-                           wrdata_en_shift[1] | wrdata_en_shift[2];
+                           wrdata_en_shift[1];
     wire wl_active;
 
     // For the UltraScale RXTX_BITSLICE TBYTE_IN path, high enables the
@@ -1081,14 +1293,18 @@ module ddr4_phy_native #(
     //
     // TX_BITSLICE D[7:0] for DQS (8:1 DDR):
     //   Normal write: 01_01_01_01 → continuous toggle
-    //   Write Leveling strobe: 00_00_00_01 → single rising edge
+    //   Write Leveling capture: 01_01_01_01 → four rising edges
     //   Idle: 00_00_00_00
     // -----------------------------------------------------------------
     reg wl_dqs_strobe;
     always @* begin
         if (wl_active) begin
             if (wl_dqs_strobe)
-                dqs_pattern = 8'b00_00_00_01;
+                // Native RX requires one complete 8-UI word before its legal
+                // fabric observation point (FIFO Q) can be read. Every rising
+                // edge has the same trained phase relative to CK, so this is
+                // one bounded write-leveling capture burst, not normal data.
+                dqs_pattern = 8'b01_01_01_01;
             else
                 dqs_pattern = 8'b00_00_00_00;
         end else if (wrdata_en_any || wrdata_en_shift[0]) begin
@@ -1183,11 +1399,13 @@ module ddr4_phy_native #(
                      GATE_RESTORE_WAIT_CLEAR = 5'd16,
                      GATE_RESTORE_RELEASE = 5'd17,
                      GATE_RESTORE_WAIT_RELEASE = 5'd18,
-                     GATE_FLUSH_WAIT = 5'd19;
+                     GATE_FLUSH_WAIT = 5'd19,
+                     GATE_CANDIDATE_FLUSH = 5'd20;
     reg [4:0] gate_phase;
     reg [3:0] gate_observe_count;
     reg [BYTE_LANES-1:0] gate_fresh_seen;
     reg [BYTE_LANES-1:0] gate_match_seen;
+    reg [BYTE_LANES-1:0] gate_status_seen;
     reg [BYTE_LANES-1:0] gate_in_range;
     reg [BYTE_LANES-1:0] gate_best_valid;
     reg [8:0] gate_cur_start [0:BYTE_LANES-1];
@@ -1196,6 +1414,16 @@ module ddr4_phy_native #(
     reg [8:0] gate_best_width [0:BYTE_LANES-1];
     reg [8:0] gate_center [0:BYTE_LANES-1];
     reg [8:0] gate_restore_tap;
+    // The first completed GT_STATUS window is the one associated with the
+    // scheduled READ mask.  Once every lane has closed that first window,
+    // later periodic copies cannot improve the result and only add a whole-
+    // cycle ambiguity (and hundreds of unnecessary RIU transactions).
+    wire [BYTE_LANES-1:0] gate_candidate_valid =
+        gate_fresh_seen & gate_status_seen;
+    wire [BYTE_LANES-1:0] gate_window_closes =
+        gate_in_range & ~gate_candidate_valid;
+    wire gate_all_first_windows_complete =
+        &(gate_best_valid | gate_window_closes);
 
     wire [BYTE_LANES-1:0] train_lane_mask =
         ({{(BYTE_LANES-1){1'b0}}, 1'b1} << train_lane);
@@ -1231,40 +1459,56 @@ module ddr4_phy_native #(
     reg [8:0] dqs_initial_tap [0:BYTE_LANES-1];
     reg [7:0] vtc_settle_counter;
 
+    // -----------------------------------------------------------------
+    // Native write-level feedback capture
+    // -----------------------------------------------------------------
+    // An UltraScale IOB receiver that feeds RXTX_BITSLICE.DATAIN cannot also
+    // drive fabric (REQP-1922).  Consequently write leveling must consume Q,
+    // the bit slice's documented FPGA-side output.  Q is an 8-UI FIFO word,
+    // so each DFI strobe produces a bounded four-cycle DQS burst.  The first
+    // burst at every tap is deliberately a primer: it allows the DRAM's tWLO
+    // response to settle.  A later controller strobe captures a full word at
+    // the same tap.  This also makes the result independent of package/board
+    // delay and of the asynchronous FIFO's EMPTY synchronization latency.
+    reg       wl_prime_pending;
+    reg       wl_feedback_valid;
+    reg [7:0] wl_feedback_word;
+    reg [1:0] wl_mixed_retries;
+    wire      wl_rx_fifo_reset = (phy_state == PHY_WL_SAMPLE);
+
     // Training failure latch registers
     reg [BYTE_LANES-1:0] gate_train_fail;
     reg [BYTE_LANES-1:0] eye_train_fail;
     reg [BYTE_LANES-1:0] wl_train_fail;
 
-    // Unlike the component ISERDES, the native RXTX_BITSLICE FIFO advances
-    // only on the write-leveling DQS edge.  Its one captured word contains
-    // both pre-edge and post-edge samples, and the previously trained RX
-    // IDELAY changes which part of that transition appears at any Q bit.
-    // DDR4 instead holds the write-leveling feedback level on DQ after the
-    // strobe.  Synchronize that static IOB level into DIV_CLK and sample it
-    // after PHY_WL_ADJUST's existing 15-cycle settling interval.
-    reg [BYTE_LANES-1:0] wl_feedback_meta;
-    reg [BYTE_LANES-1:0] wl_feedback_sync;
-    always @(posedge i_controller_clk) begin
-        if (sync_rst) begin
-            wl_feedback_meta <= {BYTE_LANES{1'b0}};
-            wl_feedback_sync <= {BYTE_LANES{1'b0}};
-        end else begin
-            wl_feedback_meta <= wl_feedback_raw;
-            wl_feedback_sync <= wl_feedback_meta;
-        end
-    end
-    wire wl_feedback_sample = wl_feedback_sync[train_lane];
     reg  wl_feedback_zero;
     reg  wl_feedback_one;
     always @* begin
         wl_feedback_zero = 1'b0;
         wl_feedback_one  = 1'b0;
-        case (wl_feedback_sample)
-            1'b0: wl_feedback_zero = 1'b1;
-            1'b1: wl_feedback_one  = 1'b1;
-            default: begin end // retain the tap and retry an unknown sample
-        endcase
+        if (wl_feedback_valid) begin
+            case (wl_feedback_word)
+                8'h00: wl_feedback_zero = 1'b1;
+                8'hff: wl_feedback_one  = 1'b1;
+                default: begin end
+            endcase
+        end
+    end
+
+    // Q changes after the FIFO_RD_CLK rising edge.  Sample it on the falling
+    // edge, exactly as the application read path does, so write leveling never
+    // evaluates the old FIFO head.  PHY_WL_SAMPLE holds RX_RST asserted and
+    // clears validity before every capture attempt.
+    always @(negedge i_controller_clk) begin
+        if (sync_rst) begin
+            wl_feedback_valid <= 1'b0;
+            wl_feedback_word  <= 8'h00;
+        end else if (phy_state == PHY_WL_SAMPLE) begin
+            wl_feedback_valid <= 1'b0;
+        end else if ((phy_state == PHY_WL_ADJUST) && fifo_word_valid_q) begin
+            wl_feedback_word  <= iserdes_dq_q[train_lane * DQ_BITS];
+            wl_feedback_valid <= 1'b1;
+        end
     end
 
     // DQS initial delay is the BISC-calibrated quarter-cycle baseline.  A
@@ -1469,6 +1713,8 @@ module ddr4_phy_native #(
             odelay_dqs_cntvalue <= 9'b0;
             odelay_dq_cntvalue  <= 9'b0;
             wl_dqs_strobe       <= 1'b0;
+            wl_prime_pending    <= 1'b1;
+            wl_mixed_retries    <= 2'd0;
             en_vtc_q            <= 1'b1;
             // The reset sequencer's mux holds RX/TX EN_VTC High through
             // BISC.  Once rst_init_complete selects this register, COUNT
@@ -1484,6 +1730,7 @@ module ddr4_phy_native #(
             gate_observe_count  <= 4'd0;
             gate_fresh_seen     <= {BYTE_LANES{1'b0}};
             gate_match_seen     <= {BYTE_LANES{1'b0}};
+            gate_status_seen    <= {BYTE_LANES{1'b0}};
             gate_in_range       <= {BYTE_LANES{1'b0}};
             gate_best_valid     <= {BYTE_LANES{1'b0}};
             native_riu_addr     <= 6'd0;
@@ -1491,6 +1738,7 @@ module ddr4_phy_native #(
             native_riu_wr_en    <= 1'b0;
             native_riu_sel      <= {BYTE_LANES{1'b0}};
             rx_fifo_flush_count <= 5'd0;
+            gate_capture_enable <= 1'b0;
         end else begin
             // This block is the sole owner of the flush timer.  The post-WL
             // flush and the post-gate-sweep flush intentionally share it.
@@ -1545,6 +1793,8 @@ module ddr4_phy_native #(
                             gate_observe_count <= 4'd0;
                             gate_fresh_seen <= {BYTE_LANES{1'b0}};
                             gate_match_seen <= {BYTE_LANES{1'b0}};
+                            gate_status_seen <= {BYTE_LANES{1'b0}};
+                            gate_capture_enable <= 1'b0;
                             gate_in_range <= {BYTE_LANES{1'b0}};
                             gate_best_valid <= {BYTE_LANES{1'b0}};
                             for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES;
@@ -1588,6 +1838,8 @@ module ddr4_phy_native #(
                                 wl_dq_tap[dfi_pack_idx] <= 9'd0;
                                 wl_seen_zero[dfi_pack_idx] <= 1'b0;
                             end
+                            wl_prime_pending <= 1'b1;
+                            wl_mixed_retries <= 2'd0;
                             phy_timer <= 4'd4;
                             phy_state <= PHY_WL_SAMPLE;
                         end
@@ -1613,8 +1865,16 @@ module ddr4_phy_native #(
                                 if (phy_timer != 0)
                                     phy_timer <= phy_timer - 1'b1;
                                 else if ((&native_riu_valid) &&
-                                         (native_riu_rd_data[0][8:0] == gate_sweep_tap))
-                                    gate_phase <= GATE_CLEAR;
+                                         (native_riu_rd_data[0][8:0] == gate_sweep_tap)) begin
+                                    // RX_RST clears only the deserializer/FIFO
+                                    // pointers; RX_RST_DLY remains deasserted,
+                                    // so the candidate delay just programmed
+                                    // above is preserved.  This prevents a
+                                    // clipped burst from candidate N being
+                                    // completed by candidate N+1.
+                                    rx_fifo_flush_count <= 5'd8;
+                                    gate_phase <= GATE_CANDIDATE_FLUSH;
+                                end
                                 else begin
 `ifdef SIM_NATIVE_RIU_DEBUG
                                     $display("[%0t] NATIVE_RIU_WAIT: tap=%0d valid=%b rd0=%h",
@@ -1623,6 +1883,11 @@ module ddr4_phy_native #(
 `endif
                                     phy_timer <= 4'd15;
                                 end
+                            end
+
+                            GATE_CANDIDATE_FLUSH: begin
+                                if (rx_fifo_flush_count == 0)
+                                    gate_phase <= GATE_CLEAR;
                             end
 
                             GATE_CLEAR: begin
@@ -1661,6 +1926,7 @@ module ddr4_phy_native #(
                                 native_riu_sel <= {BYTE_LANES{1'b1}};
                                 gate_fresh_seen <= {BYTE_LANES{1'b0}};
                                 gate_match_seen <= {BYTE_LANES{1'b0}};
+                                gate_status_seen <= {BYTE_LANES{1'b0}};
                                 phy_timer <= 4'd15;
                                 gate_phase <= GATE_WAIT_RELEASE;
                             end
@@ -1671,6 +1937,12 @@ module ddr4_phy_native #(
                                 if (phy_timer != 0) begin
                                     phy_timer <= phy_timer - 1'b1;
                                 end else if (&native_riu_valid) begin
+                                    // Arm only the next training READ.  The
+                                    // controller spaces calibration commands
+                                    // far enough apart that dfi_read_expected
+                                    // is observed before another READ can be
+                                    // inserted into the native gate pipeline.
+                                    gate_capture_enable <= 1'b1;
                                     gate_phase <= GATE_WAIT_READ;
                                 end else begin
                                     phy_timer <= 4'd15;
@@ -1679,6 +1951,7 @@ module ddr4_phy_native #(
 
                             GATE_WAIT_READ: begin
                                 if (dfi_read_expected) begin
+                                    gate_capture_enable <= 1'b0;
                                     gate_observe_count <= 4'd0;
                                     gate_fresh_seen <= {BYTE_LANES{1'b0}};
                                     gate_match_seen <= {BYTE_LANES{1'b0}};
@@ -1717,13 +1990,19 @@ module ddr4_phy_native #(
                                 if (phy_timer != 0) begin
                                     phy_timer <= phy_timer - 1'b1;
                                 end else if (&native_riu_valid) begin
-                                    // GT_STATUS identifies a DQS/gate phase
-                                    // relationship, but it is not a receive-
-                                    // data-valid indication.  Preserve the
-                                    // fresh MPR match accumulated in
-                                    // GATE_OBSERVE; replacing it with bit 9
-                                    // selects broad half-cycle regions that
-                                    // can still clip the BL8 FIFO word.
+                                    // GT_STATUS is the native DQS/gate phase
+                                    // training result.  Qualify it separately
+                                    // from the all-DQ FIFO event: DQ IDELAY is
+                                    // deliberately still untrained here, so an
+                                    // exact MPR comparison would make gate
+                                    // success depend on an arbitrary DQ eye
+                                    // edge.  The following read-eye stage owns
+                                    // the exact MPR-data qualification.
+                                    for (dfi_pack_idx = 0;
+                                         dfi_pack_idx < BYTE_LANES;
+                                         dfi_pack_idx = dfi_pack_idx + 1)
+                                        gate_status_seen[dfi_pack_idx] <=
+                                            native_riu_rd_data[dfi_pack_idx][9];
                                     `ifndef YOSYS
                                     `ifdef SIM_QUIET_TRAINING_LOG
                                         // Keep a full 512-tap calibration visible
@@ -1750,8 +2029,7 @@ module ddr4_phy_native #(
 
                             GATE_NEXT_TAP: begin
                                 for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1) begin
-                                    if (gate_fresh_seen[dfi_pack_idx] &&
-                                        gate_match_seen[dfi_pack_idx]) begin
+                                    if (gate_candidate_valid[dfi_pack_idx]) begin
                                         if (!gate_in_range[dfi_pack_idx]) begin
                                             gate_cur_start[dfi_pack_idx] <= gate_sweep_tap;
                                             gate_cur_width[dfi_pack_idx] <= GATE_TAP_STEP;
@@ -1777,7 +2055,8 @@ module ddr4_phy_native #(
                                     end
                                 end
 
-                                if (gate_sweep_tap >= GATE_SWEEP_LAST) begin
+                                if (gate_all_first_windows_complete ||
+                                    (gate_sweep_tap >= GATE_SWEEP_LAST)) begin
                                     gate_phase <= GATE_FINALIZE;
                                 end else begin
                                     gate_sweep_tap <= gate_sweep_tap + GATE_TAP_STEP;
@@ -1811,7 +2090,8 @@ module ddr4_phy_native #(
                             GATE_WRITE_LANE: begin
                                 if (gate_best_valid[train_lane]) begin
                                     gate_center[train_lane] <= gate_target_tap;
-                                    gate_trained_mcl[train_lane] <= NATIVE_GATE_MCL;
+                                    gate_trained_mcl[train_lane] <=
+                                        NATIVE_GATE_MCL_INITIAL;
                                 end else begin
                                     gate_train_fail[train_lane] <= 1'b1;
                                     gate_center[train_lane] <= 9'd0;
@@ -1820,7 +2100,8 @@ module ddr4_phy_native #(
                                     // gate scan is reported to the controller;
                                     // moving the command mask earlier would
                                     // silently truncate the burst tail.
-                                    gate_trained_mcl[train_lane] <= NATIVE_GATE_MCL;
+                                    gate_trained_mcl[train_lane] <=
+                                        NATIVE_GATE_MCL_INITIAL;
                                 end
                                 // Program the selected fine delay back into the
                                 // byte currently being finalized. Use the same
@@ -2202,11 +2483,65 @@ module ddr4_phy_native #(
                     PHY_WL_ADJUST: begin
                         if (phy_timer != 0) begin
                             phy_timer <= phy_timer - 1'b1;
-                        end else if (!(wl_feedback_zero || wl_feedback_one)) begin
-                            // The result changed within this capture.  Keep
-                            // the same tap and obtain a settled WL response.
+                        end else if (!wl_feedback_valid) begin
+                            // No complete native word arrived. Reset the FIFO
+                            // and re-prime this tap rather than evaluating a
+                            // stale or partially assembled response.
+                            wl_prime_pending <= 1'b1;
+                            wl_mixed_retries <= 2'd0;
                             phy_timer <= 4'd4;
                             phy_state <= PHY_WL_SAMPLE;
+                        end else if (wl_prime_pending) begin
+                            // Discard the first capture at a new tap. DDR4 DQ
+                            // can change as late as tWLO after the first DQS
+                            // edge, so only a subsequent strobe can guarantee
+                            // that all eight native samples started from the
+                            // response associated with this tap.
+                            wl_prime_pending <= 1'b0;
+                            wl_mixed_retries <= 2'd0;
+                            phy_timer <= 4'd4;
+                            phy_state <= PHY_WL_SAMPLE;
+                        end else if (!(wl_feedback_zero || wl_feedback_one)) begin
+                            // A mixed word is expected only at the CK/DQS
+                            // boundary (or after a metastable sample). Retry a
+                            // bounded number of times; if it remains mixed,
+                            // move past the boundary instead of hanging the
+                            // entire calibration at one physical tap.
+                            if (wl_mixed_retries != 2'd2) begin
+                                wl_mixed_retries <= wl_mixed_retries + 1'b1;
+                                phy_timer <= 4'd4;
+                                phy_state <= PHY_WL_SAMPLE;
+                            end else if (wl_tap[train_lane] >= WL_SWEEP_LAST) begin
+                                // The range ended on an indeterminate edge.
+                                // Restore the calibrated pre-WL phase and
+                                // report failure only if a low interval had
+                                // already been established.
+                                if (wl_seen_zero[train_lane])
+                                    wl_train_fail[train_lane] <= 1'b1;
+                                wl_tap[train_lane] <= dqs_initial_tap[train_lane];
+                                wl_dq_tap[train_lane] <= 9'd0;
+                                odelay_dqs_cntvalue <= delay_step_toward(
+                                    odelay_dqs_cntvalue, dqs_initial_tap[train_lane]);
+                                odelay_dq_cntvalue <= delay_step_toward(
+                                    odelay_dq_cntvalue, 9'd0);
+                                wl_prime_pending <= 1'b1;
+                                wl_mixed_retries <= 2'd0;
+                                phy_timer <= 4'd4;
+                                phy_state <= PHY_WL_APPLY;
+                            end else begin
+                                wl_tap[train_lane] <= wl_tap[train_lane] +
+                                    WL_TAP_STEP;
+                                wl_dq_tap[train_lane] <= wl_dq_tap[train_lane] +
+                                    WL_TAP_STEP;
+                                odelay_dqs_cntvalue <= wl_tap[train_lane] +
+                                    WL_TAP_STEP;
+                                odelay_dq_cntvalue <= wl_dq_tap[train_lane] +
+                                    WL_TAP_STEP;
+                                wl_prime_pending <= 1'b1;
+                                wl_mixed_retries <= 2'd0;
+                                phy_timer <= 4'd4;
+                                phy_state <= PHY_WL_SAMPLE;
+                            end
                         end else begin
                             `ifndef YOSYS
                             `ifdef SIM_QUIET_TRAINING_LOG
@@ -2232,9 +2567,11 @@ module ddr4_phy_native #(
                                 odelay_dq_cntvalue <= delay_step_toward(
                                     odelay_dq_cntvalue,
                                     wl_final_dqs_tap - dqs_initial_tap[train_lane]);
+                                wl_prime_pending <= 1'b1;
+                                wl_mixed_retries <= 2'd0;
                                 phy_timer <= 4'd4;
                                 phy_state <= PHY_WL_APPLY;
-                            end else if (wl_tap[train_lane][8:2] == 7'b1111111) begin
+                            end else if (wl_tap[train_lane] >= WL_SWEEP_LAST) begin
                                 // If the entire range stayed high, no edge was
                                 // reachable.  Retain the pre-WL BISC baseline.
                                 // If a low was seen without a later high, report
@@ -2250,6 +2587,8 @@ module ddr4_phy_native #(
                                     odelay_dqs_cntvalue, dqs_initial_tap[train_lane]);
                                 odelay_dq_cntvalue <= delay_step_toward(
                                     odelay_dq_cntvalue, 9'd0);
+                                wl_prime_pending <= 1'b1;
+                                wl_mixed_retries <= 2'd0;
                                 phy_timer <= 4'd4;
                                 phy_state <= PHY_WL_APPLY;
                             end else begin
@@ -2257,6 +2596,8 @@ module ddr4_phy_native #(
                                 wl_dq_tap[train_lane] <= wl_dq_tap[train_lane] + {5'b0, WL_TAP_STEP};
                                 odelay_dqs_cntvalue <= wl_tap[train_lane] + {5'b0, WL_TAP_STEP};
                                 odelay_dq_cntvalue <= wl_dq_tap[train_lane] + {5'b0, WL_TAP_STEP};
+                                wl_prime_pending <= 1'b1;
+                                wl_mixed_retries <= 2'd0;
                                 phy_timer <= 4'd4;
                                 phy_state <= PHY_WL_SAMPLE;
                             end
@@ -2301,6 +2642,8 @@ module ddr4_phy_native #(
                             wl_seen_zero[train_lane + 1'b1] <= 1'b0;
                             odelay_dqs_cntvalue <= dqs_initial_tap[train_lane + 1'b1];
                             odelay_dq_cntvalue  <= 9'd0;
+                            wl_prime_pending <= 1'b1;
+                            wl_mixed_retries <= 2'd0;
                             phy_timer <= 4'd4;
                             phy_state <= PHY_WL_SAMPLE;
                         end else begin

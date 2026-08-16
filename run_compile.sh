@@ -16,13 +16,14 @@
 #   ./run_compile.sh --formal            Formal single config (4 tasks)
 #   ./run_compile.sh --formal-regr       Formal regression (28 tasks)
 #   ./run_compile.sh --sim [TEST]        Single sim test (default: baseline)
-#   ./run_compile.sh --sim-regr          Full sim regression (22 tests)
+#   ./run_compile.sh --sim-regr          Full sim regression (26 tests)
 #   ./run_compile.sh --no-sim            Lint + compile + formal (skip sim)
 #
 # Sim tests: baseline flyby_50 flyby_100 flyby_200 flyby_300 flyby_400
 #   map0 map0_flyby_200 bist_full x16 x16_map0 x16_bist_full x16_flyby_4lane
-#   x4 x4_map0 ddr4_1600 ddr4_1600_flyby ddr4_2133 ddr4_2133_flyby
-#   density_4g train_fail
+#   x4 x4_map0 ddr4_1250 ddr4_1600 ddr4_1600_flyby
+#   ddr4_2133 ddr4_2133_flyby density_4g row_bits_14 row_bits_17
+#   train_fail csr_reset dm_stress
 #
 # Engineer: Angelo C. Jacobo
 set -o pipefail
@@ -102,7 +103,7 @@ SIM_TESTS=(
     map0 map0_flyby_200 bist_full
     x16 x16_map0 x16_bist_full x16_flyby_4lane
     x4 x4_map0
-    ddr4_1600 ddr4_1600_flyby ddr4_2133 ddr4_2133_flyby
+    ddr4_1250 ddr4_1600 ddr4_1600_flyby ddr4_2133 ddr4_2133_flyby
     density_4g row_bits_14 row_bits_17 train_fail csr_reset dm_stress
 )
 
