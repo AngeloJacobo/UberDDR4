@@ -1,8 +1,4 @@
-# Keep scripts and FPGA sources portable across Windows and Linux checkouts.
-.gitattributes text eol=lf
-*.sh  text eol=lf
-*.tcl text eol=lf
-*.v   text eol=lf
-*.sv  text eol=lf
-*.vh  text eol=lf
-*.xdc text eol=lf
+# Normalize every detected text file to LF in both the repository and working
+# tree.  This keeps a Windows checkout safe to copy to Linux while Git leaves
+# binary files untouched.
+* text=auto eol=lf
