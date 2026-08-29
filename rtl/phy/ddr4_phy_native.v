@@ -275,13 +275,18 @@ module ddr4_phy_native #(
     // below uses it to retain calibration's continuous-drain behavior.
     (* mark_debug = "true" *) reg [3:0] phy_state;
 
-    // The controller normally reads page-0 MPR2 (0000_1111, sent MSB first),
-    // which uniquely identifies all eight UI positions.  The diagnostic
-    // MPR0 pattern alternates on every UI and therefore exposes a clipped
-    // first falling edge that MPR2 can hide when the preceding preamble
-    // happens to equal its second zero.
-    localparam [7:0] MPR_PATTERN = 8'b11110000;
-    localparam [7:0] MPR0_PATTERN = 8'b10101010;
+    // The controller requests page-0 MPR2 (0000_1111, sent MSB first). Keep
+    // that non-periodic word for DQS-gate training because it uniquely marks
+    // the BL8 boundary. During the subsequent DQ-eye sweep, alternate MPR0
+    // and MPR2 on successive READs. JEDEC MPR0 is observed at the XiPHY FIFO
+    // as 1010_1010, exercising every data transition, while MPR2 identifies
+    // which command produced the returned word. Requiring the pattern that
+    // was actually requested prevents an adjacent PHY_RDEN cycle from looking
+    // like a valid eye merely because consecutive MPR reads repeat data.
+    localparam [7:0] MPR_GATE_PATTERN = 8'b11110000;
+    localparam [7:0] MPR_EYE_PATTERN  = 8'b10101010;
+    localparam [7:0] MPR2_PATTERN     = MPR_GATE_PATTERN;
+    localparam [7:0] MPR0_PATTERN     = MPR_EYE_PATTERN;
 
     // During the coarse DQS-gate search, any cyclic rotation of MPR page 0 is
     // sufficient evidence that the lane captured stable DRAM data.  This
@@ -295,7 +300,7 @@ module ddr4_phy_native #(
             repeated_sample = {sample, sample};
             mpr_rotation_match = 1'b0;
             for (rotation = 0; rotation < 8; rotation = rotation + 1)
-                if (repeated_sample[rotation +: 8] === MPR_PATTERN)
+                if (repeated_sample[rotation +: 8] === MPR_GATE_PATTERN)
                     mpr_rotation_match = 1'b1;
         end
     endfunction
@@ -306,9 +311,10 @@ module ddr4_phy_native #(
         integer rotation_index;
         begin
             mpr_rotation_offset = 4'd8;
-            // Iterate high-to-low so the lowest valid rotation wins. MPR2 has
-            // one unique match, but deterministic priority keeps this helper
-            // well-defined for any future diagnostic pattern.
+            // Iterate high-to-low so the lowest valid rotation wins.
+            // Deterministic priority keeps this diagnostic helper
+            // well-defined even when a periodic pattern matches more than
+            // one rotation.
             for (rotation_index = 7; rotation_index >= 0;
                  rotation_index = rotation_index - 1)
                 if (rotation_matches[rotation_index])
@@ -358,12 +364,17 @@ module ddr4_phy_native #(
     localparam [4:0] GATE_TAP_STEP = 5'd4;
     localparam [8:0] GATE_SWEEP_LAST = 9'd508;
 `endif
-    // A single marginal sample can assert GT_STATUS and complete one FIFO word
-    // exactly at a coarse-cycle boundary, but it has no usable hardware
-    // margin.  Reject such edge blips and require a contiguous fine window.
-    // Eight taps is intentionally small versus a normal gate eye (typically
-    // tens to hundreds of taps), yet remains valid for the four-tap debug scan.
-    localparam [8:0] GATE_MIN_WINDOW_TAPS = 9'd8;
+    // A gate window clipped by an RL_DLY coarse boundary can still assert
+    // GT_STATUS and complete FIFO words, but centering that short fragment
+    // leaves too little margin for reset-to-reset phase and PVT movement.  In
+    // hardware this appeared as a 24--28 tap fragment at the bottom of the
+    // fine range while the same calibration produced 200+ tap windows on the
+    // other bytes.  Do not resolve a byte from such a fragment: continue the
+    // existing bounded coarse/mCL search until at least sixteen consecutive
+    // production fine-sweep samples (64 taps) are valid, then center between
+    // the measured edges.  This is a generic margin requirement, not a board
+    // offset; it applies identically to every UltraScale/UltraScale+ byte.
+    localparam [8:0] GATE_MIN_WINDOW_TAPS = 9'd64;
 `ifdef SIM_NATIVE_TX_DEBUG_FAST_EYE
     localparam [8:0] EYE_SWEEP_LAST = 9'd64;
 `else
@@ -658,10 +669,9 @@ module ddr4_phy_native #(
     // Bank address BA[BA_BITS-1:0]
     (* mark_debug = "true" *) wire [SERDES_RATIO-1:0] dfi_read_command;
     (* mark_debug = "true" *) wire dfi_read_expected;
-`ifdef SIM_NATIVE_DIAG_MPR_ALTERNATE
     // Consecutive eye-training READs use different MPR locations.  A raw
-    // FIFO word spliced across two physical BL8 returns then cannot masquerade
-    // as a valid repeated training pattern.
+    // FIFO word from the preceding command cannot validate the current delay
+    // candidate even though both are individually legal MPR data.
     reg mpr_alt_page_q;
     reg [7:0] mpr_command_pattern_q;
     reg [7:0] mpr_expected_pattern_q;
@@ -682,7 +692,7 @@ module ddr4_phy_native #(
                 // while recording the stable page launched now.
                 mpr_expected_pattern_q <= mpr_command_pattern_q;
                 mpr_command_pattern_q <=
-                    mpr_alt_page_q ? MPR_PATTERN : MPR0_PATTERN;
+                    mpr_alt_page_q ? MPR2_PATTERN : MPR0_PATTERN;
             end
             // Keep BA stable throughout command serialization.  The return
             // marker is many controller clocks before the next calibration
@@ -691,16 +701,6 @@ module ddr4_phy_native #(
                 mpr_alt_page_q <= ~mpr_alt_page_q;
         end
     end
-`elsif SIM_NATIVE_DIAG_MPR0_BOUNDARY
-    // During MPR mode BA selects the page-0 MPR location.  Override the
-    // controller's MPR2 request with MPR0 only for this boundary diagnostic;
-    // normal traffic remains untouched.
-    wire [4*BA_BITS-1:0] native_dfi_bank =
-        (i_dfi_rdlvl_gate_en || i_dfi_rdlvl_en) ?
-        {(4*BA_BITS){1'b0}} : i_dfi_bank;
-`else
-    wire [4*BA_BITS-1:0] native_dfi_bank = i_dfi_bank;
-`endif
     generate
         genvar babit;
         for (babit = 0; babit < BA_BITS; babit = babit + 1) begin : gen_acmd_ba
@@ -2771,9 +2771,9 @@ module ddr4_phy_native #(
     //
     // The DQS gate already establishes the physical BL8 boundary (the AXKU3
     // capture showed a complete 55 DQS word).  Eye training below therefore
-    // accepts only the canonical, unrotated F0 MPR word on every DQ in the
-    // byte.  Application data can then consume Q directly, exactly one FIFO
-    // word per READ, including an isolated READ.
+    // accepts only the canonical, unrotated command-associated MPR0/MPR2 word
+    // on every DQ in the byte. Application data can then consume Q directly,
+    // exactly one FIFO word per READ, including an isolated READ.
     // -----------------------------------------------------------------
     reg [3:0]  bitslip_count_q [0:BYTE_LANES-1];
 
@@ -3302,9 +3302,10 @@ module ddr4_phy_native #(
     // Eye Training: canonical BL8 boundary and analog-eye comparison
     // -----------------------------------------------------------------
     // Gate training establishes a complete DQS-framed BL8 word before the DQ
-    // eye sweep.  Only an exact F0 word on all eight DQ pins is a legal eye
-    // sample.  Accepting a cyclic MPR rotation would center an adjacent UI and
-    // silently splice neighboring application bursts at the native FIFO Q.
+    // eye sweep. Only the exact word requested by the associated MPR READ on
+    // all eight DQ pins is a legal eye sample. Accepting a cyclic rotation or
+    // the preceding command's MPR page would silently splice neighboring BL8
+    // bursts at the native FIFO Q.
     wire [DQ_BITS-1:0] lane_mpr_bit_match [0:BYTE_LANES-1];
     wire [BYTE_LANES-1:0] lane_mpr_word_match;
 `ifdef SIM_NATIVE_DIAG_ROTATED_MPR_EYE
@@ -3318,11 +3319,7 @@ module ddr4_phy_native #(
                  mpr_bit = mpr_bit + 1) begin : gen_mpr_bit
                 assign lane_mpr_bit_match[mpr_lane][mpr_bit] =
                     (iserdes_dq_q[mpr_lane * DQ_BITS + mpr_bit] ===
-`ifdef SIM_NATIVE_DIAG_MPR_ALTERNATE
                      mpr_expected_pattern_q);
-`else
-                     MPR_PATTERN);
-`endif
             end
             assign lane_mpr_word_match[mpr_lane] =
                 &lane_mpr_bit_match[mpr_lane];
@@ -3338,7 +3335,7 @@ module ddr4_phy_native #(
                     assign rotation_bit_match[mpr_rotation_bit] =
                         (({iserdes_dq_q[MPR_ROT_IDX],
                            iserdes_dq_q[MPR_ROT_IDX]} >> mpr_rotation) ===
-                         MPR_PATTERN);
+                         mpr_expected_pattern_q);
                 end
                 assign lane_mpr_rotation_match[mpr_lane][mpr_rotation] =
                     &rotation_bit_match;
@@ -4737,10 +4734,11 @@ module ddr4_phy_native #(
                             end
                         end else begin
                             eye_center_tap[train_lane] <= eye_center_candidate;
-                            // The accepted eye contains the canonical F0 word
-                            // on every DQ, so Q is already the isolated-READ
-                            // BL8 word.  Keep the public bitslip diagnostic at
-                            // zero; no fabric rotation is applied.
+                            // The accepted eye contains the exact MPR word
+                            // requested for each observation on every DQ, so Q
+                            // is already the isolated-READ BL8 word. Keep the
+                            // public bitslip diagnostic at zero; no fabric
+                            // rotation is applied.
                             if (train_lane == 0)
                                 eye_reference_offset <= 4'd0;
 `ifdef SIM_NATIVE_DIAG_ROTATED_MPR_EYE
@@ -6492,9 +6490,9 @@ module ddr4_phy_native #(
         dbg_gate_first_dqs_tap;
     (* mark_debug = "true" *) reg [15:0] dbg_gate_read_count;
     // Sticky eye evidence remains readable after MPR is disabled.  The first
-    // vector proves an exact F0 word existed somewhere in the sweep; the
-    // second proves the selected center reproduced that exact word during the
-    // independent center verification read.
+    // vector proves an exact command-associated MPR word existed somewhere in
+    // the sweep; the second proves the selected center reproduced the exact
+    // requested word during the independent center verification read.
     (* mark_debug = "true" *) reg [BYTE_LANES-1:0]
         dbg_eye_ever_mpr_exact;
     (* mark_debug = "true" *) reg [BYTE_LANES-1:0]
