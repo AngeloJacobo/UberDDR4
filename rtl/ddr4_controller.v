@@ -88,6 +88,11 @@ module ddr4_controller #(
     // CA/CKE serializer fill latency which is not part of tPHY_WRLAT.  The
     // component PHY uses 0; the native BITSLICE PHY requires 9.
     parameter[3:0] TPHY_INIT_LAT = 0,
+    // Some native PHY architectures invalidate their source-synchronous RX
+    // word boundary while write leveling changes the DQS transmit path. Set
+    // this to run write leveling first and establish the final read gate/eye
+    // afterward. The default preserves the component-PHY sequence.
+    parameter[0:0] POST_WL_READ_TRAINING = 0,
     // The next parameters act more like localparams but are here to simplify port declarations 
     parameter SERDES_RATIO = 4, // 4:1 controller
               BA_BITS = 2, // bank address (always 2 for DDR4)
@@ -235,8 +240,10 @@ module ddr4_controller #(
                ROM_RESET_N   = 27;
 
     // Named ROM address constants
-    localparam[5:0] ROM_ADDR_RD_CAL    = 22,
-                    ROM_ADDR_WL_CAL    = 27,
+    localparam[5:0] ROM_ADDR_RD_CAL    =
+                        POST_WL_READ_TRAINING ? 27 : 22,
+                    ROM_ADDR_WL_CAL    =
+                        POST_WL_READ_TRAINING ? 22 : 27,
                     ROM_ADDR_REF_START = 33,
                     ROM_ADDR_REF_END   = 35;
 
@@ -246,13 +253,11 @@ module ddr4_controller #(
                     MRS_MR6 = 3'b110;
 
     // Training command pump FSM states (DFI 3.1 training sequence).
-    // The pump walks through three phases in order:
-    //   1. Gate training  (GATE_EN -> GATE_READ -> GATE_WAIT -> GATE_EXIT)
-    //      PHY learns when read-data-valid window opens.
-    //   2. Eye training   (EYE_EN -> EYE_READ -> EYE_WAIT -> EYE_EXIT)
-    //      PHY centres the sampling clock within the data eye.
-    //   3. Write leveling (WL_EN -> WL_STROBE -> WL_WAIT -> WL_EXIT)
-    //      PHY aligns DQS to CK at the DRAM.
+    // The component PHY uses gate -> eye -> write leveling. Native XiPHY can
+    // invalidate its RX word boundary while write leveling changes the DQS
+    // path, so POST_WL_READ_TRAINING selects write leveling -> gate -> eye.
+    // In either order, the final read training defines the application RX
+    // boundary and deasserting rdlvl_en resets the DFI read word pointer.
     // Each phase retries up to CALIB_RETRY_MAX times on timeout.
     localparam[3:0] CALIB_IDLE       = 4'd0,
                     CALIB_GATE_EN    = 4'd1,
@@ -734,7 +739,12 @@ module ddr4_controller #(
 
     // -- Training pump state (driven by the calibration FSM) --
     reg [3:0] calib_state;
-    reg [$clog2(max_fn(T_RDLVL_MAX, T_WRLVL_MAX)):0] calib_timer;
+    // Counts remaining calibration clocks. Loading timeout-1 lets an exact
+    // $clog2(timeout)-bit counter represent power-of-two timeout values (for
+    // example, 524288 clocks needs 19 bits rather than 20).
+    localparam integer CALIB_TIMER_WIDTH =
+        $clog2(max_fn(T_RDLVL_MAX, T_WRLVL_MAX));
+    reg [CALIB_TIMER_WIDTH-1:0] calib_timer;
     (* mark_debug = "true" *) reg [$clog2(CALIB_GAP_MAX):0] calib_gap_timer;
     reg [1:0] calib_retry_count;
     reg calib_read_req;
@@ -1835,19 +1845,25 @@ module ddr4_controller #(
                 calib_read_req <= 1'b0;
 
                 case (calib_state)
-                    // Wait for ROM to reach the read-calibration window
-                    // (ROM addr 22). Pause the ROM immediately to prevent
-                    // it from advancing past the window, then wait for the
-                    // PHY to signal readiness (DFI 3.1 section 4.1: MC must 
-                    // not start training until dfi_init_complete is asserted).
+                    // Wait for the first calibration window. Component PHYs
+                    // begin at the MPR read trigger; native PHYs that require
+                    // final post-WL read framing begin at the WL trigger.
+                    // Do not train until dfi_init_complete is asserted.
                     CALIB_IDLE: begin
-                        if (instruction_address == ROM_ADDR_RD_CAL) begin
+                        if (instruction_address ==
+                            (POST_WL_READ_TRAINING ? ROM_ADDR_WL_CAL :
+                                                     ROM_ADDR_RD_CAL)) begin
                             // Freeze ROM so it can't advance past the
                             // calibration window while we wait for PHY.
                             pause_counter <= 1'b1;
                             if (i_dfi_init_complete) begin
-                                calib_state <= CALIB_GATE_EN;
-                                calib_gap_timer <= T_RDLVL_EN;
+                                if (POST_WL_READ_TRAINING) begin
+                                    calib_state <= CALIB_WL_EN;
+                                    calib_gap_timer <= T_WRLVL_EN;
+                                end else begin
+                                    calib_state <= CALIB_GATE_EN;
+                                    calib_gap_timer <= T_RDLVL_EN;
+                                end
                             end
                         end
                     end
@@ -1857,7 +1873,7 @@ module ddr4_controller #(
                         o_dfi_rdlvl_gate_en <= 1'b1;
                         if (calib_gap_timer == 0) begin
                             calib_state <= CALIB_GATE_READ;
-                            calib_timer <= T_RDLVL_MAX;
+                            calib_timer <= T_RDLVL_MAX - 1'b1;
                         end
                     end
 
@@ -1877,12 +1893,10 @@ module ddr4_controller #(
                     // Keep pumping READs every T_RDLVL_RR cycles until
                     // PHY responds (rdlvl_resp=all 1s) or timeout expires.
                     // On timeout: retry (back to GATE_EN) or give up.
-                    // T_RDLVL_MAX=4096 is sufficient: PHY trains ALL byte
-                    // lanes in parallel (not sequentially), so lane count
-                    // doesn't increase training time. With T_RDLVL_RR=16,
-                    // the MC issues ~256 READs per attempt — well above the
-                    // ~64-128 taps a typical PHY needs to sweep. Retries
-                    // (CALIB_RETRY_MAX=3) provide further safety margin.
+                    // T_RDLVL_MAX is PHY-dependent. The component PHY trains
+                    // all lanes in parallel over one fine-delay sweep. The
+                    // native PHY also searches BITSLICE coarse delay and read
+                    // latency, so ddr4_top supplies it with a larger watchdog.
                     CALIB_GATE_WAIT: begin
                         if (calib_timer == 0) begin // T_RDLVL_MAX expired
                             // CALIB_RETRY_MAX is not yet exceed so repeat gate training
@@ -1914,7 +1928,7 @@ module ddr4_controller #(
                         o_dfi_rdlvl_en <= 1'b1;
                         if (calib_gap_timer == 0) begin
                             calib_state <= CALIB_EYE_READ;
-                            calib_timer <= T_RDLVL_MAX;
+                            calib_timer <= T_RDLVL_MAX - 1'b1;
                         end
                     end
 
@@ -1944,13 +1958,19 @@ module ddr4_controller #(
                             calib_gap_timer <= T_RDLVL_RR;
                         end
                     end
-                    // Eye training done.
-                    // Release pause_counter so ROM resumes (disables MPR
-                    // via MR3, then walks to write-leveling window at 27).
-                    // Re-pause when ROM reaches addr 27 for WL phase.
+                    // Eye training done. In the component sequence, resume the
+                    // ROM through MPR disable and enter write leveling. In the
+                    // native sequence this is the final training phase: resume
+                    // through MPR disable, final refresh, and init completion.
                     CALIB_EYE_EXIT: begin
                         o_dfi_rdlvl_en <= 1'b0;
-                        if (instruction_address == ROM_ADDR_WL_CAL) begin
+                        if (POST_WL_READ_TRAINING) begin
+                            pause_counter <= 1'b0;
+                            if (reset_done) begin
+                                calib_state <= CALIB_DONE;
+                                o_calib_complete <= 1'b1;
+                            end
+                        end else if (instruction_address == ROM_ADDR_WL_CAL) begin
                             // ROM reached WL trigger so freeze it and
                             // begin write leveling phase.
                             pause_counter <= 1'b1;
@@ -1969,7 +1989,7 @@ module ddr4_controller #(
                         o_dfi_wrlvl_en <= 1'b1;
                         if (calib_gap_timer == 0) begin
                             calib_state <= CALIB_WL_STROBE;
-                            calib_timer <= T_WRLVL_MAX;
+                            calib_timer <= T_WRLVL_MAX - 1'b1;
                         end
                     end
 
@@ -2004,16 +2024,28 @@ module ddr4_controller #(
                         end
                     end
 
-                    // Write leveling done. Release ROM so it finishes
-                    // init (MR1 WL off, final REF, reset_done).
-                    // Once reset_done asserts → CALIB_DONE.
+                    // Write leveling done. Component PHYs release the ROM to
+                    // finish initialization. Native PHYs release through WL
+                    // disable, enable MPR, then re-pause at the read trigger
+                    // so gate and eye training establish the final RX framing.
                     CALIB_WL_EXIT: begin
                         o_dfi_wrlvl_en <= 1'b0;
                         o_dfi_wrlvl_strobe <= 1'b0;
-                        pause_counter <= 1'b0;
-                        if (reset_done) begin
-                            calib_state <= CALIB_DONE;
-                            o_calib_complete <= 1'b1;
+                        if (POST_WL_READ_TRAINING) begin
+                            if (instruction_address == ROM_ADDR_RD_CAL) begin
+                                pause_counter <= 1'b1;
+                                calib_state <= CALIB_GATE_EN;
+                                calib_gap_timer <= T_RDLVL_EN;
+                                calib_retry_count <= 2'b00;
+                            end else begin
+                                pause_counter <= 1'b0;
+                            end
+                        end else begin
+                            pause_counter <= 1'b0;
+                            if (reset_done) begin
+                                calib_state <= CALIB_DONE;
+                                o_calib_complete <= 1'b1;
+                            end
                         end
                     end
 
@@ -2193,19 +2225,35 @@ module ddr4_controller #(
             6'd18: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tDLLK_nCK));    // wait tDLLK (DLL lock)
             6'd19: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));        // PRE ALL (A10=1), wait tRP
 
-            // -- Read calibration window (JESD79-4D section 4.10.3 "MPR Reads") --
-            6'd20: read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_EN);                              // MR3: MPR enable (A2=1)
-            6'd21: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));    // wait tMOD
-            6'd22: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, 0);                        // read leveling trigger (pause_counter gates ROM) (ROM_ADDR_RD_CAL)
-            6'd23: read_rom_instruction = rom_mrs  (MRS_MR3, MR3_MPR_DIS);                             // MR3: MPR disable
-            6'd24: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));    // wait tMOD
-
-            // -- Write leveling window (JESD79-4D §4.7 "Write Leveling") --
-            6'd25: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_EN);                               // MR1: write leveling on (A7=1)
-            6'd26: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, nCK_to_cycles(tWLMRD_nCK)); // wait tWLMRD
-            6'd27: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, 0);                        // write leveling trigger (pause_counter gates ROM) (ROM_ADDR_WL_CAL)
-            6'd28: read_rom_instruction = rom_mrs  (MRS_MR1, MR1_WL_DIS);                              // MR1: write leveling off
-            6'd29: read_rom_instruction = rom_timer(CTL_TIMER,      CMD_NOP, ps_to_cycles(tMOD_ps));    // wait tMOD
+            // -- Calibration windows --
+            // Component PHY: MPR gate/eye training, then write leveling.
+            // Native PHY: write leveling, then final MPR gate/eye training.
+            // Both retain the JEDEC tWLMRD/tMOD waits surrounding the
+            // corresponding MR1/MR3 mode transitions.
+            6'd20: read_rom_instruction = POST_WL_READ_TRAINING ?
+                rom_mrs(MRS_MR1, MR1_WL_EN) :
+                rom_mrs(MRS_MR3, MR3_MPR_EN);
+            6'd21: read_rom_instruction = POST_WL_READ_TRAINING ?
+                rom_timer(CTL_TIMER, CMD_NOP, nCK_to_cycles(tWLMRD_nCK)) :
+                rom_timer(CTL_TIMER, CMD_NOP, ps_to_cycles(tMOD_ps));
+            6'd22: read_rom_instruction = rom_timer(CTL_TIMER, CMD_NOP, 0);
+            6'd23: read_rom_instruction = POST_WL_READ_TRAINING ?
+                rom_mrs(MRS_MR1, MR1_WL_DIS) :
+                rom_mrs(MRS_MR3, MR3_MPR_DIS);
+            6'd24: read_rom_instruction = rom_timer(
+                CTL_TIMER, CMD_NOP, ps_to_cycles(tMOD_ps));
+            6'd25: read_rom_instruction = POST_WL_READ_TRAINING ?
+                rom_mrs(MRS_MR3, MR3_MPR_EN) :
+                rom_mrs(MRS_MR1, MR1_WL_EN);
+            6'd26: read_rom_instruction = POST_WL_READ_TRAINING ?
+                rom_timer(CTL_TIMER, CMD_NOP, ps_to_cycles(tMOD_ps)) :
+                rom_timer(CTL_TIMER, CMD_NOP, nCK_to_cycles(tWLMRD_nCK));
+            6'd27: read_rom_instruction = rom_timer(CTL_TIMER, CMD_NOP, 0);
+            6'd28: read_rom_instruction = POST_WL_READ_TRAINING ?
+                rom_mrs(MRS_MR3, MR3_MPR_DIS) :
+                rom_mrs(MRS_MR1, MR1_WL_DIS);
+            6'd29: read_rom_instruction = rom_timer(
+                CTL_TIMER, CMD_NOP, ps_to_cycles(tMOD_ps));
 
             // -- Final refresh + done --
             6'd30: read_rom_instruction = rom_timer(CTL_TIMER_A10,  CMD_PRE, ps_to_cycles(tRP_ps));  // PRE ALL, wait tRP

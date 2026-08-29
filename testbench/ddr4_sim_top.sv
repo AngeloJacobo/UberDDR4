@@ -200,25 +200,25 @@ module ddr4_sim_top;
 // The focused native-PHY write diagnostic is intentionally short.  Dump its
 // complete lifetime, including reset and calibration, so a waveform contains
 // every event that can affect the first user write.
-`ifdef SIM_NATIVE_TX_DEBUG_REDUCED_VCD
+`ifdef SIM_VCD_START_TIME
+    localparam time TB_VCD_START_TIME = `SIM_VCD_START_TIME;
+`elsif SIM_NATIVE_TX_DEBUG_REDUCED_VCD
     // Fast native-PHY diagnostic trace: isolate the four directed reads and
     // the native FIFO-to-DFI return path.  Full-lifetime capture remains the
     // default for SIM_NATIVE_TX_DEBUG.
     localparam time TB_VCD_START_TIME = 'd6100000;
 `elsif SIM_NATIVE_TX_DEBUG
     localparam time TB_VCD_START_TIME = 'd0;
-`elsif SIM_VCD_START_TIME
-    localparam time TB_VCD_START_TIME = 'd0;
 `else
     localparam time TB_VCD_START_TIME = 'd0;
 `endif
 
-`ifdef SIM_NATIVE_TX_DEBUG_REDUCED_VCD
+`ifdef SIM_VCD_END_TIME
+    localparam time TB_VCD_END_TIME = `SIM_VCD_END_TIME;
+`elsif SIM_NATIVE_TX_DEBUG_REDUCED_VCD
     localparam time TB_VCD_END_TIME = 'd6300000;
 `elsif SIM_NATIVE_TX_DEBUG
     localparam time TB_VCD_END_TIME = 'd50000000;
-`elsif SIM_VCD_END_TIME
-    localparam time TB_VCD_END_TIME = 'd93260389;
 `else
     localparam time TB_VCD_END_TIME = 'd93260389;
 `endif

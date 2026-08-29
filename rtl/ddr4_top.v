@@ -166,6 +166,12 @@ module ddr4_top #(
     // The component PHY has neither latency.
     localparam [1:0] PHY_TPHY_WRLAT   = PHY_IMPL ? 2'd1 : 2'd0;
     localparam [3:0] PHY_TPHY_INIT_LAT = PHY_IMPL ? 4'd9 : 4'd0;
+    // The native PHY exhaustively searches read-latency/coarse/fine tuples
+    // during read leveling and coarse/fine tuples per lane during write
+    // leveling. Keep the component-PHY watchdogs unchanged, but allow both
+    // native searches to finish before the controller declares a timeout.
+    localparam integer PHY_T_RDLVL_MAX = PHY_IMPL ? 524288 : 65536;
+    localparam integer PHY_T_WRLVL_MAX = PHY_IMPL ? 524288 : 65536;
 
     // -----------------------------------------------------------------
     // DFI 3.1 Internal Bus
@@ -300,7 +306,10 @@ module ddr4_top #(
         .CL(CL),
         .CWL(CWL),
         .TPHY_WRLAT(PHY_TPHY_WRLAT),
-        .TPHY_INIT_LAT(PHY_TPHY_INIT_LAT)
+        .TPHY_INIT_LAT(PHY_TPHY_INIT_LAT),
+        .POST_WL_READ_TRAINING(PHY_IMPL),
+        .T_RDLVL_MAX(PHY_T_RDLVL_MAX),
+        .T_WRLVL_MAX(PHY_T_WRLVL_MAX)
     ) u_controller (
         .i_controller_clk(i_controller_clk),
         .i_rst_n(internal_rst_n),
