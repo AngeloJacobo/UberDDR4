@@ -18,14 +18,10 @@ trace.vcd
 sim_result.log
 testbench/regression_logs/
 
-# Micron DDR4 model symlinks (created by setup_micron_model.sh)
-testbench/micron/arch_package.sv
-testbench/micron/proj_package.sv
-testbench/micron/interface.sv
-testbench/micron/StateTable.sv
-testbench/micron/StateTableCore.sv
-testbench/micron/MemoryArray.sv
-testbench/micron/ddr4_model.sv
+# Micron DDR4 model links/copies (created by setup_micron_model.sh).
+# Keep only the repository-owned wrapper under version control.
+testbench/micron/*
+!testbench/micron/ddr4_sdram_model_wrapper.sv
 
 # Vivado project files
 *.xpr
@@ -45,11 +41,12 @@ formal/ddr4_multiconfig_*/
 __pycache__/
 *.pyc
 
-# Temporary / generated
-.tmp/
+# Temporary / generated / reference files
+*tmp/
 .uberddr4_xsim.lock
 build_logs/
 doc/
+*.pdf
 
 # OS
 .DS_Store

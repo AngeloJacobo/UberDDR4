@@ -11,9 +11,9 @@
 #   source /path/to/Vivado/2023.1/settings64.sh   # sets $XILINX_VIVADO
 #
 # Usage (from repo root):
-#   ./UberDDR4/testbench/setup_micron_model.sh
+#   ./testbench/setup_micron_model.sh
 #
-# Safe to re-run: ln -sf overwrites existing symlinks without error.
+# Safe to re-run: generated links or copies are overwritten in place.
 #
 set -euo pipefail
 
@@ -35,6 +35,7 @@ if [[ ! -d "$SRC" ]]; then
 fi
 
 MICRON_FILES=(
+    arch_defines.v
     arch_package.sv
     proj_package.sv
     interface.sv
@@ -42,15 +43,33 @@ MICRON_FILES=(
     StateTableCore.sv
     MemoryArray.sv
     ddr4_model.sv
+    timing_tasks.sv
 )
 
-echo "Creating symlinks in $MICRON_DIR ..."
+mkdir -p "$MICRON_DIR"
 
 for f in "${MICRON_FILES[@]}"; do
-    ln -sf "$SRC/$f" "$MICRON_DIR/$f"
-    echo "  $f -> $SRC/$f"
+    if [[ ! -f "$SRC/$f" ]]; then
+        echo "ERROR: Required Micron model file is missing:" >&2
+        echo "  $SRC/$f" >&2
+        exit 1
+    fi
+done
+
+echo "Installing Micron model files in $MICRON_DIR ..."
+
+for f in "${MICRON_FILES[@]}"; do
+    # Git Bash may be unable to create native Windows symlinks unless
+    # Developer Mode or elevated privileges are enabled.  Prefer links, but
+    # fall back to copies so the same setup command works on Windows and Linux.
+    if ln -sf "$SRC/$f" "$MICRON_DIR/$f" 2>/dev/null; then
+        echo "  linked: $f"
+    else
+        cp -f "$SRC/$f" "$MICRON_DIR/$f"
+        echo "  copied: $f"
+    fi
 done
 
 echo ""
-echo "Done. Symlinks created for ${#MICRON_FILES[@]} Micron DDR4 model files."
-echo "You can now run:  ./UberDDR4/testbench/run_xsim.sh"
+echo "Done. Installed ${#MICRON_FILES[@]} Micron DDR4 model files."
+echo "You can now run:  ./testbench/run_xsim.sh"
