@@ -51,6 +51,11 @@ module ddr4_prober #(
     // BIST burst write per-byte-lane masking: 0=disabled (full-word writes),
     // 1=enabled (cycles through byte lanes one at a time to stress DM path)
     parameter[0:0] BIST_DM_TEST     = 1,
+    // Hardware diagnostic: after the first BIST mismatch, drain all older
+    // requests and reread that exact address repeatedly without rewriting it.
+    // This distinguishes a stored/write-path error from an intermittent
+    // receive-path error. Keep disabled in production builds.
+    parameter[0:0] BIST_REREAD_DIAG = 0,
     // Debug CSR register file: 0=disabled (saves area), 1=enabled
     parameter      DEBUG_CSR_ENABLE = 1
 ) (
@@ -114,7 +119,18 @@ module ddr4_prober #(
     (* mark_debug = "true" *) input  wire                     i_pause_counter,     // 1 = ROM frozen by training FSM
     (* mark_debug = "true" *) input  wire                     i_reset_done,        // 1 = init ROM completed
     (* mark_debug = "true" *) input  wire                     i_pipe_stall,        // 1 = WB pipeline stalled
-    (* mark_debug = "true" *) input  wire [1:0]               i_calib_retry_count  // Training retry attempts (0-3)
+    (* mark_debug = "true" *) input  wire [1:0]               i_calib_retry_count, // Training retry attempts (0-3)
+    // Native-PHY post-failure TX-eye diagnostic handshake.  These remain
+    // inactive in component mode and in normal production builds where
+    // BIST_REREAD_DIAG is disabled.
+    input  wire                     i_phy_tx_diag_supported,
+    (* mark_debug = "true" *) output reg                      o_phy_tx_diag_req,
+    (* mark_debug = "true" *) output reg  [7:0]               o_phy_tx_diag_dq,
+    (* mark_debug = "true" *) output reg  [8:0]               o_phy_tx_diag_tap,
+    (* mark_debug = "true" *) input  wire                     i_phy_tx_diag_ack,
+    (* mark_debug = "true" *) input  wire                     i_phy_tx_diag_error,
+    (* mark_debug = "true" *) input  wire [8:0]               i_phy_tx_diag_current_tap,
+    (* mark_debug = "true" *) input  wire [8:0]               i_phy_tx_diag_previous_tap
 );
 
     // -----------------------------------------------------------------
@@ -202,6 +218,7 @@ module ddr4_prober #(
     (* mark_debug = "true" *) reg        bist_fail_sticky;
     (* mark_debug = "true" *) reg        auto_reset_en;
     (* mark_debug = "true" *) wire       bist_pass;
+    wire bist_diag_active;
 
     // Module-scope CSR write-enable decode (visible to both gen_bist and gen_csr)
     wire csr_we = i_wb_dbg_cyc && i_wb_dbg_stb && i_wb_dbg_we;
@@ -255,12 +272,189 @@ module ddr4_prober #(
         // Two-stage register catches a single-cycle CSR pulse reliably.
         wire bist_start_any = bist_auto_start || bist_csr_start_r || bist_csr_start_d;
 
-        reg [BIST_ADDR_BITS-1:0] write_addr;
-        reg [BIST_ADDR_BITS-1:0] read_addr;
-        reg [BIST_ADDR_BITS-1:0] check_addr;
+        // Keep the three BIST cursors independently visible.  In particular,
+        // write_addr lets an ILA trigger on the original memory write that is
+        // later identified by diag_fail_addr; observing only the failure-time
+        // read cannot distinguish a stored TX error from an RX return error.
+        (* mark_debug = "true" *) reg [BIST_ADDR_BITS-1:0] write_addr;
+        (* mark_debug = "true" *) reg [BIST_ADDR_BITS-1:0] read_addr;
+        (* mark_debug = "true" *) reg [BIST_ADDR_BITS-1:0] check_addr;
         reg alt_phase;
         reg last_read_scrambled;
         reg [$clog2(WB_SEL_BITS)-1:0] write_byte_counter;
+
+        localparam integer BIST_DIAG_READS = 32;
+        localparam integer BIST_DIAG_STREAM_WRITES = 64;
+        // A tap must survive both maximum simultaneous switching and the
+        // data-dependent neighbour/UI combinations of normal traffic.  Keep
+        // every stress word at a distinct address so no earlier error is
+        // hidden by a later overwrite.  Half the region alternates all-zero
+        // and all-one words; the other half uses the normal address-derived
+        // BIST pattern.  The depth exceeds the longest pre-failure interval
+        // observed during the validating full-memory BIST while remaining a
+        // bounded calibration cost independent of the installed capacity.
+        localparam integer BIST_TX_EYE_WORDS = 262144;
+        localparam integer BIST_TX_EYE_ADDR_BITS =
+            $clog2(BIST_TX_EYE_WORDS);
+        localparam integer BIST_TX_EYE_COUNT_BITS =
+            $clog2(BIST_TX_EYE_WORDS + 1);
+        localparam integer PHYSICAL_DQ_BITS = 8 * BYTE_LANES;
+        localparam [3:0] DIAG_REREAD_ORIGINAL = 4'd0,
+                         DIAG_REWRITE         = 4'd1,
+                         DIAG_REREAD_REWRITE  = 4'd2,
+                         DIAG_REREAD_CONTROL  = 4'd3,
+                         DIAG_STREAM_REWRITE  = 4'd4,
+                         DIAG_REREAD_STREAM   = 4'd5,
+                         DIAG_TX_EYE_REQUEST  = 4'd6,
+                         DIAG_TX_EYE_WRITE    = 4'd7,
+                         DIAG_TX_EYE_READ     = 4'd8,
+                         DIAG_TX_EYE_ANALYZE  = 4'd9,
+                         DIAG_TX_EYE_FINALIZE = 4'd10,
+                         DIAG_TX_EYE_APPLY_GAP = 4'd11,
+                         DIAG_TX_EYE_APPLY_REQUEST = 4'd12;
+        (* mark_debug = "true" *) reg diag_pending;
+        (* mark_debug = "true" *) reg diag_running;
+        (* mark_debug = "true" *) reg diag_done;
+        (* mark_debug = "true" *) reg [3:0] diag_phase;
+        (* mark_debug = "true" *) reg diag_rewrite_accepted;
+        (* mark_debug = "true" *) reg [BIST_ADDR_BITS-1:0]
+            diag_fail_addr;
+        reg [WB_ADDR_BITS-1:0] diag_fail_wb_addr;
+        reg [WB_DATA_BITS-1:0] diag_expected_data;
+        (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
+            diag_first_bad_xor;
+        // The AXKU3 ILA has finite probe width.  The observed DDR4-1600 fault
+        // is within the first two 32-bit UI words, so retain a compact view of
+        // that exact first-failure mask alongside the complete CSR/debug copy.
+        // This alias is diagnostic-only and has no functional fanout.
+        (* mark_debug = "true" *) wire [63:0]
+            dbg_diag_first_bad_xor_low64 = diag_first_bad_xor[63:0];
+        (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
+            diag_retry_last_xor;
+        (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
+            diag_retry_xor_or;
+        (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
+            diag_retry_xor_and;
+        (* mark_debug = "true" *) reg [5:0] diag_reads_issued;
+        (* mark_debug = "true" *) reg [5:0] diag_reads_returned;
+        (* mark_debug = "true" *) reg [5:0] diag_match_count;
+        (* mark_debug = "true" *) reg [5:0] diag_mismatch_count;
+        (* mark_debug = "true" *) reg [5:0] diag_post_reads_issued;
+        (* mark_debug = "true" *) reg [5:0] diag_post_reads_returned;
+        (* mark_debug = "true" *) reg [5:0] diag_post_match_count;
+        (* mark_debug = "true" *) reg [5:0] diag_post_mismatch_count;
+        (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
+            diag_post_last_xor;
+        (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
+            diag_post_xor_or;
+        (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
+            diag_post_xor_and;
+
+        // A rewrite of the failing address exercises both the isolated write
+        // and isolated read boundaries, so it cannot by itself distinguish a
+        // TX boundary error from an RX boundary error.  Retain one word that
+        // the normal streaming BIST verified, then reread that known-good
+        // location in isolation before performing the rewrite.  If this
+        // control word also fails, the isolated RX path is responsible; if it
+        // remains clean while the rewritten failing word is bad, the isolated
+        // TX path is responsible.
+        reg last_good_valid;
+        reg [BIST_ADDR_BITS-1:0] last_good_addr;
+        reg [WB_ADDR_BITS-1:0] last_good_wb_addr;
+        reg [WB_DATA_BITS-1:0] last_good_expected_data;
+        (* mark_debug = "true" *) reg diag_control_valid;
+        (* mark_debug = "true" *) reg [BIST_ADDR_BITS-1:0]
+            diag_control_addr;
+        reg [WB_ADDR_BITS-1:0] diag_control_wb_addr;
+        reg [WB_DATA_BITS-1:0] diag_control_expected_data;
+        (* mark_debug = "true" *) reg [5:0] diag_control_reads_issued;
+        (* mark_debug = "true" *) reg [5:0] diag_control_reads_returned;
+        (* mark_debug = "true" *) reg [5:0] diag_control_match_count;
+        (* mark_debug = "true" *) reg [5:0] diag_control_mismatch_count;
+
+        // A single isolated rewrite intentionally starts from an idle bus and
+        // therefore cannot reproduce a fault that exists only between
+        // contiguous native serializer words.  After the isolated rewrite has
+        // been classified, issue a 64-word uninterrupted write stream with
+        // the failed address in its middle.  Its immediate neighbours use the
+        // opposite all-zero/all-one value so every DQ, including the observed
+        // lane-0 DQ6, changes at the word boundary.  This diagnostic runs only
+        // after a real BIST failure and never changes a passing execution.
+        reg [WB_ADDR_BITS-1:0] diag_stream_base_wb_addr;
+        reg [6:0] diag_stream_target_index;
+        (* mark_debug = "true" *) reg [6:0]
+            diag_stream_writes_accepted;
+        (* mark_debug = "true" *) reg diag_stream_target_seen;
+        (* mark_debug = "true" *) reg [5:0] diag_stream_reads_issued;
+        (* mark_debug = "true" *) reg [5:0] diag_stream_reads_returned;
+        (* mark_debug = "true" *) reg [5:0] diag_stream_match_count;
+        (* mark_debug = "true" *) reg [5:0] diag_stream_mismatch_count;
+        (* mark_debug = "true" *) reg [7:0] diag_stream_xor_or;
+        (* mark_debug = "true" *) reg [7:0] diag_stream_xor_and;
+
+        // Per-bit TX-eye sweep.  Sixty-five samples cover absolute taps
+        // 0,8,...,504,511.  The native PHY performs every intermediate <=8
+        // tap VAR_LOAD step and returns the pre-sweep BISC-maintained value so
+        // it can be restored after measurement.
+        (* mark_debug = "true" *) reg [7:0] diag_tx_eye_bad_data_bit;
+        (* mark_debug = "true" *) reg [7:0] diag_tx_eye_dq;
+        (* mark_debug = "true" *) reg [6:0] diag_tx_eye_sample;
+        (* mark_debug = "true" *) reg [64:0] diag_tx_eye_pass_map;
+        (* mark_debug = "true" *) reg [6:0] diag_tx_eye_pass_count;
+        (* mark_debug = "true" *) reg [8:0] diag_tx_eye_baseline_tap;
+        (* mark_debug = "true" *) reg diag_tx_eye_baseline_valid;
+        (* mark_debug = "true" *) reg [8:0] diag_tx_eye_first_pass;
+        (* mark_debug = "true" *) reg [8:0] diag_tx_eye_last_pass;
+        (* mark_debug = "true" *) reg diag_tx_eye_pass_found;
+        (* mark_debug = "true" *) reg diag_tx_eye_bad_seen;
+        (* mark_debug = "true" *) reg [BIST_TX_EYE_COUNT_BITS-1:0]
+            diag_tx_eye_writes_accepted;
+        (* mark_debug = "true" *) reg [BIST_TX_EYE_COUNT_BITS-1:0]
+            diag_tx_eye_reads_issued;
+        (* mark_debug = "true" *) reg [BIST_TX_EYE_COUNT_BITS-1:0]
+            diag_tx_eye_reads_returned;
+        reg [WB_ADDR_BITS-1:0] diag_tx_eye_base_wb_addr;
+        (* mark_debug = "true" *) reg diag_tx_eye_restore_pending;
+        (* mark_debug = "true" *) reg diag_tx_eye_update_error;
+        (* mark_debug = "true" *) reg diag_tx_eye_done;
+        // Scan the 64 uniformly spaced samples twice to find a passing
+        // interval that wraps through tap 511/0.  The resulting correction
+        // is retained per physical DQ and validated by restarting the entire
+        // BIST, rather than accepting the diagnostic reads as a shortcut.
+        (* mark_debug = "true" *) reg [7:0] diag_tx_eye_scan_index;
+        (* mark_debug = "true" *) reg [6:0] diag_tx_eye_scan_run;
+        (* mark_debug = "true" *) reg [6:0] diag_tx_eye_best_run;
+        (* mark_debug = "true" *) reg [6:0] diag_tx_eye_best_end;
+        (* mark_debug = "true" *) reg [8:0] diag_tx_eye_center_tap;
+        (* mark_debug = "true" *) reg [PHYSICAL_DQ_BITS-1:0]
+            diag_tx_eye_tuned_mask;
+        reg [8:0] diag_tx_eye_seed_tap [0:PHYSICAL_DQ_BITS-1];
+        reg [8:0] diag_tx_eye_original_tap [0:PHYSICAL_DQ_BITS-1];
+        // A bounded full-BIST retry rank is retained independently for every
+        // physical DQ.  The short eye sweep identifies candidate taps, but
+        // only the complete BIST can qualify a candidate for production use.
+        // If that authoritative check fails, the next candidate is selected
+        // center-out from the fixed seed measured once for that DQ. Keeping
+        // only the rank (rather than a board-specific tap) lets retries
+        // exhaust the circular delay range portably across UltraScale/
+        // UltraScale+ devices and PCB layouts.
+        reg [9:0] diag_tx_eye_retry_rank [0:PHYSICAL_DQ_BITS-1];
+        (* mark_debug = "true" *) reg [9:0]
+            diag_tx_eye_retry_rank_current;
+        integer diag_tx_eye_reset_dq;
+        // Locate the first failing serialized data bit after traffic has
+        // stopped.  A one-bit-per-controller-cycle scan is deliberately
+        // used here: a combinational priority encoder across the complete
+        // Wishbone word would otherwise sit directly on the normal read ACK
+        // path and needlessly constrain DDR4-1600 timing.  Diagnostic entry
+        // is already waiting for all outstanding requests to drain, so this
+        // bounded post-failure latency has no functional cost.
+        localparam integer DIAG_BAD_INDEX_BITS =
+            (WB_DATA_BITS <= 2) ? 1 : $clog2(WB_DATA_BITS);
+        reg [DIAG_BAD_INDEX_BITS-1:0] diag_bad_bit_scan_index;
+        reg [WB_DATA_BITS-1:0] diag_bad_bit_scan_mask;
+        reg diag_bad_bit_scan_loaded;
+        reg diag_bad_bit_found;
 
         // Outstanding request tracking for WB pipelining.
         // Circular buffer FIFO tracks W/R type per outstanding request.
@@ -286,6 +480,106 @@ module ddr4_prober #(
                 a = {{(32-BIST_ADDR_BITS){1'b0}}, addr};
                 seed = a ^ {a[15:0], a[31:16]} ^ 32'hA55A3CC3;
                 gen_pattern = {(WB_DATA_BITS/32){seed}};
+            end
+        endfunction
+
+        function [WB_DATA_BITS-1:0] tx_eye_pattern;
+            input [BIST_ADDR_BITS-1:0] addr;
+            input [BIST_TX_EYE_COUNT_BITS-1:0] index;
+            begin
+                if (!index[BIST_TX_EYE_ADDR_BITS-1])
+                    tx_eye_pattern = index[0] ?
+                        {WB_DATA_BITS{1'b1}} :
+                        {WB_DATA_BITS{1'b0}};
+                else
+                    tx_eye_pattern = gen_pattern(addr);
+            end
+        endfunction
+
+        function [8:0] tx_eye_tap_for_sample;
+            input [6:0] sample;
+            begin
+                tx_eye_tap_for_sample = (sample >= 7'd64) ?
+                    9'd511 : {sample[5:0], 3'b000};
+            end
+        endfunction
+
+        function [7:0] physical_dq_for_data_bit;
+            input [7:0] data_bit;
+            begin
+                // One DFI UI contains eight physical DQ bits per byte lane.
+                // Modulo maps any of the eight serialized UIs back to its pad.
+                physical_dq_for_data_bit = data_bit % (8 * BYTE_LANES);
+            end
+        endfunction
+
+        // One physical DQ is serialized across every DFI UI in the Wishbone
+        // word.  A single ODELAY setting must therefore work for all of those
+        // UI positions, not merely for the position that exposed the first
+        // BIST error.  Reducing the fixed-stride positions here makes the TX
+        // eye the intersection of all serialized-bit windows and prevents a
+        // later UI on the same pad from failing after apparent centering.
+        function physical_dq_read_mismatch;
+            input [WB_DATA_BITS-1:0] actual_data;
+            input [WB_DATA_BITS-1:0] expected_word;
+            input [7:0] physical_dq;
+            integer ui_index;
+            begin
+                physical_dq_read_mismatch = 1'b0;
+                for (ui_index = 0;
+                     ui_index < (WB_DATA_BITS / PHYSICAL_DQ_BITS);
+                     ui_index = ui_index + 1) begin
+                    if (actual_data[ui_index*PHYSICAL_DQ_BITS +
+                                    physical_dq] !=
+                        expected_word[ui_index*PHYSICAL_DQ_BITS +
+                                      physical_dq])
+                        physical_dq_read_mismatch = 1'b1;
+                end
+            end
+        endfunction
+
+        function [8:0] tx_eye_seed_from_run;
+            input [6:0] best_end;
+            input [6:0] best_run;
+            input [8:0] fallback_tap;
+            reg [6:0] start_sample;
+            reg [6:0] run_minus_one;
+            reg [8:0] start_tap;
+            reg [8:0] span_taps;
+            begin
+                // If the eight-tap grid sees a passing interval, seed at its
+                // circular midpoint. A narrow eye can fall entirely between
+                // grid samples; in that case the original BISC-maintained tap
+                // is a deterministic, device-independent fallback seed.
+                if (best_run == 0) begin
+                    tx_eye_seed_from_run = fallback_tap;
+                end else begin
+                    start_sample = best_end - best_run + 1'b1;
+                    run_minus_one = best_run - 1'b1;
+                    start_tap = {start_sample[5:0], 3'b000};
+                    span_taps = {run_minus_one[5:0], 3'b000};
+                    tx_eye_seed_from_run = start_tap + (span_taps >> 1);
+                end
+            end
+        endfunction
+
+        function [8:0] tx_eye_candidate_from_seed;
+            input [8:0] seed_tap;
+            input [9:0] retry_rank;
+            begin
+                // Enumerate all 512 delay taps exactly once in circular
+                // center-out order around a seed that remains fixed for this
+                // physical DQ across every full-BIST retry:
+                // center, +1, -1, +2, -2, ... , +256.  This is exhaustive,
+                // bounded, and independent of device/board tap calibration.
+                if (retry_rank == 0)
+                    tx_eye_candidate_from_seed = seed_tap;
+                else if (retry_rank[0])
+                    tx_eye_candidate_from_seed = seed_tap +
+                        ((retry_rank + 1'b1) >> 1);
+                else
+                    tx_eye_candidate_from_seed = seed_tap -
+                        (retry_rank >> 1);
             end
         endfunction
 
@@ -382,6 +676,93 @@ module ddr4_prober #(
                 alt_phase       <= 1'b0;
                 last_read_scrambled <= 1'b0;
                 write_byte_counter <= {$clog2(WB_SEL_BITS){1'b0}};
+                diag_pending       <= 1'b0;
+                diag_running       <= 1'b0;
+                diag_done          <= 1'b0;
+                diag_phase         <= DIAG_REREAD_ORIGINAL;
+                diag_rewrite_accepted <= 1'b0;
+                diag_fail_addr     <= {BIST_ADDR_BITS{1'b0}};
+                diag_fail_wb_addr  <= {WB_ADDR_BITS{1'b0}};
+                diag_expected_data <= {WB_DATA_BITS{1'b0}};
+                diag_first_bad_xor <= {WB_DATA_BITS{1'b0}};
+                diag_retry_last_xor <= {WB_DATA_BITS{1'b0}};
+                diag_retry_xor_or  <= {WB_DATA_BITS{1'b0}};
+                diag_retry_xor_and <= {WB_DATA_BITS{1'b1}};
+                diag_reads_issued  <= 6'd0;
+                diag_reads_returned <= 6'd0;
+                diag_match_count   <= 6'd0;
+                diag_mismatch_count <= 6'd0;
+                diag_post_reads_issued <= 6'd0;
+                diag_post_reads_returned <= 6'd0;
+                diag_post_match_count <= 6'd0;
+                diag_post_mismatch_count <= 6'd0;
+                diag_post_last_xor <= {WB_DATA_BITS{1'b0}};
+                diag_post_xor_or <= {WB_DATA_BITS{1'b0}};
+                diag_post_xor_and <= {WB_DATA_BITS{1'b1}};
+                last_good_valid <= 1'b0;
+                last_good_addr <= {BIST_ADDR_BITS{1'b0}};
+                last_good_wb_addr <= {WB_ADDR_BITS{1'b0}};
+                last_good_expected_data <= {WB_DATA_BITS{1'b0}};
+                diag_control_valid <= 1'b0;
+                diag_control_addr <= {BIST_ADDR_BITS{1'b0}};
+                diag_control_wb_addr <= {WB_ADDR_BITS{1'b0}};
+                diag_control_expected_data <= {WB_DATA_BITS{1'b0}};
+                diag_control_reads_issued <= 6'd0;
+                diag_control_reads_returned <= 6'd0;
+                diag_control_match_count <= 6'd0;
+                diag_control_mismatch_count <= 6'd0;
+                diag_stream_base_wb_addr <= {WB_ADDR_BITS{1'b0}};
+                diag_stream_target_index <= 7'd0;
+                diag_stream_writes_accepted <= 7'd0;
+                diag_stream_target_seen <= 1'b0;
+                diag_stream_reads_issued <= 6'd0;
+                diag_stream_reads_returned <= 6'd0;
+                diag_stream_match_count <= 6'd0;
+                diag_stream_mismatch_count <= 6'd0;
+                diag_stream_xor_or <= 8'd0;
+                diag_stream_xor_and <= 8'hff;
+                diag_tx_eye_bad_data_bit <= 8'd0;
+                diag_tx_eye_dq <= 8'd0;
+                diag_tx_eye_sample <= 7'd0;
+                diag_tx_eye_pass_map <= 65'd0;
+                diag_tx_eye_pass_count <= 7'd0;
+                diag_tx_eye_baseline_tap <= 9'd0;
+                diag_tx_eye_baseline_valid <= 1'b0;
+                diag_tx_eye_first_pass <= 9'd0;
+                diag_tx_eye_last_pass <= 9'd0;
+                diag_tx_eye_pass_found <= 1'b0;
+                diag_tx_eye_bad_seen <= 1'b0;
+                diag_tx_eye_writes_accepted <=
+                    {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                diag_tx_eye_reads_issued <=
+                    {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                diag_tx_eye_reads_returned <=
+                    {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                diag_tx_eye_base_wb_addr <= {WB_ADDR_BITS{1'b0}};
+                diag_tx_eye_restore_pending <= 1'b0;
+                diag_tx_eye_update_error <= 1'b0;
+                diag_tx_eye_done <= 1'b0;
+                diag_tx_eye_scan_index <= 8'd0;
+                diag_tx_eye_scan_run <= 7'd0;
+                diag_tx_eye_best_run <= 7'd0;
+                diag_tx_eye_best_end <= 7'd0;
+                diag_tx_eye_center_tap <= 9'd0;
+                diag_tx_eye_tuned_mask <= {PHYSICAL_DQ_BITS{1'b0}};
+                diag_tx_eye_retry_rank_current <= 10'd0;
+                for (diag_tx_eye_reset_dq = 0;
+                     diag_tx_eye_reset_dq < PHYSICAL_DQ_BITS;
+                     diag_tx_eye_reset_dq = diag_tx_eye_reset_dq + 1) begin
+                    diag_tx_eye_retry_rank[diag_tx_eye_reset_dq] <= 10'd0;
+                    diag_tx_eye_seed_tap[diag_tx_eye_reset_dq] <= 9'd0;
+                    diag_tx_eye_original_tap[diag_tx_eye_reset_dq] <= 9'd0;
+                end
+                diag_bad_bit_scan_index <= {DIAG_BAD_INDEX_BITS{1'b0}};
+                diag_bad_bit_scan_mask <= {WB_DATA_BITS{1'b0}};
+                diag_bad_bit_scan_loaded <= 1'b0;
+                diag_bad_bit_found <= 1'b0;
+                o_phy_tx_diag_req <= 1'b0;
+                o_phy_tx_diag_dq <= 8'd0;
+                o_phy_tx_diag_tap <= 9'd0;
                 o_wb_cyc        <= 1'b0;
                 o_wb_stb        <= 1'b0;
                 o_wb_we         <= 1'b0;
@@ -418,19 +799,802 @@ module ddr4_prober #(
                             $display("[%0t] BIST CHK: addr=%0d exp=%0h got=%0h state=%0d", $realtime, check_addr, expected_data, i_wb_data, bist_state);
                         end
                     `endif
-                    if (i_wb_data == expected_data) begin // read data matches expected pattern
-                        correct_count <= correct_count + 1'b1;
-                    end else begin // read data mismatch so increment error count and latch fail sticky
-                        error_count <= error_count + 1'b1;
-                        bist_fail_sticky <= 1'b1;
-                        `ifndef YOSYS 
-                            $display("[%0t] BIST FAIL: addr=%0h expected=%0h got=%0h", $realtime, check_addr, expected_data, i_wb_data);
-                        `endif
+                    if (BIST_REREAD_DIAG && diag_running &&
+                        (diag_phase == DIAG_REREAD_ORIGINAL)) begin
+                        // Every retry targets diag_fail_addr. Preserve the
+                        // first sample, final sample, and the OR of all error
+                        // masks so one ILA capture shows whether the same
+                        // stored bit is repeatably wrong or the RX result
+                        // varies from read to read.
+                        diag_reads_returned <= diag_reads_returned + 1'b1;
+                        diag_retry_last_xor <= i_wb_data ^
+                                               diag_expected_data;
+                        diag_retry_xor_or <= diag_retry_xor_or |
+                                             (i_wb_data ^ diag_expected_data);
+                        diag_retry_xor_and <= diag_retry_xor_and &
+                                              (i_wb_data ^ diag_expected_data);
+                        if (i_wb_data == diag_expected_data) begin
+                            diag_match_count <= diag_match_count + 1'b1;
+                            correct_count <= correct_count + 1'b1;
+                        end else begin
+                            diag_mismatch_count <=
+                                diag_mismatch_count + 1'b1;
+                            error_count <= error_count + 1'b1;
+                        end
+                    end else if (BIST_REREAD_DIAG && diag_running &&
+                                 (diag_phase == DIAG_REREAD_CONTROL)) begin
+                        diag_control_reads_returned <=
+                            diag_control_reads_returned + 1'b1;
+                        if (i_wb_data == diag_control_expected_data) begin
+                            diag_control_match_count <=
+                                diag_control_match_count + 1'b1;
+                            correct_count <= correct_count + 1'b1;
+                        end else begin
+                            diag_control_mismatch_count <=
+                                diag_control_mismatch_count + 1'b1;
+                            error_count <= error_count + 1'b1;
+                        end
+                    end else if (BIST_REREAD_DIAG && diag_running &&
+                                 (diag_phase == DIAG_REREAD_REWRITE)) begin
+                        // After both read-only classifications, rewrite the
+                        // expected word once and repeat the failing-address
+                        // reads.  Interpret this result together with the
+                        // known-good isolated control above: the pair
+                        // distinguishes isolated TX and RX boundary failures
+                        // without changing any delay or training setting.
+                        diag_post_reads_returned <=
+                            diag_post_reads_returned + 1'b1;
+                        diag_post_last_xor <= i_wb_data ^
+                                              diag_expected_data;
+                        diag_post_xor_or <= diag_post_xor_or |
+                                            (i_wb_data ^ diag_expected_data);
+                        diag_post_xor_and <= diag_post_xor_and &
+                                             (i_wb_data ^ diag_expected_data);
+                        if (i_wb_data == diag_expected_data) begin
+                            diag_post_match_count <=
+                                diag_post_match_count + 1'b1;
+                            correct_count <= correct_count + 1'b1;
+                        end else begin
+                            diag_post_mismatch_count <=
+                                diag_post_mismatch_count + 1'b1;
+                            error_count <= error_count + 1'b1;
+                        end
+                    end else if (BIST_REREAD_DIAG && diag_running &&
+                                 (diag_phase == DIAG_REREAD_STREAM)) begin
+                        diag_stream_reads_returned <=
+                            diag_stream_reads_returned + 1'b1;
+                        diag_stream_xor_or <= diag_stream_xor_or |
+                            (i_wb_data[42:35] ^ diag_expected_data[42:35]);
+                        diag_stream_xor_and <= diag_stream_xor_and &
+                            (i_wb_data[42:35] ^ diag_expected_data[42:35]);
+                        if (i_wb_data == diag_expected_data) begin
+                            diag_stream_match_count <=
+                                diag_stream_match_count + 1'b1;
+                            correct_count <= correct_count + 1'b1;
+                        end else begin
+                            diag_stream_mismatch_count <=
+                                diag_stream_mismatch_count + 1'b1;
+                            error_count <= error_count + 1'b1;
+                        end
+                    end else if (BIST_REREAD_DIAG && diag_running &&
+                                 (diag_phase == DIAG_TX_EYE_READ)) begin
+                        // The sweep classifies only the physical DQ implicated
+                        // by the first failure.  Other bits are deliberately
+                        // ignored here so a separate marginal pad cannot hide
+                        // this bit's complete pass window.
+                        diag_tx_eye_reads_returned <=
+                            diag_tx_eye_reads_returned + 1'b1;
+                        if (physical_dq_read_mismatch(
+                                i_wb_data,
+                                tx_eye_pattern(
+                                    diag_tx_eye_base_wb_addr[
+                                        BIST_ADDR_BITS-1:0] +
+                                    diag_tx_eye_reads_returned,
+                                    diag_tx_eye_reads_returned),
+                                diag_tx_eye_dq))
+                            diag_tx_eye_bad_seen <= 1'b1;
+                    end else begin
+                        if (i_wb_data == expected_data) begin // read data matches expected pattern
+                            correct_count <= correct_count + 1'b1;
+                            // Preserve the most recently verified normal-BIST
+                            // word.  While diag_pending drains already-issued
+                            // requests this naturally selects a known-good
+                            // neighbor after the first failure at address 0.
+                            last_good_valid <= 1'b1;
+                            last_good_addr <= check_addr;
+                            last_good_wb_addr <= uses_scramble ?
+                                stress_addr(check_addr) :
+                                {{(WB_ADDR_BITS-BIST_ADDR_BITS){1'b0}},
+                                 check_addr};
+                            last_good_expected_data <= expected_data;
+                        end else begin // read data mismatch so increment error count and latch fail sticky
+                            error_count <= error_count + 1'b1;
+                            bist_fail_sticky <= 1'b1;
+                            if (BIST_REREAD_DIAG && !diag_pending &&
+                                !diag_running && !diag_done) begin
+                                diag_pending <= 1'b1;
+                                diag_fail_addr <= check_addr;
+                                diag_fail_wb_addr <= uses_scramble ?
+                                    stress_addr(check_addr) :
+                                    {{(WB_ADDR_BITS-BIST_ADDR_BITS){1'b0}},
+                                     check_addr};
+                                diag_expected_data <= expected_data;
+                                diag_first_bad_xor <= i_wb_data ^ expected_data;
+                                diag_tx_eye_bad_data_bit <= 8'd0;
+                                diag_tx_eye_dq <= 8'd0;
+                                diag_bad_bit_scan_index <=
+                                    {DIAG_BAD_INDEX_BITS{1'b0}};
+                                diag_bad_bit_scan_mask <=
+                                    {WB_DATA_BITS{1'b0}};
+                                diag_bad_bit_scan_loaded <= 1'b0;
+                                diag_bad_bit_found <= 1'b0;
+                            end
+                            `ifndef YOSYS
+                                $display("[%0t] BIST FAIL: addr=%0h expected=%0h got=%0h", $realtime, check_addr, expected_data, i_wb_data);
+                            `endif
+                        end
+                        check_addr <= check_addr + 1'b1;
                     end
-                    check_addr <= check_addr + 1'b1;
                 end
 
-                case (bist_state)
+                if (BIST_REREAD_DIAG && diag_pending) begin
+                    // Stop issuing new traffic, then wait until every request
+                    // older than the failing response has retired. Starting
+                    // the retry stream earlier would associate its ACKs with
+                    // addresses still present in the B4 request FIFO.
+                    o_wb_stb <= 1'b0;
+                    if (!diag_bad_bit_scan_loaded) begin
+                        // Load from the registered failure mask, never from
+                        // the live ACK bus.  Thereafter a shift register
+                        // exposes one bit per cycle without a 256:1 mux.
+                        diag_bad_bit_scan_mask <= diag_first_bad_xor;
+                        diag_bad_bit_scan_loaded <= 1'b1;
+                    end else if (!diag_bad_bit_found) begin
+                        if (diag_bad_bit_scan_mask[0]) begin
+                            diag_tx_eye_bad_data_bit <=
+                                {{(8-DIAG_BAD_INDEX_BITS){1'b0}},
+                                 diag_bad_bit_scan_index};
+                            diag_tx_eye_dq <= physical_dq_for_data_bit(
+                                {{(8-DIAG_BAD_INDEX_BITS){1'b0}},
+                                 diag_bad_bit_scan_index});
+                            diag_bad_bit_found <= 1'b1;
+                        end else begin
+                            diag_bad_bit_scan_mask <=
+                                diag_bad_bit_scan_mask >> 1;
+                            diag_bad_bit_scan_index <=
+                                diag_bad_bit_scan_index + 1'b1;
+                        end
+                    end else if (outstanding == 0) begin
+                        diag_pending <= 1'b0;
+                        // Make the already-trained decision only after the
+                        // request pipe is idle.  Keeping this indexed mask
+                        // lookup out of the 256-bit mismatch encoder is
+                        // essential to normal BIST timing at DDR4-1600.
+                        // A failure after an earlier correction rejects that
+                        // candidate but does not prove the DQ untrainable.
+                        // The per-DQ seed was fixed by its first measured eye,
+                        // so rescanning the same 65 coarse points here adds no
+                        // information and makes a bounded fine search take
+                        // minutes per candidate. Advance directly to the next
+                        // center-out tap; it still has to survive the complete
+                        // BIST before init_done is allowed. An as-yet untuned
+                        // DQ follows the full classification/measurement path.
+                        if (diag_tx_eye_tuned_mask[diag_tx_eye_dq]) begin
+                            diag_running <= 1'b1;
+                            diag_tx_eye_done <= 1'b0;
+                            diag_tx_eye_update_error <= 1'b0;
+                            diag_tx_eye_restore_pending <= 1'b0;
+                            o_phy_tx_diag_dq <= diag_tx_eye_dq;
+                            if (diag_tx_eye_retry_rank[diag_tx_eye_dq] <
+                                10'd511) begin
+                                diag_tx_eye_retry_rank[diag_tx_eye_dq] <=
+                                    diag_tx_eye_retry_rank[diag_tx_eye_dq] +
+                                    1'b1;
+                                diag_tx_eye_retry_rank_current <=
+                                    diag_tx_eye_retry_rank[
+                                        diag_tx_eye_dq] + 1'b1;
+                                diag_tx_eye_center_tap <=
+                                    tx_eye_candidate_from_seed(
+                                        diag_tx_eye_seed_tap[
+                                            diag_tx_eye_dq],
+                                        diag_tx_eye_retry_rank[
+                                            diag_tx_eye_dq] + 1'b1);
+                                o_phy_tx_diag_tap <=
+                                    tx_eye_candidate_from_seed(
+                                        diag_tx_eye_seed_tap[
+                                            diag_tx_eye_dq],
+                                        diag_tx_eye_retry_rank[
+                                            diag_tx_eye_dq] + 1'b1);
+                                o_phy_tx_diag_req <= 1'b1;
+                                diag_phase <= DIAG_TX_EYE_APPLY_REQUEST;
+                            end else begin
+                                // Rank 511 was the final unique tap. Restore
+                                // the BISC-maintained value before reporting a
+                                // genuinely exhaustive failure.
+                                diag_tx_eye_retry_rank_current <= 10'd512;
+                                diag_tx_eye_restore_pending <= 1'b1;
+                                o_phy_tx_diag_tap <=
+                                    diag_tx_eye_original_tap[
+                                        diag_tx_eye_dq];
+                                o_phy_tx_diag_req <= 1'b1;
+                                diag_phase <= DIAG_TX_EYE_REQUEST;
+                            end
+                        end else begin
+                            diag_tx_eye_retry_rank_current <=
+                                diag_tx_eye_retry_rank[diag_tx_eye_dq];
+                            diag_running <= 1'b1;
+                            diag_phase <= DIAG_REREAD_ORIGINAL;
+                            diag_rewrite_accepted <= 1'b0;
+                            diag_reads_issued <= 6'd0;
+                            diag_reads_returned <= 6'd0;
+                            diag_match_count <= 6'd0;
+                            diag_mismatch_count <= 6'd0;
+                            diag_retry_last_xor <= {WB_DATA_BITS{1'b0}};
+                            diag_retry_xor_or <= {WB_DATA_BITS{1'b0}};
+                            diag_retry_xor_and <= {WB_DATA_BITS{1'b1}};
+                            diag_post_reads_issued <= 6'd0;
+                            diag_post_reads_returned <= 6'd0;
+                            diag_post_match_count <= 6'd0;
+                            diag_post_mismatch_count <= 6'd0;
+                            diag_post_last_xor <= {WB_DATA_BITS{1'b0}};
+                            diag_post_xor_or <= {WB_DATA_BITS{1'b0}};
+                            diag_post_xor_and <= {WB_DATA_BITS{1'b1}};
+                            diag_control_valid <= last_good_valid;
+                            diag_control_addr <= last_good_addr;
+                            diag_control_wb_addr <= last_good_wb_addr;
+                            diag_control_expected_data <=
+                                last_good_expected_data;
+                            diag_control_reads_issued <= 6'd0;
+                            diag_control_reads_returned <= 6'd0;
+                            diag_control_match_count <= 6'd0;
+                            diag_control_mismatch_count <= 6'd0;
+                            diag_stream_base_wb_addr <=
+                                (diag_fail_wb_addr >= 32) ?
+                                (diag_fail_wb_addr - 32) :
+                                {WB_ADDR_BITS{1'b0}};
+                            diag_stream_target_index <=
+                                (diag_fail_wb_addr >= 32) ?
+                                7'd32 : diag_fail_wb_addr[6:0];
+                            // Keep the TX-eye scratch stream inside one
+                            // naturally aligned stress region. The complete
+                            // region remains in range at either memory end.
+                            diag_tx_eye_base_wb_addr <=
+                                {diag_fail_wb_addr[
+                                     WB_ADDR_BITS-1:BIST_TX_EYE_ADDR_BITS],
+                                 {BIST_TX_EYE_ADDR_BITS{1'b0}}};
+                            diag_stream_writes_accepted <= 7'd0;
+                            diag_stream_target_seen <= 1'b0;
+                            diag_stream_reads_issued <= 6'd0;
+                            diag_stream_reads_returned <= 6'd0;
+                            diag_stream_match_count <= 6'd0;
+                            diag_stream_mismatch_count <= 6'd0;
+                            diag_stream_xor_or <= 8'd0;
+                            diag_stream_xor_and <= 8'hff;
+                            o_wb_stb <= 1'b1;
+                            o_wb_we <= 1'b0;
+                            o_wb_addr <= diag_fail_wb_addr;
+                            check_addr <= diag_fail_addr;
+                        end
+                    end
+                end else if (BIST_REREAD_DIAG && diag_running) begin
+                    case (diag_phase)
+                        DIAG_REREAD_ORIGINAL: begin
+                            o_wb_we <= 1'b0;
+                            o_wb_addr <= diag_fail_wb_addr;
+                            if (o_wb_stb && !i_wb_stall) begin
+                                diag_reads_issued <=
+                                    diag_reads_issued + 1'b1;
+                                if (diag_reads_issued == BIST_DIAG_READS-1)
+                                    o_wb_stb <= 1'b0;
+                            end
+                            if ((diag_reads_issued == BIST_DIAG_READS) &&
+                                (diag_reads_returned == BIST_DIAG_READS) &&
+                                (outstanding == 0)) begin
+                                o_wb_stb <= 1'b1;
+                                if (diag_control_valid) begin
+                                    diag_phase <= DIAG_REREAD_CONTROL;
+                                    o_wb_we <= 1'b0;
+                                    o_wb_addr <= diag_control_wb_addr;
+                                    check_addr <= diag_control_addr;
+                                end else begin
+                                    diag_phase <= DIAG_REWRITE;
+                                    diag_rewrite_accepted <= 1'b0;
+                                    o_wb_we <= 1'b1;
+                                    o_wb_addr <= diag_fail_wb_addr;
+                                    o_wb_data <= diag_expected_data;
+                                    o_wb_sel <= {WB_SEL_BITS{1'b1}};
+                                end
+                            end
+                        end
+
+                        DIAG_REREAD_CONTROL: begin
+                            o_wb_we <= 1'b0;
+                            o_wb_addr <= diag_control_wb_addr;
+                            if (o_wb_stb && !i_wb_stall) begin
+                                diag_control_reads_issued <=
+                                    diag_control_reads_issued + 1'b1;
+                                if (diag_control_reads_issued ==
+                                    BIST_DIAG_READS-1)
+                                    o_wb_stb <= 1'b0;
+                            end
+                            if ((diag_control_reads_issued ==
+                                 BIST_DIAG_READS) &&
+                                (diag_control_reads_returned ==
+                                 BIST_DIAG_READS) &&
+                                (outstanding == 0)) begin
+                                diag_phase <= DIAG_REWRITE;
+                                diag_rewrite_accepted <= 1'b0;
+                                o_wb_stb <= 1'b1;
+                                o_wb_we <= 1'b1;
+                                o_wb_addr <= diag_fail_wb_addr;
+                                o_wb_data <= diag_expected_data;
+                                o_wb_sel <= {WB_SEL_BITS{1'b1}};
+                            end
+                        end
+
+                        DIAG_REWRITE: begin
+                            o_wb_we <= 1'b1;
+                            o_wb_addr <= diag_fail_wb_addr;
+                            o_wb_data <= diag_expected_data;
+                            o_wb_sel <= {WB_SEL_BITS{1'b1}};
+                            if (o_wb_stb && !i_wb_stall) begin
+                                diag_rewrite_accepted <= 1'b1;
+                                o_wb_stb <= 1'b0;
+                            end
+                            if (diag_rewrite_accepted &&
+                                (outstanding == 0)) begin
+                                diag_phase <= DIAG_REREAD_REWRITE;
+                                diag_post_reads_issued <= 6'd0;
+                                diag_post_reads_returned <= 6'd0;
+                                diag_post_match_count <= 6'd0;
+                                diag_post_mismatch_count <= 6'd0;
+                                diag_post_last_xor <=
+                                    {WB_DATA_BITS{1'b0}};
+                                diag_post_xor_or <=
+                                    {WB_DATA_BITS{1'b0}};
+                                diag_post_xor_and <=
+                                    {WB_DATA_BITS{1'b1}};
+                                o_wb_stb <= 1'b1;
+                                o_wb_we <= 1'b0;
+                                check_addr <= diag_fail_addr;
+                            end
+                        end
+
+                        DIAG_REREAD_REWRITE: begin
+                            o_wb_we <= 1'b0;
+                            o_wb_addr <= diag_fail_wb_addr;
+                            if (o_wb_stb && !i_wb_stall) begin
+                                diag_post_reads_issued <=
+                                    diag_post_reads_issued + 1'b1;
+                                if (diag_post_reads_issued ==
+                                    BIST_DIAG_READS-1)
+                                    o_wb_stb <= 1'b0;
+                            end
+                            if ((diag_post_reads_issued == BIST_DIAG_READS) &&
+                                (diag_post_reads_returned == BIST_DIAG_READS) &&
+                                (outstanding == 0)) begin
+                                // Keep ownership and follow the proven
+                                // isolated transaction with a continuous write
+                                // stream.  Starting with STB Low gives the
+                                // stream state one clean setup cycle for its
+                                // base address and stress word.
+                                diag_phase <= DIAG_STREAM_REWRITE;
+                                o_wb_stb <= 1'b0;
+                                o_wb_we <= 1'b1;
+                            end
+                        end
+
+                        DIAG_STREAM_REWRITE: begin
+                            o_wb_we <= 1'b1;
+                            o_wb_sel <= {WB_SEL_BITS{1'b1}};
+
+                            if (!o_wb_stb &&
+                                (diag_stream_writes_accepted == 0) &&
+                                (outstanding == 0)) begin
+                                o_wb_stb <= 1'b1;
+                                o_wb_addr <= diag_stream_base_wb_addr;
+                                o_wb_data <=
+                                    (diag_stream_target_index == 0) ?
+                                    diag_expected_data :
+                                    {WB_DATA_BITS{1'b1}};
+                            end else if (o_wb_stb && !i_wb_stall) begin
+                                diag_stream_writes_accepted <=
+                                    diag_stream_writes_accepted + 1'b1;
+                                if (diag_stream_writes_accepted ==
+                                    diag_stream_target_index)
+                                    diag_stream_target_seen <= 1'b1;
+
+                                if (diag_stream_writes_accepted ==
+                                    BIST_DIAG_STREAM_WRITES-1) begin
+                                    o_wb_stb <= 1'b0;
+                                end else begin
+                                    o_wb_addr <= diag_stream_base_wb_addr +
+                                        diag_stream_writes_accepted + 1'b1;
+                                    if ((diag_stream_writes_accepted + 1'b1) ==
+                                        diag_stream_target_index)
+                                        o_wb_data <= diag_expected_data;
+                                    else if ((diag_stream_writes_accepted +
+                                              1'b1) & 1'b1)
+                                        o_wb_data <= {WB_DATA_BITS{1'b0}};
+                                    else
+                                        o_wb_data <= {WB_DATA_BITS{1'b1}};
+                                end
+                            end
+
+                            if ((diag_stream_writes_accepted ==
+                                 BIST_DIAG_STREAM_WRITES) &&
+                                (outstanding == 0) && !o_wb_stb) begin
+                                diag_phase <= DIAG_REREAD_STREAM;
+                                diag_stream_reads_issued <= 6'd0;
+                                diag_stream_reads_returned <= 6'd0;
+                                diag_stream_match_count <= 6'd0;
+                                diag_stream_mismatch_count <= 6'd0;
+                                diag_stream_xor_or <= 8'd0;
+                                diag_stream_xor_and <= 8'hff;
+                                o_wb_stb <= 1'b1;
+                                o_wb_we <= 1'b0;
+                                o_wb_addr <= diag_fail_wb_addr;
+                                check_addr <= diag_fail_addr;
+                            end
+                        end
+
+                        DIAG_REREAD_STREAM: begin
+                            o_wb_we <= 1'b0;
+                            o_wb_addr <= diag_fail_wb_addr;
+                            if (o_wb_stb && !i_wb_stall) begin
+                                diag_stream_reads_issued <=
+                                    diag_stream_reads_issued + 1'b1;
+                                if (diag_stream_reads_issued ==
+                                    BIST_DIAG_READS-1)
+                                    o_wb_stb <= 1'b0;
+                            end
+                            if ((diag_stream_reads_issued ==
+                                 BIST_DIAG_READS) &&
+                                (diag_stream_reads_returned ==
+                                 BIST_DIAG_READS) &&
+                                (outstanding == 0)) begin
+                                o_wb_stb <= 1'b0;
+                                if (i_phy_tx_diag_supported) begin
+                                    // Begin at absolute tap zero.  The PHY
+                                    // captures the BISC-maintained starting
+                                    // value before it performs this request.
+                                    diag_phase <= DIAG_TX_EYE_REQUEST;
+                                    diag_tx_eye_sample <= 7'd0;
+                                    diag_tx_eye_pass_map <= 65'd0;
+                                    diag_tx_eye_pass_count <= 7'd0;
+                                    diag_tx_eye_baseline_valid <= 1'b0;
+                                    diag_tx_eye_pass_found <= 1'b0;
+                                    diag_tx_eye_bad_seen <= 1'b0;
+                                    diag_tx_eye_restore_pending <= 1'b0;
+                                    diag_tx_eye_update_error <= 1'b0;
+                                    diag_tx_eye_done <= 1'b0;
+                                    diag_tx_eye_scan_index <= 8'd0;
+                                    diag_tx_eye_scan_run <= 7'd0;
+                                    diag_tx_eye_best_run <= 7'd0;
+                                    diag_tx_eye_best_end <= 7'd0;
+                                    diag_tx_eye_center_tap <= 9'd0;
+                                    o_phy_tx_diag_dq <= diag_tx_eye_dq;
+                                    o_phy_tx_diag_tap <= 9'd0;
+                                    o_phy_tx_diag_req <= 1'b1;
+                                end else begin
+                                    diag_running <= 1'b0;
+                                    diag_done <= 1'b1;
+                                    o_wb_cyc <= 1'b0;
+                                    bist_state <= BIST_DONE;
+                                end
+                            end
+                        end
+
+                        DIAG_TX_EYE_REQUEST: begin
+                            // No memory transaction is allowed while a native
+                            // output delay is moving.
+                            o_wb_stb <= 1'b0;
+                            if (i_phy_tx_diag_ack) begin
+                                o_phy_tx_diag_req <= 1'b0;
+                                if (i_phy_tx_diag_error) begin
+                                    diag_tx_eye_update_error <= 1'b1;
+                                    diag_tx_eye_done <= 1'b1;
+                                    diag_running <= 1'b0;
+                                    diag_done <= 1'b1;
+                                    o_wb_cyc <= 1'b0;
+                                    bist_state <= BIST_DONE;
+                                end else if (diag_tx_eye_restore_pending) begin
+                                    // The production/BISC-maintained tap is
+                                    // back in place; leave no diagnostic state
+                                    // in the functional datapath.
+                                    diag_tx_eye_done <= 1'b1;
+                                    diag_running <= 1'b0;
+                                    diag_done <= 1'b1;
+                                    o_wb_cyc <= 1'b0;
+                                    bist_state <= BIST_DONE;
+                                end else begin
+                                    if (!diag_tx_eye_baseline_valid) begin
+                                        diag_tx_eye_baseline_tap <=
+                                            i_phy_tx_diag_previous_tap;
+                                        diag_tx_eye_baseline_valid <= 1'b1;
+                                        if (!diag_tx_eye_tuned_mask[
+                                                diag_tx_eye_dq])
+                                            diag_tx_eye_original_tap[
+                                                diag_tx_eye_dq] <=
+                                                i_phy_tx_diag_previous_tap;
+                                    end
+                                    diag_tx_eye_writes_accepted <=
+                                        {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                                    diag_tx_eye_bad_seen <= 1'b0;
+                                    diag_tx_eye_reads_issued <=
+                                        {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                                    diag_tx_eye_reads_returned <=
+                                        {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                                    o_wb_we <= 1'b1;
+                                    diag_phase <= DIAG_TX_EYE_WRITE;
+                                end
+                            end
+                        end
+
+                        DIAG_TX_EYE_WRITE: begin
+                            o_wb_we <= 1'b1;
+                            o_wb_sel <= {WB_SEL_BITS{1'b1}};
+
+                            if (!o_wb_stb &&
+                                (diag_tx_eye_writes_accepted == 0) &&
+                                (outstanding == 0)) begin
+                                o_wb_stb <= 1'b1;
+                                o_wb_addr <= diag_tx_eye_base_wb_addr;
+                                o_wb_data <= tx_eye_pattern(
+                                    diag_tx_eye_base_wb_addr[
+                                        BIST_ADDR_BITS-1:0],
+                                    {BIST_TX_EYE_COUNT_BITS{1'b0}});
+                            end else if (o_wb_stb && !i_wb_stall) begin
+                                diag_tx_eye_writes_accepted <=
+                                    diag_tx_eye_writes_accepted + 1'b1;
+
+                                if (diag_tx_eye_writes_accepted ==
+                                    BIST_TX_EYE_WORDS-1) begin
+                                    o_wb_stb <= 1'b0;
+                                end else begin
+                                    o_wb_addr <= diag_tx_eye_base_wb_addr +
+                                        diag_tx_eye_writes_accepted + 1'b1;
+                                    // Preserve both calibration pattern
+                                    // classes at separate addresses so every
+                                    // returned word remains independently
+                                    // checkable.
+                                    o_wb_data <= tx_eye_pattern(
+                                        diag_tx_eye_base_wb_addr[
+                                            BIST_ADDR_BITS-1:0] +
+                                        diag_tx_eye_writes_accepted + 1'b1,
+                                        diag_tx_eye_writes_accepted + 1'b1);
+                                end
+                            end
+
+                            if ((diag_tx_eye_writes_accepted ==
+                                 BIST_TX_EYE_WORDS) &&
+                                (outstanding == 0) && !o_wb_stb) begin
+                                diag_tx_eye_reads_issued <=
+                                    {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                                diag_tx_eye_reads_returned <=
+                                    {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                                diag_tx_eye_bad_seen <= 1'b0;
+                                o_wb_stb <= 1'b1;
+                                o_wb_we <= 1'b0;
+                                o_wb_addr <= diag_tx_eye_base_wb_addr;
+                                diag_phase <= DIAG_TX_EYE_READ;
+                            end
+                        end
+
+                        DIAG_TX_EYE_READ: begin
+                            o_wb_we <= 1'b0;
+                            if (o_wb_stb && !i_wb_stall) begin
+                                diag_tx_eye_reads_issued <=
+                                    diag_tx_eye_reads_issued + 1'b1;
+                                if (diag_tx_eye_reads_issued ==
+                                    BIST_TX_EYE_WORDS-1)
+                                    o_wb_stb <= 1'b0;
+                                else
+                                    o_wb_addr <= diag_tx_eye_base_wb_addr +
+                                        diag_tx_eye_reads_issued + 1'b1;
+                            end
+
+                            if ((diag_tx_eye_reads_issued ==
+                                 BIST_TX_EYE_WORDS) &&
+                                (diag_tx_eye_reads_returned ==
+                                 BIST_TX_EYE_WORDS) &&
+                                (outstanding == 0)) begin
+                                diag_tx_eye_pass_map[diag_tx_eye_sample] <=
+                                    !diag_tx_eye_bad_seen;
+                                if (!diag_tx_eye_bad_seen) begin
+                                    diag_tx_eye_pass_count <=
+                                        diag_tx_eye_pass_count + 1'b1;
+                                    diag_tx_eye_last_pass <=
+                                        tx_eye_tap_for_sample(
+                                            diag_tx_eye_sample);
+                                    if (!diag_tx_eye_pass_found) begin
+                                        diag_tx_eye_first_pass <=
+                                            tx_eye_tap_for_sample(
+                                                diag_tx_eye_sample);
+                                        diag_tx_eye_pass_found <= 1'b1;
+                                    end
+                                end
+
+                                o_wb_stb <= 1'b0;
+                                if (diag_tx_eye_sample == 7'd64) begin
+                                    // All 65 measurements are complete. Tap
+                                    // 511 is adjacent to tap zero and is kept
+                                    // as a diagnostic endpoint; the circular
+                                    // center calculation uses uniform samples
+                                    // 0..63 twice.
+                                    diag_phase <= DIAG_TX_EYE_ANALYZE;
+                                    diag_tx_eye_scan_index <= 8'd0;
+                                    diag_tx_eye_scan_run <= 7'd0;
+                                    diag_tx_eye_best_run <= 7'd0;
+                                    diag_tx_eye_best_end <= 7'd0;
+                                end else begin
+                                    diag_phase <= DIAG_TX_EYE_REQUEST;
+                                    o_phy_tx_diag_req <= 1'b1;
+                                    diag_tx_eye_sample <=
+                                        diag_tx_eye_sample + 1'b1;
+                                    o_phy_tx_diag_tap <=
+                                        tx_eye_tap_for_sample(
+                                            diag_tx_eye_sample + 1'b1);
+                                end
+                            end
+                        end
+
+                        DIAG_TX_EYE_ANALYZE: begin
+                            o_wb_stb <= 1'b0;
+                            // One extra cycle after index 127 lets the final
+                            // nonblocking best-run update settle before the
+                            // center is calculated.
+                            if (diag_tx_eye_scan_index == 8'd128) begin
+                                diag_phase <= DIAG_TX_EYE_FINALIZE;
+                            end else begin
+                                if (diag_tx_eye_pass_map[
+                                        diag_tx_eye_scan_index[5:0]]) begin
+                                    if (diag_tx_eye_scan_run < 7'd64)
+                                        diag_tx_eye_scan_run <=
+                                            diag_tx_eye_scan_run + 1'b1;
+                                    if (((diag_tx_eye_scan_run < 7'd64) ?
+                                         (diag_tx_eye_scan_run + 1'b1) :
+                                         7'd64) > diag_tx_eye_best_run) begin
+                                        diag_tx_eye_best_run <=
+                                            (diag_tx_eye_scan_run < 7'd64) ?
+                                            (diag_tx_eye_scan_run + 1'b1) :
+                                            7'd64;
+                                        diag_tx_eye_best_end <=
+                                            diag_tx_eye_scan_index[6:0];
+                                    end
+                                end else begin
+                                    diag_tx_eye_scan_run <= 7'd0;
+                                end
+                                diag_tx_eye_scan_index <=
+                                    diag_tx_eye_scan_index + 1'b1;
+                            end
+                        end
+
+                        DIAG_TX_EYE_FINALIZE: begin
+                            o_wb_stb <= 1'b0;
+                            if (diag_tx_eye_retry_rank_current >= 10'd512) begin
+                                // Every physical tap has failed the
+                                // authoritative full BIST. Restore the original
+                                // BISC value before reporting a genuine,
+                                // bounded uncorrectable failure.
+                                diag_tx_eye_restore_pending <= 1'b1;
+                                o_phy_tx_diag_tap <=
+                                    diag_tx_eye_original_tap[
+                                        diag_tx_eye_dq];
+                                o_phy_tx_diag_req <= 1'b1;
+                                diag_phase <= DIAG_TX_EYE_REQUEST;
+                            end else begin
+                                if (!diag_tx_eye_tuned_mask[
+                                        diag_tx_eye_dq]) begin
+                                    diag_tx_eye_seed_tap[
+                                        diag_tx_eye_dq] <=
+                                        tx_eye_seed_from_run(
+                                            diag_tx_eye_best_end,
+                                            diag_tx_eye_best_run,
+                                            diag_tx_eye_baseline_tap);
+                                    diag_tx_eye_center_tap <=
+                                        tx_eye_candidate_from_seed(
+                                            tx_eye_seed_from_run(
+                                                diag_tx_eye_best_end,
+                                                diag_tx_eye_best_run,
+                                                diag_tx_eye_baseline_tap),
+                                            diag_tx_eye_retry_rank_current);
+                                end else begin
+                                    diag_tx_eye_center_tap <=
+                                        tx_eye_candidate_from_seed(
+                                            diag_tx_eye_seed_tap[
+                                                diag_tx_eye_dq],
+                                            diag_tx_eye_retry_rank_current);
+                                end
+                                // The sweep ended at tap 511. Cross the
+                                // circular boundary by one tap, then advance
+                                // in <=8-tap updates to the selected center.
+                                o_phy_tx_diag_tap <= 9'd0;
+                                o_phy_tx_diag_req <= 1'b1;
+                                diag_phase <= DIAG_TX_EYE_APPLY_REQUEST;
+                            end
+                        end
+
+                        DIAG_TX_EYE_APPLY_REQUEST: begin
+                            o_wb_stb <= 1'b0;
+                            if (i_phy_tx_diag_ack) begin
+                                o_phy_tx_diag_req <= 1'b0;
+                                if (i_phy_tx_diag_error) begin
+                                    diag_tx_eye_update_error <= 1'b1;
+                                    diag_tx_eye_done <= 1'b1;
+                                    diag_running <= 1'b0;
+                                    diag_done <= 1'b1;
+                                    o_wb_cyc <= 1'b0;
+                                    bist_state <= BIST_DONE;
+                                end else if (o_phy_tx_diag_tap ==
+                                             diag_tx_eye_center_tap) begin
+                                    // Retain the centered tap and rerun every
+                                    // BIST phase from address zero. A later
+                                    // failure on another physical DQ starts
+                                    // its independent eye measurement; a
+                                    // failure on this DQ rejects this tap and
+                                    // advances its bounded candidate rank.
+                                    diag_tx_eye_tuned_mask[
+                                        diag_tx_eye_dq] <= 1'b1;
+                                    diag_tx_eye_done <= 1'b1;
+                                    diag_running <= 1'b0;
+                                    diag_pending <= 1'b0;
+                                    diag_done <= 1'b0;
+                                    bist_state <= BIST_BURST_WRITE;
+                                    write_addr <= {BIST_ADDR_BITS{1'b0}};
+                                    read_addr <= {BIST_ADDR_BITS{1'b0}};
+                                    check_addr <= {BIST_ADDR_BITS{1'b0}};
+                                    correct_count <= 32'd0;
+                                    error_count <= 32'd0;
+                                    bist_fail_sticky <= 1'b0;
+                                    o_bist_failed_reset_req <= 1'b0;
+                                    alt_phase <= 1'b0;
+                                    last_read_scrambled <= 1'b0;
+                                    last_good_valid <= 1'b0;
+                                    o_wb_cyc <= 1'b1;
+                                    o_wb_stb <= 1'b1;
+                                    o_wb_we <= 1'b1;
+                                    o_wb_addr <= {WB_ADDR_BITS{1'b0}};
+                                    o_wb_data <= gen_pattern(
+                                        {BIST_ADDR_BITS{1'b0}});
+                                    o_wb_sel <= BIST_DM_TEST ?
+                                        {{(WB_SEL_BITS-1){1'b0}}, 1'b1} :
+                                        {WB_SEL_BITS{1'b1}};
+                                    write_byte_counter <=
+                                        {$clog2(WB_SEL_BITS){1'b0}};
+                                    outstanding <= 5'd0;
+                                    ack_type_q <= 16'd0;
+                                    ack_wr_ptr <= 4'd0;
+                                    ack_rd_ptr <= 4'd0;
+                                end else begin
+                                    diag_phase <= DIAG_TX_EYE_APPLY_GAP;
+                                end
+                            end
+                        end
+
+                        DIAG_TX_EYE_APPLY_GAP: begin
+                            // The PHY accepts a new transaction only after it
+                            // observes REQ low following ACK.
+                            o_phy_tx_diag_req <= 1'b1;
+                            if ((o_phy_tx_diag_tap + 9'd8) <
+                                diag_tx_eye_center_tap)
+                                o_phy_tx_diag_tap <=
+                                    o_phy_tx_diag_tap + 9'd8;
+                            else
+                                o_phy_tx_diag_tap <=
+                                    diag_tx_eye_center_tap;
+                            diag_phase <= DIAG_TX_EYE_APPLY_REQUEST;
+                        end
+
+                        default: begin
+                            diag_running <= 1'b0;
+                            diag_done <= 1'b1;
+                            o_wb_cyc <= 1'b0;
+                            o_wb_stb <= 1'b0;
+                            bist_state <= BIST_DONE;
+                        end
+                    endcase
+                end else case (bist_state)
                     BIST_IDLE: begin
                         o_bist_failed_reset_req <= 1'b0;
                         if (bist_start_any) begin // triggered by auto-start or CSR write
@@ -444,6 +1608,53 @@ module ddr4_prober #(
                             correct_count <= 32'd0;
                             error_count   <= 32'd0;
                             bist_fail_sticky <= 1'b0;
+                            diag_pending <= 1'b0;
+                            diag_running <= 1'b0;
+                            diag_done <= 1'b0;
+                            diag_control_valid <= 1'b0;
+                            diag_control_reads_issued <= 6'd0;
+                            diag_control_reads_returned <= 6'd0;
+                            diag_control_match_count <= 6'd0;
+                            diag_control_mismatch_count <= 6'd0;
+                            diag_stream_writes_accepted <= 7'd0;
+                            diag_stream_target_seen <= 1'b0;
+                            diag_stream_reads_issued <= 6'd0;
+                            diag_stream_reads_returned <= 6'd0;
+                            diag_stream_match_count <= 6'd0;
+                            diag_stream_mismatch_count <= 6'd0;
+                            diag_stream_xor_or <= 8'd0;
+                            diag_stream_xor_and <= 8'hff;
+                            diag_tx_eye_bad_data_bit <= 8'd0;
+                            diag_tx_eye_dq <= 8'd0;
+                            diag_tx_eye_sample <= 7'd0;
+                            diag_tx_eye_pass_map <= 65'd0;
+                            diag_tx_eye_pass_count <= 7'd0;
+                            diag_tx_eye_baseline_tap <= 9'd0;
+                            diag_tx_eye_baseline_valid <= 1'b0;
+                            diag_tx_eye_first_pass <= 9'd0;
+                            diag_tx_eye_last_pass <= 9'd0;
+                            diag_tx_eye_pass_found <= 1'b0;
+                            diag_tx_eye_bad_seen <= 1'b0;
+                            diag_tx_eye_writes_accepted <=
+                                {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                            diag_tx_eye_reads_issued <=
+                                {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                            diag_tx_eye_reads_returned <=
+                                {BIST_TX_EYE_COUNT_BITS{1'b0}};
+                            diag_tx_eye_base_wb_addr <=
+                                {WB_ADDR_BITS{1'b0}};
+                            diag_tx_eye_restore_pending <= 1'b0;
+                            diag_tx_eye_update_error <= 1'b0;
+                            diag_tx_eye_done <= 1'b0;
+                            diag_tx_eye_scan_index <= 8'd0;
+                            diag_tx_eye_scan_run <= 7'd0;
+                            diag_tx_eye_best_run <= 7'd0;
+                            diag_tx_eye_best_end <= 7'd0;
+                            diag_tx_eye_center_tap <= 9'd0;
+                            o_phy_tx_diag_req <= 1'b0;
+                            o_phy_tx_diag_dq <= 8'd0;
+                            o_phy_tx_diag_tap <= 9'd0;
+                            last_good_valid <= 1'b0;
                             o_wb_cyc      <= 1'b1;
                             o_wb_stb      <= 1'b1;
                             o_wb_we       <= 1'b1;
@@ -660,11 +1871,13 @@ module ddr4_prober #(
 
         assign o_bist_busy = (bist_state != BIST_IDLE) && (bist_state != BIST_DONE);
         assign bist_pass   = (bist_state == BIST_DONE) && !bist_fail_sticky;
+        assign bist_diag_active = diag_pending || diag_running;
 
     end else begin : gen_no_bist
 
         assign o_bist_busy = 1'b0;
         assign bist_pass   = 1'b0;
+        assign bist_diag_active = 1'b0;
 
         always @(posedge i_clk) begin
             bist_state           <= BIST_IDLE;
@@ -683,6 +1896,9 @@ module ddr4_prober #(
             o_wb_addr            <= {WB_ADDR_BITS{1'b0}};
             o_wb_data            <= {WB_DATA_BITS{1'b0}};
             o_wb_sel             <= {WB_SEL_BITS{1'b0}};
+            o_phy_tx_diag_req    <= 1'b0;
+            o_phy_tx_diag_dq     <= 8'd0;
+            o_phy_tx_diag_tap    <= 9'd0;
         end
 
     end endgenerate
@@ -849,7 +2065,9 @@ module ddr4_prober #(
                     o_init_done <= 1'b1;
                 if (i_calib_complete && BIST_MODE != 0 && bist_pass)
                     o_init_done <= 1'b1;
-                if (i_calib_complete && BIST_MODE != 0 && bist_fail_sticky)
+                if (i_calib_complete && BIST_MODE != 0 &&
+                    bist_fail_sticky &&
+                    !(BIST_REREAD_DIAG && bist_diag_active))
                     o_init_failed <= 1'b1;
             end
         end

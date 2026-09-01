@@ -143,6 +143,16 @@ module ddr4_phy_native #(
     output wire                             o_dfi_rdlvl_req,
     output wire                             o_dfi_rdlvl_gate_req,
     output wire                             o_dfi_wrlvl_req,
+    // Board-bring-up TX-eye diagnostic.  The request is accepted only after
+    // normal calibration, while the controller/prober has drained all memory
+    // traffic.  DQ is a physical bit index across all byte lanes.
+    (* mark_debug = "true" *) input  wire                             i_tx_diag_req,
+    (* mark_debug = "true" *) input  wire [7:0]                       i_tx_diag_dq,
+    (* mark_debug = "true" *) input  wire [8:0]                       i_tx_diag_tap,
+    (* mark_debug = "true" *) output reg                              o_tx_diag_ack,
+    (* mark_debug = "true" *) output reg                              o_tx_diag_error,
+    (* mark_debug = "true" *) output wire [8:0]                       o_tx_diag_current_tap,
+    (* mark_debug = "true" *) output reg  [8:0]                       o_tx_diag_previous_tap,
     // DDR4 SDRAM I/O
     output wire                             o_ddr4_ck_p,
     output wire                             o_ddr4_ck_n,
@@ -988,6 +998,16 @@ module ddr4_phy_native #(
     (* mark_debug = "true" *) reg [8:0] odelay_dqs_cntvalue;
     (* mark_debug = "true" *) reg [BYTE_LANES-1:0] odelay_dqs_load;
     wire [8:0] odelay_dqs_cntvalueout [0:BYTE_LANES-1];
+    // Per-bit DQ TX delay controls used only by the post-failure write-eye
+    // diagnostic.  These controls remain idle and EN_VTC remains High during
+    // every normal calibration and application transaction.
+    (* mark_debug = "true" *) reg [8:0] tx_dq_cntvaluein;
+    (* mark_debug = "true" *) reg [TOTAL_DQ-1:0] tx_dq_load;
+    (* mark_debug = "true" *) reg [TOTAL_DQ-1:0] tx_dq_ce;
+    (* mark_debug = "true" *) reg tx_dq_inc;
+    (* mark_debug = "true" *) reg tx_dq_en_vtc;
+    wire [DQ_BITS*9-1:0] tx_dq_cntvalueout [0:BYTE_LANES-1];
+    wire [TOTAL_DQ*9-1:0] tx_dq_cntvalueout_flat;
     (* mark_debug = "true" *) wire [8:0]
         rx_max_relative_offset [0:BYTE_LANES-1];
 
@@ -1000,9 +1020,25 @@ module ddr4_phy_native #(
     // presented to RXTX_BITSLICE. Preserve the DFI bundle at that boundary
     // while the exact native serializer phase is selected below.
     wire wrdata_en_any = |i_dfi_wrdata_en;
+    reg [DFI_DATA_WIDTH*4-1:0] tx_wrdata_early;
     reg [DFI_DATA_WIDTH*4-1:0] tx_wrdata_pipe0;
+    reg [DM_PER_PHASE*4-1:0]   tx_wrmask_early;
     reg [DM_PER_PHASE*4-1:0]   tx_wrmask_pipe0;
     reg [2:0]                  wrdata_en_shift;
+    // The first BL8 after an idle interval has an otherwise unused native
+    // serializer word immediately before its payload.  Present the captured
+    // DFI word in that slot as well as in the payload slot so DQ/DM are
+    // already stable when TBYTE opens the DQS preamble.  This is essential at
+    // high data rates: without the predrive, unshifted DQ becomes valid only
+    // one quarter-tCK before the first 90-degree DQS edge.  Do not predrive
+    // later words in a contiguous run; their preceding serializer word is the
+    // previous BL8 payload and must retain full-rate write throughput.
+    (* mark_debug = "true" *) wire tx_predrive_first =
+        wrdata_en_shift[0] && !wrdata_en_shift[1];
+    wire [DFI_DATA_WIDTH*4-1:0] tx_wrdata_native =
+        tx_predrive_first ? tx_wrdata_early : tx_wrdata_pipe0;
+    wire [DM_PER_PHASE*4-1:0] tx_wrmask_native =
+        tx_predrive_first ? tx_wrmask_early : tx_wrmask_pipe0;
     // Keep the physical write-window qualifier as a named net.  The AXKU3
     // debug constraint probes this boundary directly to distinguish write
     // turnaround from receive-gate activity; preserving it has no functional
@@ -1046,6 +1082,38 @@ module ddr4_phy_native #(
     (* mark_debug = "true" *) reg [BYTE_LANES-1:0] native_riu_sel;
     wire [15:0] native_riu_rd_data [0:BYTE_LANES-1];
     (* mark_debug = "true" *) wire [BYTE_LANES-1:0] native_riu_valid;
+
+    // Post-failure TX-eye diagnostics share the same physical RIU ingress as
+    // calibration.  The override is asserted only after BIST has stopped all
+    // memory traffic; normal gate/eye/write-level training retains exclusive
+    // ownership of native_riu_* above.  Keeping arbitration at this boundary
+    // also preserves the byte-local RIU registers required by implementation.
+    localparam integer TX_DIAG_LANE_W =
+        $clog2(BYTE_LANES > 1 ? BYTE_LANES : 2);
+    (* mark_debug = "true" *) reg tx_diag_riu_override;
+    (* mark_debug = "true" *) reg [5:0] tx_diag_riu_addr;
+    (* mark_debug = "true" *) reg [15:0] tx_diag_riu_wr_data;
+    (* mark_debug = "true" *) reg tx_diag_riu_wr_en;
+    (* mark_debug = "true" *) reg [BYTE_LANES-1:0]
+        tx_diag_riu_lower_sel;
+    (* mark_debug = "true" *) reg [BYTE_LANES-1:0]
+        tx_diag_riu_upper_sel;
+
+    wire [5:0] byte_riu_addr = tx_diag_riu_override ?
+        tx_diag_riu_addr : native_riu_addr;
+    wire [15:0] byte_riu_wr_data = tx_diag_riu_override ?
+        tx_diag_riu_wr_data : native_riu_wr_data;
+    wire byte_riu_wr_en = tx_diag_riu_override ?
+        tx_diag_riu_wr_en : native_riu_wr_en;
+    wire [BYTE_LANES-1:0] byte_riu_lower_sel =
+        tx_diag_riu_override ? tx_diag_riu_lower_sel :
+                               native_riu_lower_sel;
+    wire [BYTE_LANES-1:0] byte_riu_upper_sel =
+        tx_diag_riu_override ? tx_diag_riu_upper_sel : native_riu_sel;
+    // RIU output-delay updates must pause BITSLICE_CONTROL VT tracking.  The
+    // diagnostic FSM holds this Low for the UG571 ten-clock guard intervals
+    // on both sides of every reversible update.
+    wire byte_bsc_en_vtc = bsc_en_vtc & ~tx_diag_riu_override;
 
     // BITSLICE_CONTROL RIU registers used by read-gate calibration.
     localparam [5:0] RIU_ADDR_NIBBLE_CTRL0 = 6'h00;
@@ -1581,7 +1649,7 @@ module ddr4_phy_native #(
                 .i_rx_fifo_rst     (rx_fifo_reset_active),
                 .o_dly_rdy         (byte_dly_rdy[lane]),
                 .o_vtc_rdy         (byte_vtc_rdy[lane]),
-                .i_bsc_en_vtc      (bsc_en_vtc),
+                .i_bsc_en_vtc      (byte_bsc_en_vtc),
                 .i_bitslice_en_vtc (bitslice_en_vtc),
                 .i_tx_dq_data      (tx_dq_data[lane]),
                 .i_tx_dqs_data     (lane_dqs_pattern),
@@ -1604,16 +1672,16 @@ module ddr4_phy_native #(
                 .o_dbg_nibble_ready(dbg_byte_nibble_ready[
                                      lane*4 +: 4]),
                 .i_fifo_rd_en      (fifo_rd_en_drive[lane]),
-                .i_riu_addr        (native_riu_addr),
-                .i_riu_wr_data     (native_riu_wr_data),
+                .i_riu_addr        (byte_riu_addr),
+                .i_riu_wr_data     (byte_riu_wr_data),
                 // native_riu_sel is a byte-lane transaction mask.  Each
                 // selected byte targets only its DQS-owning upper nibble;
                 // the lower nibble consumes the forwarded trained DQS clocks.
-                .i_riu_wr_en       (native_riu_wr_en &
-                                    (native_riu_lower_sel[lane] |
-                                     native_riu_sel[lane])),
-                .i_riu_lower_sel   (native_riu_lower_sel[lane]),
-                .i_riu_upper_sel   (native_riu_sel[lane]),
+                .i_riu_wr_en       (byte_riu_wr_en &
+                                    (byte_riu_lower_sel[lane] |
+                                     byte_riu_upper_sel[lane])),
+                .i_riu_lower_sel   (byte_riu_lower_sel[lane]),
+                .i_riu_upper_sel   (byte_riu_upper_sel[lane]),
                 .o_riu_rd_data     (native_riu_rd_data[lane]),
                 .o_riu_valid       (native_riu_valid[lane]),
                 .i_rx_cntvaluein   (idelay_cntvalue),
@@ -1625,13 +1693,398 @@ module ddr4_phy_native #(
                 .i_tx_dqs_cntvaluein(odelay_dqs_cntvalue),
                 .i_tx_dqs_load     (odelay_dqs_load[lane]),
                 .o_tx_dqs_cntvalueout(odelay_dqs_cntvalueout[lane]),
+                .i_tx_dq_cntvaluein(tx_dq_cntvaluein),
+                .i_tx_dq_load      (tx_dq_load[
+                                     lane*DQ_BITS +: DQ_BITS]),
+                .i_tx_dq_ce        (tx_dq_ce[
+                                     lane*DQ_BITS +: DQ_BITS]),
+                .i_tx_dq_inc       (tx_dq_inc),
+                .i_tx_dq_en_vtc    (tx_dq_en_vtc),
+                .o_tx_dq_cntvalueout(tx_dq_cntvalueout[lane]),
                 .io_ddr4_dq        (io_ddr4_dq[lane*DQ_BITS +: DQ_BITS]),
                 .io_ddr4_dqs_p     (io_ddr4_dqs_p[lane]),
                 .io_ddr4_dqs_n     (io_ddr4_dqs_n[lane]),
                 .o_ddr4_dm_n       (o_ddr4_dm_n[lane])
             );
+            assign tx_dq_cntvalueout_flat[
+                lane*DQ_BITS*9 +: DQ_BITS*9] = tx_dq_cntvalueout[lane];
         end
     endgenerate
+
+    // -----------------------------------------------------------------
+    // Post-failure per-bit TX-delay controller
+    // -----------------------------------------------------------------
+    // MIG leaves the individual RXTX_BITSLICE TX_CE/TX_LOAD ports idle and
+    // adjusts native output delays through BITSLICE_CONTROL's RIU.  UG571
+    // defines ODELAY00 at 0x0A (tristate) and ODELAY01..07 at 0x0B..0x11
+    // (physical bit-slice positions 0..6).  Temporarily set
+    // NIBBLE_CTRL0.DIS_DYN_MODE_TX, load the selected ODELAYxx register, and
+    // verify its RIU readback.  Once software-directed TX centering begins,
+    // retain DIS_DYN_MODE_TX for the selected nibble: UG571 defines that bit
+    // as the ownership switch that enables transmit delay-line RIU updates.
+    // Clearing it after each write returns the delay to dynamic MIG/BISC
+    // ownership and can silently discard the measured setting before BIST
+    // validation.  EN_VTC is still re-enabled after each transaction, so the
+    // TIME-format delay continues voltage/temperature compensation.
+    localparam [4:0] TX_DIAG_IDLE              = 5'd0,
+                     TX_DIAG_WAIT_VTC_OFF      = 5'd1,
+                     TX_DIAG_READ_CTRL         = 5'd2,
+                     TX_DIAG_WAIT_CTRL_READ    = 5'd3,
+                     TX_DIAG_WRITE_CTRL        = 5'd4,
+                     TX_DIAG_WAIT_CTRL_WRITE   = 5'd5,
+                     TX_DIAG_READ_DELAY        = 5'd6,
+                     TX_DIAG_WAIT_DELAY_READ   = 5'd7,
+                     TX_DIAG_WRITE_DELAY       = 5'd8,
+                     TX_DIAG_WAIT_DELAY_WRITE  = 5'd9,
+                     TX_DIAG_RESTORE_CTRL      = 5'd10,
+                     TX_DIAG_WAIT_CTRL_RESTORE = 5'd11,
+                     TX_DIAG_WAIT_POST         = 5'd12,
+                     TX_DIAG_WAIT_VTC_ON       = 5'd13,
+                     TX_DIAG_WAIT_REQ_LOW      = 5'd14;
+    // UG571 permits the internal BISC sequencer to defer an RIU transaction
+    // by lowering RIU_VALID.  Normal output-delay registers complete in two
+    // RIU clocks, but wait substantially longer here so a collision can
+    // retire without turning a harmless maintenance access into a false
+    // diagnostic failure.
+    localparam [5:0] TX_DIAG_RIU_TIMEOUT = 6'd63;
+    (* mark_debug = "true" *) reg [4:0] tx_diag_state;
+    (* mark_debug = "true" *) reg [7:0] tx_diag_dq_q;
+    (* mark_debug = "true" *) reg [8:0] tx_diag_target_q;
+    (* mark_debug = "true" *) reg [5:0] tx_diag_wait_q;
+    (* mark_debug = "true" *) reg [TX_DIAG_LANE_W-1:0]
+        tx_diag_lane_q;
+    (* mark_debug = "true" *) reg [3:0] tx_diag_map_q;
+    (* mark_debug = "true" *) reg [15:0] tx_diag_ctrl_q;
+    (* mark_debug = "true" *) reg tx_diag_ctrl_valid_q;
+    (* mark_debug = "true" *) reg [8:0] tx_diag_current_tap_q;
+    (* mark_debug = "true" *) reg [15:0] tx_diag_riu_readback_q;
+    (* mark_debug = "true" *) wire tx_diag_ce_any = |tx_dq_ce;
+
+    wire tx_diag_input_valid = (i_tx_diag_dq < TOTAL_DQ);
+    wire tx_diag_riu_selected_valid =
+        native_riu_valid[tx_diag_lane_q];
+    wire [15:0] tx_diag_riu_selected_data =
+        native_riu_rd_data[tx_diag_lane_q];
+    assign o_tx_diag_current_tap = tx_diag_current_tap_q;
+
+    function [3:0] tx_diag_map_entry;
+        input integer logical_dq;
+        integer byte_dq;
+        begin
+            byte_dq = logical_dq % DQ_BITS;
+            if (&DQ_PIN_MAP) begin
+                tx_diag_map_entry[3] = (byte_dq >= 4);
+                tx_diag_map_entry[2:0] = (byte_dq % 4) + 2;
+            end else begin
+                tx_diag_map_entry = DQ_PIN_MAP[logical_dq*4 +: 4];
+            end
+        end
+    endfunction
+
+    always @(posedge i_controller_clk) begin
+        if (sync_rst) begin
+            tx_diag_state            <= TX_DIAG_IDLE;
+            tx_diag_dq_q             <= 8'd0;
+            tx_diag_target_q         <= 9'd0;
+            tx_diag_wait_q           <= 6'd0;
+            tx_diag_lane_q           <= {TX_DIAG_LANE_W{1'b0}};
+            tx_diag_map_q            <= 4'd0;
+            tx_diag_ctrl_q           <= 16'd0;
+            tx_diag_ctrl_valid_q     <= 1'b0;
+            tx_diag_current_tap_q    <= 9'd0;
+            tx_diag_riu_readback_q   <= 16'd0;
+            tx_diag_riu_override     <= 1'b0;
+            tx_diag_riu_addr         <= 6'd0;
+            tx_diag_riu_wr_data      <= 16'd0;
+            tx_diag_riu_wr_en        <= 1'b0;
+            tx_diag_riu_lower_sel    <= {BYTE_LANES{1'b0}};
+            tx_diag_riu_upper_sel    <= {BYTE_LANES{1'b0}};
+            tx_dq_cntvaluein         <= 9'd0;
+            tx_dq_load               <= {TOTAL_DQ{1'b0}};
+            tx_dq_ce                 <= {TOTAL_DQ{1'b0}};
+            tx_dq_inc                <= 1'b0;
+            tx_dq_en_vtc             <= 1'b1;
+            o_tx_diag_ack            <= 1'b0;
+            o_tx_diag_error          <= 1'b0;
+            o_tx_diag_previous_tap   <= 9'd0;
+        end else begin
+            // RIU write-enable, obsolete direct-delay controls, and ACK are
+            // one-controller-cycle pulses unless a state asserts them below.
+            tx_diag_riu_wr_en <= 1'b0;
+            tx_dq_load    <= {TOTAL_DQ{1'b0}};
+            tx_dq_ce      <= {TOTAL_DQ{1'b0}};
+            tx_dq_inc     <= 1'b0;
+            tx_dq_en_vtc  <= 1'b1;
+            o_tx_diag_ack <= 1'b0;
+
+            case (tx_diag_state)
+                TX_DIAG_IDLE: begin
+                    tx_diag_riu_override <= 1'b0;
+                    tx_diag_riu_lower_sel <= {BYTE_LANES{1'b0}};
+                    tx_diag_riu_upper_sel <= {BYTE_LANES{1'b0}};
+                    if (i_tx_diag_req) begin
+                        o_tx_diag_error <= 1'b0;
+                        if (!rst_init_complete || !tx_diag_input_valid) begin
+                            o_tx_diag_error <= 1'b1;
+                            o_tx_diag_ack <= 1'b1;
+                            tx_diag_state <= TX_DIAG_WAIT_REQ_LOW;
+                        end else begin
+                            tx_diag_dq_q <= i_tx_diag_dq;
+                            tx_diag_target_q <= i_tx_diag_tap;
+                            tx_diag_lane_q <= i_tx_diag_dq / DQ_BITS;
+                            tx_diag_map_q <=
+                                tx_diag_map_entry(i_tx_diag_dq);
+                            tx_diag_ctrl_valid_q <= 1'b0;
+                            tx_diag_riu_override <= 1'b1;
+                            tx_diag_wait_q <= 6'd0;
+                            tx_diag_state <= TX_DIAG_WAIT_VTC_OFF;
+                        end
+                    end
+                end
+
+                TX_DIAG_WAIT_VTC_OFF: begin
+                    // Derive the byte/nibble selection and ODELAY register
+                    // from the latched logical DQ after the request boundary.
+                    tx_diag_riu_addr <= 6'h0b + tx_diag_map_q[2:0];
+                    tx_diag_riu_lower_sel <= {BYTE_LANES{1'b0}};
+                    tx_diag_riu_upper_sel <= {BYTE_LANES{1'b0}};
+                    if (tx_diag_map_q[3])
+                        tx_diag_riu_upper_sel[tx_diag_lane_q] <= 1'b1;
+                    else
+                        tx_diag_riu_lower_sel[tx_diag_lane_q] <= 1'b1;
+                    if (tx_diag_wait_q < 6'd9) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else begin
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_READ_CTRL;
+                    end
+                end
+
+                TX_DIAG_READ_CTRL: begin
+                    tx_diag_riu_addr <= RIU_ADDR_NIBBLE_CTRL0;
+                    tx_diag_wait_q <= 6'd0;
+                    tx_diag_state <= TX_DIAG_WAIT_CTRL_READ;
+                end
+
+                TX_DIAG_WAIT_CTRL_READ: begin
+                    if (tx_diag_wait_q < 6'd3) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else if (tx_diag_riu_selected_valid) begin
+                        tx_diag_ctrl_q <= tx_diag_riu_selected_data;
+                        tx_diag_ctrl_valid_q <= 1'b1;
+                        tx_diag_riu_readback_q <=
+                            tx_diag_riu_selected_data;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_WRITE_CTRL;
+                    end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
+                        // BISC owns the RIU temporarily.  Keep the address
+                        // and nibble selection stable until it releases it.
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else begin
+                        o_tx_diag_error <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_WAIT_POST;
+                    end
+                end
+
+                TX_DIAG_WRITE_CTRL: begin
+                    // Bit 10 disables fabric dynamic mode and transfers
+                    // output-delay ownership to the selected nibble's RIU.
+                    tx_diag_riu_addr <= RIU_ADDR_NIBBLE_CTRL0;
+                    tx_diag_riu_wr_data <= tx_diag_ctrl_q | 16'h0400;
+                    // Interconnect writes are legal only while RIU_VALID is
+                    // High.  A collision after this accepted cycle is still
+                    // allowed; WAIT_CTRL_WRITE polls the committed value.
+                    if (tx_diag_riu_selected_valid) begin
+                        tx_diag_riu_wr_en <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_WAIT_CTRL_WRITE;
+                    end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else begin
+                        o_tx_diag_error <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_WAIT_POST;
+                    end
+                end
+
+                TX_DIAG_WAIT_CTRL_WRITE: begin
+                    if (tx_diag_wait_q < 6'd3) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else if (tx_diag_riu_selected_valid &&
+                                 tx_diag_riu_selected_data[10]) begin
+                        tx_diag_riu_readback_q <=
+                            tx_diag_riu_selected_data;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_READ_DELAY;
+                    end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
+                        // RIU writes are shadowed and can be deferred by
+                        // BISC.  Do not mistake a valid-but-stale readback for
+                        // a failed write; poll until ownership is visible.
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else begin
+                        tx_diag_riu_readback_q <=
+                            tx_diag_riu_selected_data;
+                        o_tx_diag_error <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_RESTORE_CTRL;
+                    end
+                end
+
+                TX_DIAG_READ_DELAY: begin
+                    tx_diag_riu_addr <= 6'h0b + tx_diag_map_q[2:0];
+                    tx_diag_wait_q <= 6'd0;
+                    tx_diag_state <= TX_DIAG_WAIT_DELAY_READ;
+                end
+
+                TX_DIAG_WAIT_DELAY_READ: begin
+                    if (tx_diag_wait_q < 6'd3) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else if (tx_diag_riu_selected_valid) begin
+                        tx_diag_riu_readback_q <=
+                            tx_diag_riu_selected_data;
+                        tx_diag_current_tap_q <=
+                            tx_diag_riu_selected_data[8:0];
+                        o_tx_diag_previous_tap <=
+                            tx_diag_riu_selected_data[8:0];
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <=
+                            (tx_diag_riu_selected_data[8:0] ==
+                             tx_diag_target_q) ?
+                            TX_DIAG_RESTORE_CTRL : TX_DIAG_WRITE_DELAY;
+                    end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else begin
+                        o_tx_diag_error <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_RESTORE_CTRL;
+                    end
+                end
+
+                TX_DIAG_WRITE_DELAY: begin
+                    // INC=DEC=0 is the UG571 absolute-load operation.
+                    tx_diag_riu_addr <= 6'h0b + tx_diag_map_q[2:0];
+                    tx_diag_riu_wr_data <= {7'd0, tx_diag_target_q};
+                    if (tx_diag_riu_selected_valid) begin
+                        tx_diag_riu_wr_en <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_WAIT_DELAY_WRITE;
+                    end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else begin
+                        o_tx_diag_error <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_RESTORE_CTRL;
+                    end
+                end
+
+                TX_DIAG_WAIT_DELAY_WRITE: begin
+                    if (tx_diag_wait_q < 6'd3) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else if (tx_diag_riu_selected_valid &&
+                                 (tx_diag_riu_selected_data[8:0] ==
+                                  tx_diag_target_q)) begin
+                        tx_diag_riu_readback_q <=
+                            tx_diag_riu_selected_data;
+                        tx_diag_current_tap_q <= tx_diag_target_q;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_RESTORE_CTRL;
+                    end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
+                        // A valid stale value can precede the deferred write;
+                        // continue polling until the requested tap commits.
+                        tx_diag_riu_readback_q <=
+                            tx_diag_riu_selected_data;
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else begin
+                        tx_diag_riu_readback_q <=
+                            tx_diag_riu_selected_data;
+                        o_tx_diag_error <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_RESTORE_CTRL;
+                    end
+                end
+
+                TX_DIAG_RESTORE_CTRL: begin
+                    if (tx_diag_ctrl_valid_q) begin
+                        tx_diag_riu_addr <= RIU_ADDR_NIBBLE_CTRL0;
+                        tx_diag_riu_wr_data <= tx_diag_ctrl_q | 16'h0400;
+                        if (tx_diag_riu_selected_valid) begin
+                            tx_diag_riu_wr_en <= 1'b1;
+                            tx_diag_wait_q <= 6'd0;
+                            tx_diag_state <= TX_DIAG_WAIT_CTRL_RESTORE;
+                        end else if (tx_diag_wait_q <
+                                     TX_DIAG_RIU_TIMEOUT) begin
+                            tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                        end else begin
+                            o_tx_diag_error <= 1'b1;
+                            tx_diag_wait_q <= 6'd0;
+                            tx_diag_state <= TX_DIAG_WAIT_POST;
+                        end
+                    end else begin
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_WAIT_POST;
+                    end
+                end
+
+                TX_DIAG_WAIT_CTRL_RESTORE: begin
+                    if (tx_diag_wait_q < 6'd3) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else if (tx_diag_riu_selected_valid &&
+                                 (tx_diag_riu_selected_data ==
+                                  (tx_diag_ctrl_q | 16'h0400))) begin
+                        tx_diag_riu_readback_q <=
+                            tx_diag_riu_selected_data;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_WAIT_POST;
+                    end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else begin
+                        tx_diag_riu_readback_q <=
+                            tx_diag_riu_selected_data;
+                        o_tx_diag_error <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_WAIT_POST;
+                    end
+                end
+
+                TX_DIAG_WAIT_POST: begin
+                    if (tx_diag_wait_q < 6'd9) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else begin
+                        // Releasing the override restores the calibrated RIU
+                        // owner and raises BITSLICE_CONTROL EN_VTC.
+                        tx_diag_riu_override <= 1'b0;
+                        tx_diag_riu_lower_sel <= {BYTE_LANES{1'b0}};
+                        tx_diag_riu_upper_sel <= {BYTE_LANES{1'b0}};
+                        tx_diag_wait_q <= 6'd0;
+                        tx_diag_state <= TX_DIAG_WAIT_VTC_ON;
+                    end
+                end
+
+                TX_DIAG_WAIT_VTC_ON: begin
+                    if (tx_diag_wait_q < 6'd9) begin
+                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
+                    end else begin
+                        o_tx_diag_ack <= 1'b1;
+                        tx_diag_state <= TX_DIAG_WAIT_REQ_LOW;
+                    end
+                end
+
+                TX_DIAG_WAIT_REQ_LOW: begin
+                    if (!i_tx_diag_req)
+                        tx_diag_state <= TX_DIAG_IDLE;
+                end
+
+                default: begin
+                    tx_diag_riu_override <= 1'b0;
+                    tx_diag_riu_lower_sel <= {BYTE_LANES{1'b0}};
+                    tx_diag_riu_upper_sel <= {BYTE_LANES{1'b0}};
+                    o_tx_diag_error <= 1'b1;
+                    tx_diag_state <= TX_DIAG_IDLE;
+                end
+            endcase
+        end
+    end
 
     // -----------------------------------------------------------------
     // FIFO Read Enable
@@ -2491,12 +2944,23 @@ module ddr4_phy_native #(
         end
     end
 
-    // RXTX_BITSLICE exposes the current asynchronous-FIFO head before the
-    // rising DIV_CLK edge that consumes FIFO_RD_EN.  Capture that pre-advance
-    // Q value on the preceding falling edge.  Waiting until the following
-    // falling edge samples the next (often stale) FIFO location instead of the
-    // reserved BL8.  The direct EMPTY qualification prevents a request formed
-    // one cycle earlier from advancing through pointer equality.
+    // RXTX_BITSLICE is first-word-present: app_fifo_rd_en_q identifies the
+    // current head that will be consumed at the *next* rising DIV_CLK edge.
+    // Retain that head on the intervening falling edge.  The request register
+    // was formed only after every bit reported nonempty, and no other reader
+    // owns the FIFO in application mode, so the reservation cannot disappear
+    // before it is consumed.  Do not recompute the capture enable from
+    // FIFO_EMPTY on this half-cycle.  Besides losing the final word when EMPTY
+    // asserts after a legal pop, that path crosses the FIFO_EMPTY decode and a
+    // 256-register CE fanout in half a controller clock.  At DDR4-1600 hardware
+    // showed a single sample bit retaining the preceding word while all other
+    // bits updated, precisely the failure mode of that marginal distributed
+    // CE path.
+    //
+    // The Q-data bank is sampled unconditionally.  Only the compact valid bit
+    // is qualified, so the direct BITSLICE-Q-to-fabric-register path retains
+    // the available half-cycle while no FIFO status/control decode drives the
+    // data-register clock enables.
     integer app_sample_lane, app_sample_bit;
     integer app_sample_phase, app_sample_idx;
     always @(negedge i_controller_clk) begin
@@ -2511,34 +2975,30 @@ module ddr4_phy_native #(
             end
         end else begin
             app_fifo_rd_en_sample_q <= app_fifo_rd_en_q;
-            app_fifo_sample_valid_q <= 1'b0;
-            if (app_fifo_accept_enabled && app_fifo_advance &&
-                app_pending_available) begin
-                app_fifo_sample_valid_q <= 1'b1;
-                for (app_sample_lane = 0;
-                     app_sample_lane < BYTE_LANES;
-                     app_sample_lane = app_sample_lane + 1) begin
-                    for (app_sample_bit = 0;
-                         app_sample_bit < DQ_BITS;
-                         app_sample_bit = app_sample_bit + 1) begin
-                        app_sample_idx = app_sample_lane * DQ_BITS +
-                                         app_sample_bit;
-                        app_fifo_sample_word_q[app_sample_idx] <=
-                            aligned_dq[app_sample_idx];
-                        for (app_sample_phase = 0;
-                             app_sample_phase < SERDES_RATIO;
-                             app_sample_phase = app_sample_phase + 1) begin
-                            app_fifo_sample_data_q[
-                                app_sample_phase*DFI_DATA_WIDTH +
-                                app_sample_idx
-                            ] <= aligned_dq[app_sample_idx][
-                                2*app_sample_phase];
-                            app_fifo_sample_data_q[
-                                app_sample_phase*DFI_DATA_WIDTH +
-                                TOTAL_DQ + app_sample_idx
-                            ] <= aligned_dq[app_sample_idx][
-                                2*app_sample_phase + 1];
-                        end
+            app_fifo_sample_valid_q <= app_fifo_rd_en_q;
+            for (app_sample_lane = 0;
+                 app_sample_lane < BYTE_LANES;
+                 app_sample_lane = app_sample_lane + 1) begin
+                for (app_sample_bit = 0;
+                     app_sample_bit < DQ_BITS;
+                     app_sample_bit = app_sample_bit + 1) begin
+                    app_sample_idx = app_sample_lane * DQ_BITS +
+                                     app_sample_bit;
+                    app_fifo_sample_word_q[app_sample_idx] <=
+                        aligned_dq[app_sample_idx];
+                    for (app_sample_phase = 0;
+                         app_sample_phase < SERDES_RATIO;
+                         app_sample_phase = app_sample_phase + 1) begin
+                        app_fifo_sample_data_q[
+                            app_sample_phase*DFI_DATA_WIDTH +
+                            app_sample_idx
+                        ] <= aligned_dq[app_sample_idx][
+                            2*app_sample_phase];
+                        app_fifo_sample_data_q[
+                            app_sample_phase*DFI_DATA_WIDTH +
+                            TOTAL_DQ + app_sample_idx
+                        ] <= aligned_dq[app_sample_idx][
+                            2*app_sample_phase + 1];
                     end
                 end
             end
@@ -2581,11 +3041,11 @@ module ddr4_phy_native #(
     // Write Tri-State Control
     //
     // wrdata_en_any = OR of all 4 DFI phase enables.
-    // The delayed enable aligns ownership with tx_wrdata_pipe0 and retains it
-    // through the serialized postamble word.  Do not retain ownership for the
-    // following all-zero word: on a legal write-to-read turnaround that extra
-    // controller cycle overlaps the first READ's four-tCK PHY_RDEN mask and
-    // suppresses its leading phase, clipping the returned BL8 FIFO word.
+    // Native DQ/DQS data is retained for two DIV_CLK words.  The first word
+    // gives the 90-degree TX_BITSLICE_TRI path time to serialize the one-tCK
+    // preamble, and the second aligns the complete TBYTE ownership word with
+    // the final DQ/DQS payload.  ddr4_top advertises this as tphy_wrlat=2 so
+    // the physical first data UI remains exactly CWL clocks after WRITE.
     //
     // TBYTE_IN carries one active-high byte-enable bit per DFI phase.
     // BITSLICE_CONTROL serialises these controls alongside the matching 8:1
@@ -2593,19 +3053,50 @@ module ddr4_phy_native #(
     // -----------------------------------------------------------------
     always @(posedge i_controller_clk) begin
         if (sync_rst) begin
+            tx_wrdata_early <= {(DFI_DATA_WIDTH*4){1'b0}};
             tx_wrdata_pipe0 <= {(DFI_DATA_WIDTH*4){1'b0}};
+            tx_wrmask_early <= {(DM_PER_PHASE*4){1'b0}};
             tx_wrmask_pipe0 <= {(DM_PER_PHASE*4){1'b0}};
             wrdata_en_shift <= 3'b000;
         end else begin
-            tx_wrdata_pipe0 <= i_dfi_wrdata;
-            tx_wrmask_pipe0 <= i_dfi_wrdata_mask;
+            tx_wrdata_early <= i_dfi_wrdata;
+            tx_wrdata_pipe0 <= tx_wrdata_early;
+            tx_wrmask_early <= i_dfi_wrdata_mask;
+            tx_wrmask_pipe0 <= tx_wrmask_early;
             wrdata_en_shift <= {wrdata_en_shift[1:0], wrdata_en_any};
         end
     end
 
-    assign output_enable = wrdata_en_any | wrdata_en_shift[0] |
-                           wrdata_en_shift[1];
-    wire [3:0] tx_tbyte_window = {4{output_enable}};
+    // The DQS transmitter owns one tCK before the BL8 payload, matching the
+    // programmed one-tCK write preamble, then all four phases of the payload
+    // word.  DQ takes ownership one additional tCK earlier.  That second
+    // predrive pair does not create a DRAM transfer because DQS remains Low;
+    // it only lets the bidirectional DQ pads leave High-Z and settle before
+    // the first sampling edge.  This is especially important at higher data
+    // rates, where pad-enable skew can otherwise leave the phase-0 falling
+    // UI at the previous bus value even though the serializer data was loaded
+    // early.  Read-to-write turnaround already reserves substantially more
+    // than this extra tCK, so DQ never overlaps a DRAM read response.
+    //
+    // For contiguous writes, wrdata_en_any and wrdata_en_shift[0] overlap;
+    // the OR naturally keeps all four phases enabled between payload words.
+    wire [3:0] tx_dqs_tbyte_window =
+        ({4{wrdata_en_any}}      &
+`ifdef SIM_NATIVE_DIAG_TBYTE_LAST_PAIR
+         4'b0001) |
+`else
+         4'b1000) |
+`endif
+        ({4{wrdata_en_shift[0]}} & 4'b1111);
+    wire [3:0] tx_dq_tbyte_window =
+        ({4{wrdata_en_any}}      &
+`ifdef SIM_NATIVE_DIAG_TBYTE_LAST_PAIR
+         4'b0011) |
+`else
+         4'b1100) |
+`endif
+        ({4{wrdata_en_shift[0]}} & 4'b1111);
+    assign output_enable = |tx_dq_tbyte_window;
 
     // Keep the input buffer disabled through the complete serialized write,
     // including the native serializer latency and DQS postamble.  The
@@ -2655,7 +3146,7 @@ module ddr4_phy_native #(
     wire wl_bs_reset_window = 1'b0;
 `endif
     assign tbyte_dq = rst_init_complete ?
-        (wl_bs_reset_window ? 4'b0000 : tx_tbyte_window) :
+        (wl_bs_reset_window ? 4'b0000 : tx_dq_tbyte_window) :
         {4{rst_tbyte_en}};
 `ifdef SIM_NATIVE_DIAG_WL_TRAIN_NO_DQS
     // True mode-only A/B diagnostic: program and restore WL_TRAIN without
@@ -2665,7 +3156,7 @@ module ddr4_phy_native #(
     // activity can itself clock or reframe the receive path.  Production
     // behavior is unchanged when the diagnostic define is absent.
     assign tbyte_dqs = rst_init_complete ?
-        (wl_bs_reset_window ? 4'b0000 : tx_tbyte_window) :
+        (wl_bs_reset_window ? 4'b0000 : tx_dqs_tbyte_window) :
         {4{rst_tbyte_en}};
 `else
     assign tbyte_dqs = rst_init_complete ?
@@ -2674,7 +3165,7 @@ module ddr4_phy_native #(
 `ifdef SIM_NATIVE_DIAG_WL_DQS_RX_GUARD
            || (wl_dqs_release_guard != 0)
 `endif
-          ) ? 4'b1111 : tx_tbyte_window)) :
+          ) ? 4'b1111 : tx_dqs_tbyte_window)) :
         {4{rst_tbyte_en}};
 `endif
 
@@ -2682,7 +3173,8 @@ module ddr4_phy_native #(
     // DQS Pattern Generation
     //
     // TX_BITSLICE D[7:0] for DQS (8:1 DDR):
-    //   Normal write: 01_01_01_01 → continuous toggle
+    //   Normal write: 01_01_01_01 → one BL8 toggle word
+    //   Preamble:     00_00_00_00 → LOW during phase-3 ownership
     //   Write Leveling capture: 00_00_00_01 -> one rising edge
     //   Idle: 00_00_00_00
     // -----------------------------------------------------------------
@@ -2701,10 +3193,8 @@ module ddr4_phy_native #(
                 dqs_pattern = 8'b00_00_00_01;
             else
                 dqs_pattern = 8'b00_00_00_00;
-        end else if (wrdata_en_any || wrdata_en_shift[0]) begin
-            dqs_pattern = 8'b01_01_01_01;
         end else if (wrdata_en_shift[1]) begin
-            dqs_pattern = 8'b00_00_00_01;
+            dqs_pattern = 8'b01_01_01_01;
         end else begin
             dqs_pattern = 8'b00_00_00_00;
         end
@@ -2723,14 +3213,14 @@ module ddr4_phy_native #(
             for (wr_bit = 0; wr_bit < DQ_BITS; wr_bit = wr_bit + 1) begin : gen_wr_bit
                 localparam integer DQ_IDX = wr_lane * DQ_BITS + wr_bit;
                 assign tx_dq_data[wr_lane][wr_bit*8 +: 8] = {
-                    tx_wrdata_pipe0[3*DFI_DATA_WIDTH + TOTAL_DQ + DQ_IDX], // phase 3 fall
-                    tx_wrdata_pipe0[3*DFI_DATA_WIDTH + DQ_IDX],            // phase 3 rise
-                    tx_wrdata_pipe0[2*DFI_DATA_WIDTH + TOTAL_DQ + DQ_IDX], // phase 2 fall
-                    tx_wrdata_pipe0[2*DFI_DATA_WIDTH + DQ_IDX],            // phase 2 rise
-                    tx_wrdata_pipe0[1*DFI_DATA_WIDTH + TOTAL_DQ + DQ_IDX], // phase 1 fall
-                    tx_wrdata_pipe0[1*DFI_DATA_WIDTH + DQ_IDX],            // phase 1 rise
-                    tx_wrdata_pipe0[0*DFI_DATA_WIDTH + TOTAL_DQ + DQ_IDX], // phase 0 fall
-                    tx_wrdata_pipe0[0*DFI_DATA_WIDTH + DQ_IDX]             // phase 0 rise
+                    tx_wrdata_native[3*DFI_DATA_WIDTH + TOTAL_DQ + DQ_IDX], // phase 3 fall
+                    tx_wrdata_native[3*DFI_DATA_WIDTH + DQ_IDX],            // phase 3 rise
+                    tx_wrdata_native[2*DFI_DATA_WIDTH + TOTAL_DQ + DQ_IDX], // phase 2 fall
+                    tx_wrdata_native[2*DFI_DATA_WIDTH + DQ_IDX],            // phase 2 rise
+                    tx_wrdata_native[1*DFI_DATA_WIDTH + TOTAL_DQ + DQ_IDX], // phase 1 fall
+                    tx_wrdata_native[1*DFI_DATA_WIDTH + DQ_IDX],            // phase 1 rise
+                    tx_wrdata_native[0*DFI_DATA_WIDTH + TOTAL_DQ + DQ_IDX], // phase 0 fall
+                    tx_wrdata_native[0*DFI_DATA_WIDTH + DQ_IDX]             // phase 0 rise
                 };
             end
         end
@@ -2742,14 +3232,14 @@ module ddr4_phy_native #(
         for (dm_lane = 0; dm_lane < BYTE_LANES; dm_lane = dm_lane + 1) begin : gen_dm_pack
             if (DM_ENABLED) begin : dm_active
                 assign tx_dm_data[dm_lane] = {
-                    ~tx_wrmask_pipe0[3*DM_PER_PHASE + BYTE_LANES + dm_lane], // phase 3 fall
-                    ~tx_wrmask_pipe0[3*DM_PER_PHASE + dm_lane],              // phase 3 rise
-                    ~tx_wrmask_pipe0[2*DM_PER_PHASE + BYTE_LANES + dm_lane], // phase 2 fall
-                    ~tx_wrmask_pipe0[2*DM_PER_PHASE + dm_lane],              // phase 2 rise
-                    ~tx_wrmask_pipe0[1*DM_PER_PHASE + BYTE_LANES + dm_lane], // phase 1 fall
-                    ~tx_wrmask_pipe0[1*DM_PER_PHASE + dm_lane],              // phase 1 rise
-                    ~tx_wrmask_pipe0[0*DM_PER_PHASE + BYTE_LANES + dm_lane], // phase 0 fall
-                    ~tx_wrmask_pipe0[0*DM_PER_PHASE + dm_lane]               // phase 0 rise
+                    ~tx_wrmask_native[3*DM_PER_PHASE + BYTE_LANES + dm_lane], // phase 3 fall
+                    ~tx_wrmask_native[3*DM_PER_PHASE + dm_lane],              // phase 3 rise
+                    ~tx_wrmask_native[2*DM_PER_PHASE + BYTE_LANES + dm_lane], // phase 2 fall
+                    ~tx_wrmask_native[2*DM_PER_PHASE + dm_lane],              // phase 2 rise
+                    ~tx_wrmask_native[1*DM_PER_PHASE + BYTE_LANES + dm_lane], // phase 1 fall
+                    ~tx_wrmask_native[1*DM_PER_PHASE + dm_lane],              // phase 1 rise
+                    ~tx_wrmask_native[0*DM_PER_PHASE + BYTE_LANES + dm_lane], // phase 0 fall
+                    ~tx_wrmask_native[0*DM_PER_PHASE + dm_lane]               // phase 0 rise
                 };
             end else begin : dm_stub
                 assign tx_dm_data[dm_lane] = 8'hFF; // no mask: DM_n always high
@@ -6636,6 +7126,76 @@ module ddr4_phy_native #(
         |o_dfi_rddata_valid, fifo_pace_not_empty,
         app_fifo_pop_fire, app_fifo_pop_request
     };
+    // Native-TX boundary diagnostic.  These are aliases of existing DFI and
+    // serializer signals only; they add no state or functional muxing to the
+    // write path.  Together they show whether a WRITE command, its advertised
+    // DFI data word, the registered native word, byte mask, packed lane-0 DQ,
+    // DQS pattern, and TBYTE ownership all occupy the intended DIV_CLK slots.
+    // Probing four lane-0 DQ serializers is sufficient because the AXKU3 BIST
+    // pattern repeats every 32 bits across all four byte lanes.
+    (* mark_debug = "true" *) wire [SERDES_RATIO-1:0]
+        dbg_dfi_write_command =
+            (~i_dfi_cs_n) & i_dfi_act_n & i_dfi_ras_n &
+            (~i_dfi_cas_n) & (~i_dfi_we_n);
+    (* mark_debug = "true" *) wire [SERDES_RATIO-1:0]
+        dbg_dfi_wrdata_en = i_dfi_wrdata_en;
+    (* mark_debug = "true" *) wire [31:0] dbg_dfi_wrdata_lo =
+        i_dfi_wrdata[31:0];
+    (* mark_debug = "true" *) wire [31:0] dbg_tx_wrdata_lo =
+        tx_wrdata_native[31:0];
+    (* mark_debug = "true" *) wire [31:0] dbg_tx_wrdata_early_lo =
+        tx_wrdata_early[31:0];
+    (* mark_debug = "true" *) wire [31:0] dbg_tx_wrdata_pipe0_lo =
+        tx_wrdata_pipe0[31:0];
+    (* mark_debug = "true" *) wire [31:0] dbg_tx_lane0_dq_lo =
+        tx_dq_data[0][31:0];
+    // The DDR4-1600 hardware failure isolated to lane 0 DQ6, UI1.  Preserve
+    // that serializer's complete eight-UI parallel word rather than relying
+    // on the low-32-bit lane alias, which contains only DQ0..DQ3.
+    (* mark_debug = "true" *) wire [7:0] dbg_tx_lane0_dq6 =
+        tx_dq_data[0][6*8 +: 8];
+    // Focused DDR4-1600 TX-boundary instrumentation.  These three words show
+    // whether lane-0 DQ6 changed before, inside, or after the native first-word
+    // predrive mux.  Keeping the same UI ordering as tx_dq_data makes a saved
+    // ILA capture directly comparable with the eight bits serialized at the
+    // pad; none of these aliases participate in functional logic.
+    (* mark_debug = "true" *) wire [7:0] dbg_dfi_wrdata_dq6 = {
+        i_dfi_wrdata[3*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        i_dfi_wrdata[3*DFI_DATA_WIDTH + 6],
+        i_dfi_wrdata[2*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        i_dfi_wrdata[2*DFI_DATA_WIDTH + 6],
+        i_dfi_wrdata[1*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        i_dfi_wrdata[1*DFI_DATA_WIDTH + 6],
+        i_dfi_wrdata[0*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        i_dfi_wrdata[0*DFI_DATA_WIDTH + 6]
+    };
+    (* mark_debug = "true" *) wire [7:0] dbg_tx_wrdata_early_dq6 = {
+        tx_wrdata_early[3*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        tx_wrdata_early[3*DFI_DATA_WIDTH + 6],
+        tx_wrdata_early[2*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        tx_wrdata_early[2*DFI_DATA_WIDTH + 6],
+        tx_wrdata_early[1*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        tx_wrdata_early[1*DFI_DATA_WIDTH + 6],
+        tx_wrdata_early[0*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        tx_wrdata_early[0*DFI_DATA_WIDTH + 6]
+    };
+    (* mark_debug = "true" *) wire [7:0] dbg_tx_wrdata_pipe0_dq6 = {
+        tx_wrdata_pipe0[3*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        tx_wrdata_pipe0[3*DFI_DATA_WIDTH + 6],
+        tx_wrdata_pipe0[2*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        tx_wrdata_pipe0[2*DFI_DATA_WIDTH + 6],
+        tx_wrdata_pipe0[1*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        tx_wrdata_pipe0[1*DFI_DATA_WIDTH + 6],
+        tx_wrdata_pipe0[0*DFI_DATA_WIDTH + TOTAL_DQ + 6],
+        tx_wrdata_pipe0[0*DFI_DATA_WIDTH + 6]
+    };
+    (* mark_debug = "true" *) wire [7:0] dbg_tx_dqs_pattern = dqs_pattern;
+    (* mark_debug = "true" *) wire [2:0] dbg_tx_wrdata_en_shift =
+        wrdata_en_shift;
+    (* mark_debug = "true" *) wire [1:0] dbg_tx_mask_any = {
+        |tx_wrmask_native, |i_dfi_wrdata_mask
+    };
+    (* mark_debug = "true" *) wire [7:0] dbg_tx_dm_lane0 = tx_dm_data[0];
     (* mark_debug = "true" *) wire [3:0] dbg_gate_observe_count =
         gate_observe_count;
     (* mark_debug = "true" *) wire [3:0] dbg_eye_observe_count =

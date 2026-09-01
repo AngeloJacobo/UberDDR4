@@ -163,7 +163,9 @@ create_debug_core u_ila_0 ila
 set_property ALL_PROBE_SAME_MU true [get_debug_cores u_ila_0]
 set_property ALL_PROBE_SAME_MU_CNT 1 [get_debug_cores u_ila_0]
 set_property C_ADV_TRIGGER false [get_debug_cores u_ila_0]
-set_property C_DATA_DEPTH 4096 [get_debug_cores u_ila_0]
+# The targeted original-write trigger needs only a few controller cycles of
+# history.  Keep 2048 samples so the expanded TX pipeline probes fit the KU3P.
+set_property C_DATA_DEPTH 2048 [get_debug_cores u_ila_0]
 set_property C_EN_STRG_QUAL false [get_debug_cores u_ila_0]
 set_property C_INPUT_PIPE_STAGES 0 [get_debug_cores u_ila_0]
 set_property C_TRIGIN_EN false [get_debug_cores u_ila_0]
@@ -1104,23 +1106,101 @@ connect_debug_port u_ila_0/probe232 [get_nets [list {u_ddr4_top/gen_native_phy.u
 create_debug_port u_ila_0 probe
 set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe233]
 set_property port_width 32 [get_debug_ports u_ila_0/probe233]
-connect_debug_port u_ila_0/probe233 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[0]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[1]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[2]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[3]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[4]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[5]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[6]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[7]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[8]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[9]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[10]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[11]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[12]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[13]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[14]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[15]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[16]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[17]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[18]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[19]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[20]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[21]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[22]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[23]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[24]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[25]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[26]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[27]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[28]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[29]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[30]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_fifo_nonempty[31]}]]
+connect_debug_port u_ila_0/probe233 [get_nets [list {u_ddr4_top/u_prober/gen_bist.diag_fail_addr[*]} {u_ddr4_top/u_prober/bist_state[*]} u_ddr4_top/u_prober/gen_bist.diag_pending u_ddr4_top/u_prober/gen_bist.diag_running u_ddr4_top/u_prober/gen_bist.diag_done]]
 create_debug_port u_ila_0 probe
 set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe234]
 set_property port_width 3 [get_debug_ports u_ila_0/probe234]
-connect_debug_port u_ila_0/probe234 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/wl_handoff_phase[0]} {u_ddr4_top/gen_native_phy.u_phy/u_native/wl_handoff_phase[1]} {u_ddr4_top/gen_native_phy.u_phy/u_native/wl_handoff_phase[2]}]]
+connect_debug_port u_ila_0/probe234 [get_nets [list u_ddr4_top/u_prober/o_init_done u_ddr4_top/u_prober/o_init_failed u_ddr4_top/u_prober/gen_bist.diag_tx_eye_done]]
 create_debug_port u_ila_0 probe
 set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe235]
 set_property port_width 1 [get_debug_ports u_ila_0/probe235]
-connect_debug_port u_ila_0/probe235 [get_nets [list u_ddr4_top/gen_native_phy.u_phy/u_native/wl_handoff_readback_ok]]
+connect_debug_port u_ila_0/probe235 [get_nets [list u_ddr4_top/u_prober/o_init_failed]]
 create_debug_port u_ila_0 probe
 set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe236]
 set_property port_width 3 [get_debug_ports u_ila_0/probe236]
-connect_debug_port u_ila_0/probe236 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/eye_mcl_upper_index[0]} {u_ddr4_top/gen_native_phy.u_phy/u_native/eye_mcl_upper_index[1]} {u_ddr4_top/gen_native_phy.u_phy/u_native/eye_mcl_upper_index[2]}]]
+connect_debug_port u_ila_0/probe236 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_wrdata_en_shift[*]}]]
 create_debug_port u_ila_0 probe
 set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe237]
-set_property port_width 24 [get_debug_ports u_ila_0/probe237]
-connect_debug_port u_ila_0/probe237 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[0]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[1]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[2]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[3]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[4]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[5]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[6]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[7]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[8]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[9]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[10]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[11]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[12]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[13]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[14]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[15]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[16]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[17]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[18]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[19]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[20]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[21]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[22]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_gate_trained_mcl_low[23]}]]
+set_property port_width 29 [get_debug_ports u_ila_0/probe237]
+connect_debug_port u_ila_0/probe237 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_dfi_wrdata_dq6[*]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_wrdata_early_dq6[*]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_wrdata_pipe0_dq6[*]} {u_ddr4_top/gen_native_phy.u_phy/u_native/tbyte_dq[*]} u_ddr4_top/gen_native_phy.u_phy/u_native/tx_predrive_first]]
+
+# First-error TX diagnostics.  This bank retains the exact failing address and
+# low 64 bits of its XOR mask, then exposes the original streaming write data,
+# serializer word, TBYTE window, and live post-traffic RIU tap.  It supports a
+# terminal-failure capture followed by a second trigger at the original write
+# address without another implementation run.
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe238]
+set_property port_width 4 [get_debug_ports u_ila_0/probe238]
+connect_debug_port u_ila_0/probe238 [get_nets [list {u_ddr4_top/u_prober/gen_bist.diag_phase[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe239]
+set_property port_width 26 [get_debug_ports u_ila_0/probe239]
+connect_debug_port u_ila_0/probe239 [get_nets [list {u_ddr4_top/u_prober/gen_bist.write_addr[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe240]
+set_property port_width 8 [get_debug_ports u_ila_0/probe240]
+connect_debug_port u_ila_0/probe240 [get_nets [list {u_ddr4_top/u_prober/gen_bist.diag_tx_eye_bad_data_bit[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe241]
+set_property port_width 8 [get_debug_ports u_ila_0/probe241]
+connect_debug_port u_ila_0/probe241 [get_nets [list {u_ddr4_top/u_prober/gen_bist.diag_tx_eye_dq[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe242]
+set_property port_width 8 [get_debug_ports u_ila_0/probe242]
+connect_debug_port u_ila_0/probe242 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_lane0_dq6[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe243]
+set_property port_width 4 [get_debug_ports u_ila_0/probe243]
+connect_debug_port u_ila_0/probe243 [get_nets [list {u_ddr4_top/u_prober/gen_bist.diag_phase[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe244]
+set_property port_width 12 [get_debug_ports u_ila_0/probe244]
+connect_debug_port u_ila_0/probe244 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/tbyte_dqs[*]} {u_ddr4_top/gen_native_phy.u_phy/u_native/dbg_tx_dqs_pattern[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe245]
+set_property port_width 65 [get_debug_ports u_ila_0/probe245]
+connect_debug_port u_ila_0/probe245 [get_nets [list {u_ddr4_top/u_prober/gen_bist.dbg_diag_first_bad_xor_low64[*]} u_ddr4_top/u_prober/gen_bist.diag_tx_eye_update_error]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe246]
+set_property port_width 7 [get_debug_ports u_ila_0/probe246]
+connect_debug_port u_ila_0/probe246 [get_nets [list {u_ddr4_top/u_prober/gen_bist.diag_tx_eye_pass_count[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe247]
+set_property port_width 9 [get_debug_ports u_ila_0/probe247]
+connect_debug_port u_ila_0/probe247 [get_nets [list {u_ddr4_top/u_prober/i_phy_tx_diag_current_tap[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe248]
+set_property port_width 9 [get_debug_ports u_ila_0/probe248]
+connect_debug_port u_ila_0/probe248 [get_nets [list {u_ddr4_top/u_prober/i_phy_tx_diag_previous_tap[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe249]
+set_property port_width 9 [get_debug_ports u_ila_0/probe249]
+connect_debug_port u_ila_0/probe249 [get_nets [list {u_ddr4_top/u_prober/gen_bist.diag_tx_eye_center_tap[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe250]
+set_property port_width 6 [get_debug_ports u_ila_0/probe250]
+connect_debug_port u_ila_0/probe250 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/tx_diag_wait_q[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe251]
+set_property port_width 4 [get_debug_ports u_ila_0/probe251]
+connect_debug_port u_ila_0/probe251 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/native_riu_valid[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe252]
+set_property port_width 9 [get_debug_ports u_ila_0/probe252]
+connect_debug_port u_ila_0/probe252 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/tx_diag_target_q[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe253]
+set_property port_width 9 [get_debug_ports u_ila_0/probe253]
+connect_debug_port u_ila_0/probe253 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/tx_diag_current_tap_q[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe254]
+set_property port_width 5 [get_debug_ports u_ila_0/probe254]
+connect_debug_port u_ila_0/probe254 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/tx_diag_state[*]}]]
+create_debug_port u_ila_0 probe
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe255]
+set_property port_width 30 [get_debug_ports u_ila_0/probe255]
+connect_debug_port u_ila_0/probe255 [get_nets [list {u_ddr4_top/gen_native_phy.u_phy/u_native/tx_diag_riu_readback_q[*]} u_ddr4_top/gen_native_phy.u_phy/u_native/tx_diag_ctrl_valid_q u_ddr4_top/gen_native_phy.u_phy/u_native/tx_diag_riu_override {u_ddr4_top/gen_native_phy.u_phy/u_native/tx_diag_riu_addr[*]} {u_ddr4_top/gen_native_phy.u_phy/u_native/tx_diag_lane_q[*]} {u_ddr4_top/gen_native_phy.u_phy/u_native/tx_diag_map_q[*]}]]
 set_property C_CLK_INPUT_FREQ_HZ 300000000 [get_debug_cores dbg_hub]
 set_property C_ENABLE_CLK_DIVIDER false [get_debug_cores dbg_hub]
 set_property C_USER_SCAN_CHAIN 1 [get_debug_cores dbg_hub]

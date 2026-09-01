@@ -9,7 +9,8 @@
 // Compile the Clock Wizard simulation products together with this file:
 //   clk_wiz_0/sim/clk_wiz_0.v and clk_wiz_1/sim/clk_wiz_1.v
 //
-// Configure the Micron model for the 8 Gb x16 part and tCK = 1.600 ns.
+// Configure the Micron model for the 8 Gb x16 part and tCK = 1.250 ns
+// (DDR4-1600).
 ////////////////////////////////////////////////////////////////////////////////
 
 `timescale 1ps / 1ps

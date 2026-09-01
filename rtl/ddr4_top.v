@@ -100,6 +100,9 @@ module ddr4_top #(
     //   BIST_DM_TEST: 0=full-word burst writes, 1=per-byte-lane writes (stress DM path)
     //   Auto-disabled for x4 devices (no DM pin on x4, JESD79-4D Table 2)
     parameter[0:0] BIST_DM_TEST = (DEVICE_WIDTH == 4) ? 0 : 1,
+    // First-error repeated-read hardware diagnostic. Disabled by default and
+    // intended only for board bring-up builds.
+    parameter[0:0] BIST_REREAD_DIAG = 0,
     // Debug CSR register file: 0=disabled (saves area), 1=enabled
     parameter DEBUG_CSR_ENABLE = 1,
     // Derived from DEVICE_WIDTH -- do not override
@@ -164,7 +167,11 @@ module ddr4_top #(
     // one 1:4 TX word is registered before serialization, and the first CKE
     // transition needs nine controller clocks to fill the CA serializer.
     // The component PHY has neither latency.
-    localparam [1:0] PHY_TPHY_WRLAT   = PHY_IMPL ? 2'd1 : 2'd0;
+    // Native UltraScale BITSLICE uses one controller word to register DQ/DQS
+    // and one earlier word to serialize the TBYTE preamble/ownership envelope.
+    // Advertising two DFI clocks lets the controller present the write bundle
+    // early enough for both native stages while preserving JEDEC CWL at pins.
+    localparam [1:0] PHY_TPHY_WRLAT   = PHY_IMPL ? 2'd2 : 2'd0;
     localparam [3:0] PHY_TPHY_INIT_LAT = PHY_IMPL ? 4'd9 : 4'd0;
     // The native PHY exhaustively searches read-latency/coarse/fine tuples
     // during read leveling and coarse/fine tuples per lane during write
@@ -221,6 +228,13 @@ module ddr4_top #(
     wire [9*BYTE_LANES-1:0] phy_dqs_initial_tap;
     wire [BYTE_LANES-1:0]   phy_rd_lat_extra;
     wire                     phy_en_vtc;
+    wire                     phy_tx_diag_req;
+    wire [7:0]               phy_tx_diag_dq;
+    wire [8:0]               phy_tx_diag_tap;
+    wire                     phy_tx_diag_ack;
+    wire                     phy_tx_diag_error;
+    wire [8:0]               phy_tx_diag_current_tap;
+    wire [8:0]               phy_tx_diag_previous_tap;
     wire [5:0]              ctrl_instruction_address;
     wire                    ctrl_pause_counter;
     wire                    ctrl_reset_done;
@@ -455,6 +469,12 @@ module ddr4_top #(
         .o_phy_rd_lat_extra(phy_rd_lat_extra),
         .o_phy_en_vtc(phy_en_vtc)
     );
+    // Component mode has no native BITSLICE TX-delay diagnostic.  The prober
+    // checks the support flag and never asserts a request in this branch.
+    assign phy_tx_diag_ack = 1'b0;
+    assign phy_tx_diag_error = 1'b0;
+    assign phy_tx_diag_current_tap = 9'd0;
+    assign phy_tx_diag_previous_tap = 9'd0;
     end else begin : gen_native_phy
     ddr4_phy_native_adapter #(
         .CONTROLLER_CLK_PERIOD(CONTROLLER_CLK_PERIOD),
@@ -502,6 +522,13 @@ module ddr4_top #(
         .o_dfi_rdlvl_req(dfi_rdlvl_req),
         .o_dfi_rdlvl_gate_req(dfi_rdlvl_gate_req),
         .o_dfi_wrlvl_req(dfi_wrlvl_req),
+        .i_tx_diag_req(phy_tx_diag_req),
+        .i_tx_diag_dq(phy_tx_diag_dq),
+        .i_tx_diag_tap(phy_tx_diag_tap),
+        .o_tx_diag_ack(phy_tx_diag_ack),
+        .o_tx_diag_error(phy_tx_diag_error),
+        .o_tx_diag_current_tap(phy_tx_diag_current_tap),
+        .o_tx_diag_previous_tap(phy_tx_diag_previous_tap),
         .o_ddr4_ck_p(o_ddr4_ck_p),
         .o_ddr4_ck_n(o_ddr4_ck_n),
         .o_ddr4_reset_n(o_ddr4_reset_n),
@@ -548,6 +575,7 @@ module ddr4_top #(
         .MICRON_SIM(MICRON_SIM),
         .BIST_MODE(BIST_MODE),
         .BIST_DM_TEST(BIST_DM_TEST),
+        .BIST_REREAD_DIAG(BIST_REREAD_DIAG),
         .DEBUG_CSR_ENABLE(DEBUG_CSR_ENABLE)
     ) u_prober (
         .i_clk(i_controller_clk),
@@ -599,6 +627,14 @@ module ddr4_top #(
         .i_reset_done(ctrl_reset_done),
         .i_pipe_stall(ctrl_pipe_stall),
         .i_calib_retry_count(ctrl_calib_retry_count)
+        ,.i_phy_tx_diag_supported(PHY_IMPL)
+        ,.o_phy_tx_diag_req(phy_tx_diag_req)
+        ,.o_phy_tx_diag_dq(phy_tx_diag_dq)
+        ,.o_phy_tx_diag_tap(phy_tx_diag_tap)
+        ,.i_phy_tx_diag_ack(phy_tx_diag_ack)
+        ,.i_phy_tx_diag_error(phy_tx_diag_error)
+        ,.i_phy_tx_diag_current_tap(phy_tx_diag_current_tap)
+        ,.i_phy_tx_diag_previous_tap(phy_tx_diag_previous_tap)
     );
 
 endmodule

@@ -81,11 +81,21 @@ module ddr4_phy_native_byte #(
     output wire [8:0]  o_rx_cntvalueout_dq0,
     // Largest lane-wide relative offset that leaves every DQ at or below the
     // TIME-mode tap limit after adding its individual BISC Align_Delay.
-    output wire [8:0]  o_rx_max_relative_offset,
+    output reg  [8:0]  o_rx_max_relative_offset,
     // TX delay control for DQS
     input  wire [8:0]  i_tx_dqs_cntvaluein,
     input  wire        i_tx_dqs_load,
     output wire [8:0]  o_tx_dqs_cntvalueout,
+    // Per-DQ TX delay control.  LOAD/CNTVALUEIN are retained for the native
+    // primitive interface, while the post-failure diagnostic uses the
+    // one-hot CE bus and shared INC direction for deterministic single-tap
+    // changes with EN_VTC disabled, as specified by UG571.
+    input  wire [8:0]            i_tx_dq_cntvaluein,
+    input  wire [DQ_BITS-1:0]    i_tx_dq_load,
+    input  wire [DQ_BITS-1:0]    i_tx_dq_ce,
+    input  wire                  i_tx_dq_inc,
+    input  wire                  i_tx_dq_en_vtc,
+    output wire [DQ_BITS*9-1:0]  o_tx_dq_cntvalueout,
     // DDR4 physical pins
     inout  wire [DQ_BITS-1:0] io_ddr4_dq,
     inout  wire               io_ddr4_dqs_p,
@@ -263,8 +273,13 @@ wire dm_to_obuf;
 (* mark_debug = "true" *) reg                 rx_align_valid_q;
 reg rx_align_capture_pending_q;
 integer rx_delay_idx;
-integer rx_max_idx;
-reg [8:0] rx_max_align_delay;
+wire [8:0] rx_max_align_01;
+wire [8:0] rx_max_align_23;
+wire [8:0] rx_max_align_45;
+wire [8:0] rx_max_align_67;
+wire [8:0] rx_max_align_03;
+wire [8:0] rx_max_align_47;
+wire [8:0] rx_max_align_delay;
 
 function [8:0] rx_total_from_offset;
     input [8:0] align_delay;
@@ -288,14 +303,34 @@ endfunction
 // A lane-wide eye offset must be representable by every DQ in the byte.  Use
 // the largest per-bit Align_Delay to derive the common legal sweep range; this
 // prevents a saturated endpoint from appearing to be an artificially wide
-// valid eye in the parent calibration FSM.
-always @* begin
-    rx_max_align_delay = 9'd0;
-    for (rx_max_idx = 0; rx_max_idx < DQ_BITS; rx_max_idx = rx_max_idx + 1)
-        if (rx_align_delay_q[rx_max_idx*9 +: 9] > rx_max_align_delay)
-            rx_max_align_delay = rx_align_delay_q[rx_max_idx*9 +: 9];
-end
-assign o_rx_max_relative_offset = 9'h1ff - rx_max_align_delay;
+// valid eye in the parent calibration FSM.  Keep the eight-way maximum as a
+// balanced tree and register its result.  The previous priority-loop inferred
+// a long comparator cascade directly into the calibration FSM, unnecessarily
+// limiting the native PHY controller clock.  Align_Delay changes only when a
+// new EN_VTC-low calibration session begins, and the parent waits for the
+// ensuing VTC/RIU settle interval before consuming this limit, so the single
+// registered cycle does not change calibration behavior.
+assign rx_max_align_01 =
+    (rx_align_delay_q[0*9 +: 9] > rx_align_delay_q[1*9 +: 9]) ?
+     rx_align_delay_q[0*9 +: 9] : rx_align_delay_q[1*9 +: 9];
+assign rx_max_align_23 =
+    (rx_align_delay_q[2*9 +: 9] > rx_align_delay_q[3*9 +: 9]) ?
+     rx_align_delay_q[2*9 +: 9] : rx_align_delay_q[3*9 +: 9];
+assign rx_max_align_45 =
+    (rx_align_delay_q[4*9 +: 9] > rx_align_delay_q[5*9 +: 9]) ?
+     rx_align_delay_q[4*9 +: 9] : rx_align_delay_q[5*9 +: 9];
+assign rx_max_align_67 =
+    (rx_align_delay_q[6*9 +: 9] > rx_align_delay_q[7*9 +: 9]) ?
+     rx_align_delay_q[6*9 +: 9] : rx_align_delay_q[7*9 +: 9];
+assign rx_max_align_03 =
+    (rx_max_align_01 > rx_max_align_23) ?
+     rx_max_align_01 : rx_max_align_23;
+assign rx_max_align_47 =
+    (rx_max_align_45 > rx_max_align_67) ?
+     rx_max_align_45 : rx_max_align_67;
+assign rx_max_align_delay =
+    (rx_max_align_03 > rx_max_align_47) ?
+     rx_max_align_03 : rx_max_align_47;
 
 always @(posedge i_div_clk) begin
     if (i_bitslice_rst) begin
@@ -303,7 +338,11 @@ always @(posedge i_div_clk) begin
         rx_relative_offset_q       <= 9'd0;
         rx_align_valid_q           <= 1'b0;
         rx_align_capture_pending_q <= 1'b1;
+        o_rx_max_relative_offset   <= 9'h1ff;
     end else begin
+        // 9'h1ff - x is exactly the nine-bit one's complement of x.
+        o_rx_max_relative_offset <= ~rx_max_align_delay;
+
         // A High interval lets BISC and VTC maintain the programmed TIME
         // delay.  Arm one fresh baseline capture for the next Low interval.
         if (i_bitslice_en_vtc)
@@ -649,14 +688,12 @@ BITSLICE_CONTROL #(
 // ---------------------------------------------------------------------------
 TX_BITSLICE_TRI #(
     .DATA_WIDTH         (8),
-    // DQ uses TX_OUTPUT_PHASE_90=FALSE and therefore starts each data UI
-    // one half-UI before the corresponding DQS edge.  The tristate path has
-    // one additional DIV_CLK of fixed latency, which the parent compensates
-    // by presenting TBYTE one word ahead of the registered DQ data.  Keep the
-    // remaining phase aligned with DQ: selecting TRUE here aligns ownership
-    // with DQS instead and clips the first DQ UI whenever the bus changes from
-    // receive/idle to transmit.
-    .OUTPUT_PHASE_90    ("FALSE"),
+    // Match the generated DDR4 MIG byte topology: the shared tristate
+    // serializer uses the 90-degree TX phase while DQ/DM use the unshifted
+    // phase.  The parent presents TBYTE one complete DIV_CLK word before
+    // registered DQ, preserving the preamble, first data UI, and postamble as
+    // one coherent physical write window.
+    .OUTPUT_PHASE_90    ("TRUE"),
     .INIT               (1'b1),
     .SIM_DEVICE         (SIM_DEVICE)
 ) u_tri_lower (
@@ -681,10 +718,10 @@ TX_BITSLICE_TRI #(
 // ---------------------------------------------------------------------------
 TX_BITSLICE_TRI #(
     .DATA_WIDTH         (8),
-    // Use the same DQ-aligned ownership phase in the upper nibble.  This
-    // opens the shared DQ[7:4]/DQS output path before the first sampling edge
-    // while preserving the DQS serializer's intentional 90-degree phase.
-    .OUTPUT_PHASE_90    ("FALSE"),
+    // The upper nibble carries DQ[7:4] and DQS.  MIG uses the same 90-degree
+    // tristate phase here as on the lower nibble; DQ remains unshifted and DQS
+    // separately selects its required 90-degree generated-clock phase.
+    .OUTPUT_PHASE_90    ("TRUE"),
     .INIT               (1'b1),
     .SIM_DEVICE         (SIM_DEVICE)
 ) u_tri_upper (
@@ -871,12 +908,20 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
         .RX_DATA_WIDTH      (8),
         .TX_DATA_WIDTH      (8),
         // TIME mode lets BISC remove the per-bit clock/data insertion skew.
-        // RX remains variable for eye centering; TX is fixed because native
-        // write leveling uses BITSLICE_CONTROL.WL_DLY_RNK0 for the whole byte.
+        // RX remains variable for eye centering.  TX is VAR_LOAD so the
+        // board-bring-up diagnostic can measure the physical write eye one DQ
+        // at a time; with LOAD inactive it is behaviorally identical to the
+        // previous zero-delay FIXED configuration.
+        // Match the generated DDR4 MIG transmit relationship: DQ and DM use
+        // the unshifted serializer phase, while DQS and the shared TBYTE
+        // serializer use the 90-degree phase.  Shifting DQ together with DQS
+        // removes the source-synchronous quarter-cycle separation and launches
+        // DQ transitions on the DQS sampling edges, which becomes unreliable
+        // as tCK is reduced.
         .RX_DELAY_FORMAT    ("TIME"),
         .TX_DELAY_FORMAT    ("TIME"),
         .RX_DELAY_TYPE      ("VAR_LOAD"),
-        .TX_DELAY_TYPE      ("FIXED"),
+        .TX_DELAY_TYPE      ("VAR_LOAD"),
         .RX_DELAY_VALUE     (0),
         .TX_DELAY_VALUE     (0),
         .TX_OUTPUT_PHASE_90 ("FALSE"),
@@ -896,19 +941,19 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_lower
         // DQS sampling and serial TX clocks come from BITSLICE_CONTROL.
         // RX_CLK captures the TIME/VAR_LOAD update in the controller domain.
         .RX_CLK             (i_div_clk),
-        .TX_CLK             (1'b1),
+        .TX_CLK             (i_div_clk),
         .RX_EN_VTC          (i_bitslice_en_vtc),
-        .TX_EN_VTC          (1'b1),
+        .TX_EN_VTC          (i_tx_dq_en_vtc),
         .RX_CE              (1'b0),
         .RX_INC             (1'b0),
-        .TX_CE              (1'b0),
-        .TX_INC             (1'b0),
+        .TX_CE              (i_tx_dq_ce[LOGICAL_DQ]),
+        .TX_INC             (i_tx_dq_inc),
         .RX_CNTVALUEIN      (rx_cntvaluein_w),
         .RX_LOAD            (i_rx_load),
         .RX_CNTVALUEOUT     (rx_cntvalueout_dq[LOGICAL_DQ]),
-        .TX_CNTVALUEIN      (9'd0),
-        .TX_LOAD            (1'b0),
-        .TX_CNTVALUEOUT     (),
+        .TX_CNTVALUEIN      (i_tx_dq_cntvaluein),
+        .TX_LOAD            (i_tx_dq_load[LOGICAL_DQ]),
+        .TX_CNTVALUEOUT     (o_tx_dq_cntvalueout[LOGICAL_DQ*9 +: 9]),
         .D                  (i_tx_dq_data[LOGICAL_DQ*8 +: 8]),
         .O                  (dq_to_iob[LOGICAL_DQ]),
         .T                  (1'b1),
@@ -968,9 +1013,11 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_upper
         .RX_DELAY_FORMAT    ("TIME"),
         .TX_DELAY_FORMAT    ("TIME"),
         .RX_DELAY_TYPE      ("VAR_LOAD"),
-        .TX_DELAY_TYPE      ("FIXED"),
+        .TX_DELAY_TYPE      ("VAR_LOAD"),
         .RX_DELAY_VALUE     (0),
         .TX_DELAY_VALUE     (0),
+        // The upper-nibble DQ bits use the same unshifted phase as lower DQ
+        // and DM.  DQS and TBYTE alone select the 90-degree serializer phase.
         .TX_OUTPUT_PHASE_90 ("FALSE"),
         .RX_REFCLK_FREQUENCY(REFCLK_FREQ),
         .TX_REFCLK_FREQUENCY(REFCLK_FREQ),
@@ -988,19 +1035,19 @@ for (gi = 0; gi < 4; gi = gi + 1) begin : gen_dq_upper
         // See the lower-nibble DATA slice: these clocks capture delay-control
         // LOAD strobes; BITSLICE_CONTROL supplies the actual datapath clocks.
         .RX_CLK             (i_div_clk),
-        .TX_CLK             (1'b1),
+        .TX_CLK             (i_div_clk),
         .RX_EN_VTC          (i_bitslice_en_vtc),
-        .TX_EN_VTC          (1'b1),
+        .TX_EN_VTC          (i_tx_dq_en_vtc),
         .RX_CE              (1'b0),
         .RX_INC             (1'b0),
-        .TX_CE              (1'b0),
-        .TX_INC             (1'b0),
+        .TX_CE              (i_tx_dq_ce[LOGICAL_DQ]),
+        .TX_INC             (i_tx_dq_inc),
         .RX_CNTVALUEIN      (rx_cntvaluein_w),
         .RX_LOAD            (i_rx_load),
         .RX_CNTVALUEOUT     (rx_cntvalueout_dq[LOGICAL_DQ]),
-        .TX_CNTVALUEIN      (9'd0),
-        .TX_LOAD            (1'b0),
-        .TX_CNTVALUEOUT     (),
+        .TX_CNTVALUEIN      (i_tx_dq_cntvaluein),
+        .TX_LOAD            (i_tx_dq_load[LOGICAL_DQ]),
+        .TX_CNTVALUEOUT     (o_tx_dq_cntvalueout[LOGICAL_DQ*9 +: 9]),
         .D                  (i_tx_dq_data[LOGICAL_DQ*8 +: 8]),
         .O                  (dq_to_iob[LOGICAL_DQ]),
         .T                  (1'b1),

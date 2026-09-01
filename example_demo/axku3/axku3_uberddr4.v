@@ -10,23 +10,17 @@
 // be configured as single-ended "No Buffer" inputs and use port name clk_in1.
 // Configure their outputs as follows:
 //
-//   clk_wiz_0 / ddr4_clk   : 625 MHz (1.600 ns), No Buffer
-//                -> raw MMCM output; buffered below for OSERDESE3/ISERDESE3
+//   clk_wiz_0 / ddr4_clk   : 233.333 MHz requested, 233.376 MHz actual
+//                            (4.285 ns), normal Buffer
+//                -> quarter-rate controller/DFI clock for the native PHY
 //   clk_wiz_1 / ref300_clk : 300 MHz (3.333 ns), normal Buffer
-//              -> IDELAYCTRL reference clock
+//                -> calibrated native BITSLICE delay reference
 //
-// The 156.25 MHz controller/CLKDIV clock is deliberately NOT a wizard output.
-// The raw 625 MHz MMCM output drives a BUFGCE and a BUFGCE_DIV /4 IN PARALLEL
-// below.  This is the component-mode topology required by OSERDESE3/ISERDESE3:
-// CLK and CLKDIV use sibling dedicated global buffers, rather than cascading a
-// BUFGCE_DIV from the wizard's buffered output.  Cascading them produces an
-// excessive CLK-to-CLKDIV skew and fails the OSERDESE3 max-skew check.
-//
-// 625 MHz gives tCK = 1.600 ns (1250 MT/s nominal), meeting the JEDEC
-// DDR4-1333 maximum tCK and this -2 speed grade's 1.600 ns minimum
-// OSERDESE3/ISERDESE3 CLK period.  DDR4-1333 at 666.667 MHz does not meet the
-// latter requirement.  Faster operation requires
-// a PHY-specific PLLE4 CLKOUTPHY/XIPHY clocking architecture.
+// The native PHY instantiates one PLLE4/CLKOUTPHY per occupied I/O clock
+// region.  Each local PLL multiplies the 233.376 MHz word clock by four and
+// uses VCO_2X to deliver the 1.867 GHz serial BITSLICE clock required for a
+// 933.5 MHz DDR4 CK (DDR4-1866).  The high-speed clock remains entirely on
+// dedicated XPHY routing and never crosses a frequency-limited global buffer.
 ////////////////////////////////////////////////////////////////////////////////
 
 `default_nettype none
@@ -62,8 +56,6 @@ module axku3_uberddr4 (
 );
 
     wire controller_clk;
-    wire ddr4_clk;
-    wire ddr4_clk_mmcm;
     wire ref_clk;
     wire locked_0;
     wire locked_1;
@@ -85,7 +77,7 @@ module axku3_uberddr4 (
     clk_wiz_0 clk_wiz_0_inst
      (
       // Clock out ports
-      .ddr4_clk(ddr4_clk_mmcm),
+      .ddr4_clk(controller_clk),
       // Status and control signals
       .reset(~rst_n),
       .locked(locked_0),
@@ -104,31 +96,6 @@ module axku3_uberddr4 (
       .clk_in1(sys_clk)
      );
 
-    // Keep the high-speed CLK and divided CLKDIV as parallel descendants of
-    // the same raw MMCM output.  clk_wiz_0's 625 MHz output must be configured
-    // as "No Buffer"; inserting its output buffer here would recreate the
-    // prohibited BUFGCE -> BUFGCE_DIV clock-buffer cascade.
-    BUFGCE #(
-        .SIM_DEVICE("ULTRASCALE_PLUS")
-    ) ddr4_clk_buf (
-        .I (ddr4_clk_mmcm),
-        .CE(1'b1),
-        .O (ddr4_clk)
-    );
-
-    // OSERDESE3/ISERDESE3 require CLKDIV to be a dedicated /4 clock derived
-    // from the same MMCM output as CLK.  Do not replace this with another MMCM
-    // output or a fabric divider.
-    BUFGCE_DIV #(
-        .BUFGCE_DIVIDE(4),
-        .SIM_DEVICE("ULTRASCALE_PLUS")
-    ) controller_clk_buf (
-        .I  (ddr4_clk_mmcm),
-        .CE (1'b1),
-        .CLR(1'b0),
-        .O  (controller_clk)
-    );
-
     // Keep the controller in reset until the manually-created Clocking Wizard
     // has locked.  This is an asynchronous assertion path as required by
     // ddr4_top.i_rst_n.
@@ -143,12 +110,15 @@ module axku3_uberddr4 (
     wire init_done;
     wire init_failed;
 
-    // No external traffic generator is connected.  BIST_MODE=0 keeps the
-    // Wishbone port quiescent; all unused Wishbone inputs are tied inactive.
+    // No external traffic generator is connected. BIST_MODE=2 owns the main
+    // Wishbone port during bring-up; all external Wishbone inputs are inactive.
     // Status is sticky inside ddr4_top, so the display persists after training.
     ddr4_top #(
-        .CONTROLLER_CLK_PERIOD(6_400), // 156.25 MHz: DDR4_CLK_PERIOD * 4
-        .DDR4_CLK_PERIOD      (1_600), // 625 MHz DDR4 clock (tCK = 1.600 ns)
+        // Integer-picosecond timing model for the Clocking Wizard's actual
+        // 233.376 MHz output.  Keep the exact 4:1 relationship used by DFI;
+        // the resulting 933.504 MHz CK is inside the DDR4-1866 tCK bin.
+        .CONTROLLER_CLK_PERIOD(4_284),
+        .DDR4_CLK_PERIOD      (1_071),
         .DEVICE_WIDTH          (16),
         .ROW_BITS              (16),
         .COL_BITS              (10),
@@ -177,10 +147,15 @@ module axku3_uberddr4 (
         .PHY_BYTE_PLL_MAP      (12'h249), // lanes 3:0 all select PLL 1
         .BIST_MODE             (2),
         .BIST_DM_TEST          (0),
+        // Board bring-up diagnostic: on the first mismatch, reread the same
+        // address 32 times so ILA can distinguish write storage from RX noise.
+        .BIST_REREAD_DIAG      (1),
         .DEBUG_CSR_ENABLE      (0)
     ) u_ddr4_top (
         .i_controller_clk(controller_clk),
-        .i_ddr4_clk      (ddr4_clk),
+        // Retained for the common ddr4_top interface. Native mode generates
+        // its high-speed clocks locally and does not consume i_ddr4_clk.
+        .i_ddr4_clk      (controller_clk),
         .i_ref_clk       (ref_clk),
         .i_rst_n         (ddr4_rst_n),
 
