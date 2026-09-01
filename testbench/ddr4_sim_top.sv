@@ -59,11 +59,13 @@ endmodule
 // run_xsim.sh defines TB_USE_NATIVE_PHY only to select the testbench's top
 // parameter; this makes the simulation use the same public selection API as
 // a hardware design.
+`ifndef UBERDDR4_PHY_SOURCES_PRECOMPILED
 `include "../rtl/ddr4_phy.v"
 `include "../rtl/phy/ddr4_phy_native_reset.v"
 `include "../rtl/phy/ddr4_phy_native_byte.v"
 `include "../rtl/phy/ddr4_phy_native.v"
 `include "../rtl/phy/ddr4_phy_native_adapter.v"
+`endif
 
 module ddr4_sim_top;
 
@@ -227,7 +229,8 @@ module ddr4_sim_top;
     // Clock Generation
     // ddr4_clk   : 834 ps period (toggle every 417 ps)
     // controller : ddr4_clk / 4 = 3336 ps period (phase-aligned)
-    // ref_clk    : 300 MHz = 3334 ps period (UltraScale+ IDELAYE3/ODELAYE3 min)
+    // ref_clk    : component PHY = 300 MHz delay reference
+    //              native PHY    = controller_clk / 2 RIU clock
     // ===================================================================
     reg ddr4_clk;
     initial ddr4_clk = 1'b0;
@@ -239,8 +242,19 @@ module ddr4_sim_top;
     wire controller_clk = clk_div[1];
 
     reg ref_clk;
-    initial ref_clk = 1'b0;
-    always #1667 ref_clk = ~ref_clk;
+    initial begin
+        ref_clk = 1'b0;
+        if (TB_PHY_IMPL) begin
+            // The native RIU clock is controller_clk/2 from the same MMCM and
+            // uses the same zero-degree phase shift.  Start its first rising
+            // edge with a controller rising edge, then toggle once per full
+            // controller period.
+            #(CTRL_CLK_PERIOD / 2);
+            forever #(CTRL_CLK_PERIOD) ref_clk = ~ref_clk;
+        end else begin
+            forever #1667 ref_clk = ~ref_clk;
+        end
+    end
 
     // ===================================================================
     // Reset  -  held low for 100 ns, released on controller_clk posedge

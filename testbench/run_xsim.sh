@@ -114,6 +114,11 @@ echo -e "${DIM}PHY implementation: $PHY_IMPL${RESET}"
 step "Compiling RTL"
 "$XVLOG" -sv \
   $EXTRA_DEFS \
+  rtl/ddr4_phy.v \
+  rtl/phy/ddr4_phy_native_reset.v \
+  rtl/phy/ddr4_phy_native_byte.v \
+  rtl/phy/ddr4_phy_native.v \
+  rtl/phy/ddr4_phy_native_adapter.v \
   rtl/ddr4_controller.v \
   rtl/ddr4_prober.v \
   rtl/ddr4_top.v
@@ -129,7 +134,8 @@ if [[ "${DUMP_VCD:-0}" == "1" ]]; then
 fi
 
 step "Compiling simulation sources"
-"$XVLOG" -sv -d $MICRON_DENSITY -d $MICRON_SPEED -d ALLOW_JITTER $VCD_FLAG \
+"$XVLOG" -sv -d $MICRON_DENSITY -d $MICRON_SPEED -d ALLOW_JITTER \
+  -d UBERDDR4_PHY_SOURCES_PRECOMPILED $VCD_FLAG \
   "${PHY_TB_DEFINE[@]}" \
   $EXTRA_DEFS \
   -i testbench/micron \

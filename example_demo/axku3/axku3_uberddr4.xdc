@@ -150,9 +150,10 @@ set_property BITSTREAM.CONFIG.UNUSEDPIN Pullup [current_design]
 set_property CFGBVS GND [current_design]
 set_property CONFIG_VOLTAGE 1.8 [current_design]
 
-# The only controller-to-ref_clk crossing is the monotonic IDELAYCTRL release
-# request.  rtl/ddr4_phy.v receives it with an ASYNC_REG two-flop synchronizer;
-# do not time an asynchronous CDC path into either synchronizer stage.
+# Component mode synchronizes the monotonic IDELAYCTRL release request. Native
+# mode also uses explicit two-flop/toggle handshakes between its controller and
+# lower-frequency BITSLICE RIU clocks. ASYNC_REG marks every receiving stage;
+# these are intentional asynchronous CDC paths rather than single-cycle paths.
 set_false_path -to [get_cells -hierarchical -filter {ASYNC_REG == TRUE}]
 
 
@@ -167,7 +168,10 @@ set_property C_ADV_TRIGGER false [get_debug_cores u_ila_0]
 # history.  Keep 2048 samples so the expanded TX pipeline probes fit the KU3P.
 set_property C_DATA_DEPTH 2048 [get_debug_cores u_ila_0]
 set_property C_EN_STRG_QUAL false [get_debug_cores u_ila_0]
-set_property C_INPUT_PIPE_STAGES 0 [get_debug_cores u_ila_0]
+# Pipeline the debug-only fanout before it enters the large ILA. This keeps
+# observation logic from becoming the limiting controller-clock path while
+# preserving cycle alignment across every probe.
+set_property C_INPUT_PIPE_STAGES 2 [get_debug_cores u_ila_0]
 set_property C_TRIGIN_EN false [get_debug_cores u_ila_0]
 set_property C_TRIGOUT_EN false [get_debug_cores u_ila_0]
 set_property port_width 1 [get_debug_ports u_ila_0/clk]

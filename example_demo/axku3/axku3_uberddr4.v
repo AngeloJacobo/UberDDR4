@@ -4,22 +4,25 @@
 // Board: ALINX AXKU3, XCKU3P-FFVB676-2-I
 // DRAM:  two Micron MT40A512M16LY-062E (2 x x16 = 32-bit interface)
 //
-// Create two Clocking Wizard IPs named "clk_wiz_0" and "clk_wiz_1" before
-// synthesizing this design.  The IBUFDS/BUFG below is the ONLY buffer for the
-// board's 200 MHz differential oscillator.  Both wizard inputs therefore must
-// be configured as single-ended "No Buffer" inputs and use port name clk_in1.
-// Configure their outputs as follows:
+// Create one Clocking Wizard IP named "clk_wiz_0" before synthesizing this
+// design.  The IBUFDS/BUFG below is the ONLY buffer for the board's 200 MHz
+// differential oscillator.  Configure the wizard input as single-ended
+// "No Buffer", name it clk_in1, and generate both outputs from the same MMCM:
 //
-//   clk_wiz_0 / ddr4_clk   : 233.333 MHz requested, 233.376 MHz actual
-//                            (4.285 ns), normal Buffer
+//   clk_wiz_0 / ddr4_clk   : 300.000000 MHz, normal Buffer
 //                -> quarter-rate controller/DFI clock for the native PHY
-//   clk_wiz_1 / ref300_clk : 300 MHz (3.333 ns), normal Buffer
-//                -> calibrated native BITSLICE delay reference
+//   clk_wiz_0 / ref300_clk : controller_clk / 2 (150.000000 MHz here),
+//                            zero-degree phase, normal Buffer
+//                -> native BITSLICE register-interface (RIU) clock
+//
+// UG571 requires the PLLE4 input clock and BITSLICE_CONTROL RIU_CLK to come
+// from the same MMCM with the same phase shift when RL_DLY_RNK is used.  Do
+// not generate these two clocks with independent Clocking Wizard instances.
 //
 // The native PHY instantiates one PLLE4/CLKOUTPHY per occupied I/O clock
-// region.  Each local PLL multiplies the 233.376 MHz word clock by four and
-// uses VCO_2X to deliver the 1.867 GHz serial BITSLICE clock required for a
-// 933.5 MHz DDR4 CK (DDR4-1866).  The high-speed clock remains entirely on
+// region.  Each local PLL multiplies the 300 MHz word clock by four and uses
+// VCO_2X to deliver the 2.4 GHz serial BITSLICE clock required for a 1.2 GHz
+// DDR4 CK (DDR4-2400).  The high-speed clock remains entirely on
 // dedicated XPHY routing and never crosses a frequency-limited global buffer.
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -58,12 +61,11 @@ module axku3_uberddr4 (
     wire controller_clk;
     wire ref_clk;
     wire locked_0;
-    wire locked_1;
     wire sys_clk_ibuf;
     wire sys_clk;
 
-    // Share the board clock safely between the two MMCMs.  Do not configure
-    // either Clock Wizard to instantiate an additional IBUF/IBUFDS.
+    // Buffer the board clock once.  Do not configure the Clocking Wizard to
+    // instantiate an additional IBUF/IBUFDS.
     IBUFDS sys_clk_ibuf_inst (
         .I (sys_clk_p),
         .IB(sys_clk_n),
@@ -78,21 +80,11 @@ module axku3_uberddr4 (
      (
       // Clock out ports
       .ddr4_clk(controller_clk),
+      .ref300_clk(ref_clk),
       // Status and control signals
       .reset(~rst_n),
       .locked(locked_0),
      // Clock in ports
-      .clk_in1(sys_clk)
-     );
-
-    clk_wiz_1 clk_wiz_1_inst
-     (
-      // Clock out ports
-      .ref300_clk(ref_clk),
-      // Status and control signals
-      .reset(~rst_n),
-      .locked(locked_1),
-      // Clock in ports -- configured as single-ended, No Buffer
       .clk_in1(sys_clk)
      );
 
@@ -104,7 +96,7 @@ module axku3_uberddr4 (
         if (!rst_n) begin
             ddr4_rst_n <= 1'b0;
         end else begin
-            ddr4_rst_n <= locked_0 && locked_1;
+            ddr4_rst_n <= locked_0;
         end
     end
     wire init_done;
@@ -114,11 +106,12 @@ module axku3_uberddr4 (
     // Wishbone port during bring-up; all external Wishbone inputs are inactive.
     // Status is sticky inside ddr4_top, so the display persists after training.
     ddr4_top #(
-        // Integer-picosecond timing model for the Clocking Wizard's actual
-        // 233.376 MHz output.  Keep the exact 4:1 relationship used by DFI;
-        // the resulting 933.504 MHz CK is inside the DDR4-1866 tCK bin.
-        .CONTROLLER_CLK_PERIOD(4_284),
-        .DDR4_CLK_PERIOD      (1_071),
+        // Quarter-rate DFI relationship for a 300 MHz controller clock and
+        // 1.2 GHz DDR4 CK (DDR4-2400).  Integer picosecond parameters round
+        // downward so all computed JEDEC delays remain
+        // conservative relative to the exact 833.333 ps hardware tCK.
+        .CONTROLLER_CLK_PERIOD(3_332),
+        .DDR4_CLK_PERIOD      (833),
         .DEVICE_WIDTH          (16),
         .ROW_BITS              (16),
         .COL_BITS              (10),

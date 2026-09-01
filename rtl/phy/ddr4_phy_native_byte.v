@@ -19,8 +19,13 @@ module ddr4_phy_native_byte #(
     // Clocks
     input  wire        i_pll_clkoutphy,
     input  wire        i_div_clk,
+    // RIU has a lower maximum frequency than DIV_CLK on UltraScale(+).
+    // Keep it on a dedicated clock (normally DIV_CLK/2, as in the Xilinx
+    // DDR4 PHY) and cross the infrequent calibration transactions below.
+    input  wire        i_riu_clk,
     // Reset
     input  wire        i_bsc_rst,
+    input  wire        i_riu_rst,
     input  wire        i_bitslice_rst,
     // Clears the RX deserializer/FIFO pointers while RX_RST_DLY remains low,
     // preserving the trained input-delay value.
@@ -73,8 +78,8 @@ module ddr4_phy_native_byte #(
     input  wire                 i_riu_wr_en,
     input  wire                 i_riu_lower_sel,
     input  wire                 i_riu_upper_sel,
-    output wire [15:0]          o_riu_rd_data,
-    output wire                 o_riu_valid,
+    output reg  [15:0]          o_riu_rd_data,
+    output reg                  o_riu_valid,
     // RX delay control
     input  wire [8:0]  i_rx_cntvaluein,
     input  wire        i_rx_load,
@@ -170,10 +175,53 @@ end
 `endif
 
 // A byte has one physical CLB-to-RIU ingress bus shared by its two nibble
-// controls (UG571, RIU_OR topology).  Register a byte-local copy to prevent
-// cross-byte fanout onto that dedicated route.  Only the upper nibble is
-// selected: it owns DQS and its gate delay/status; the lower nibble receives
-// the upper nibble's trained P/N clocks through EN_OTHER_PCLK/NCLK.
+// controls (UG571, RIU_OR topology).  DIV_CLK can exceed the RIU_CLK limit
+// at DDR4-2133 and above, so the byte-local ingress also forms a complete CDC
+// boundary.  Write commands use a toggle handshake: the source payload is
+// held until the calibration FSM observes the synchronized RIU response.
+// Read address/select controls are level-synchronized because the FSM holds
+// them unchanged while waiting for RIU_VALID.
+(* DONT_TOUCH = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [5:0]  riu_wr_addr_hold;
+(* DONT_TOUCH = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [15:0] riu_wr_data_hold;
+(* DONT_TOUCH = "TRUE", SHREG_EXTRACT = "NO" *)
+reg        riu_wr_lower_hold, riu_wr_upper_hold;
+reg        riu_wr_toggle;
+
+always @(posedge i_div_clk) begin
+    if (i_bsc_rst) begin
+        riu_wr_addr_hold  <= 6'd0;
+        riu_wr_data_hold  <= 16'd0;
+        riu_wr_lower_hold <= 1'b0;
+        riu_wr_upper_hold <= 1'b0;
+        riu_wr_toggle     <= 1'b0;
+    end else if (i_riu_wr_en) begin
+        riu_wr_addr_hold  <= i_riu_addr;
+        riu_wr_data_hold  <= i_riu_wr_data;
+        riu_wr_lower_hold <= i_riu_lower_sel;
+        riu_wr_upper_hold <= i_riu_upper_sel;
+        riu_wr_toggle     <= ~riu_wr_toggle;
+    end
+end
+
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [1:0] riu_wr_toggle_sync;
+reg       riu_wr_toggle_seen;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [5:0] riu_wr_addr_meta, riu_wr_addr_sync;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [15:0] riu_wr_data_meta, riu_wr_data_sync;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg riu_wr_lower_meta, riu_wr_lower_sync;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg riu_wr_upper_meta, riu_wr_upper_sync;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [5:0] riu_read_addr_meta, riu_read_addr_sync;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg       riu_read_lower_meta, riu_read_lower_sync;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg       riu_read_upper_meta, riu_read_upper_sync;
 (* DONT_TOUCH = "TRUE", SHREG_EXTRACT = "NO" *)
 reg [5:0]  riu_addr_q;
 (* DONT_TOUCH = "TRUE", SHREG_EXTRACT = "NO" *)
@@ -181,19 +229,63 @@ reg [15:0] riu_wr_data_q;
 (* DONT_TOUCH = "TRUE", SHREG_EXTRACT = "NO" *)
 reg        riu_wr_en_q, riu_lower_sel_q, riu_upper_sel_q;
 
-always @(posedge i_div_clk) begin
-    if (i_bsc_rst) begin
+always @(posedge i_riu_clk) begin
+    if (i_riu_rst) begin
+        riu_wr_toggle_sync <= 2'b00;
+        riu_wr_toggle_seen <= 1'b0;
+        riu_wr_addr_meta <= 6'd0;
+        riu_wr_addr_sync <= 6'd0;
+        riu_wr_data_meta <= 16'd0;
+        riu_wr_data_sync <= 16'd0;
+        riu_wr_lower_meta <= 1'b0;
+        riu_wr_lower_sync <= 1'b0;
+        riu_wr_upper_meta <= 1'b0;
+        riu_wr_upper_sync <= 1'b0;
+        riu_read_addr_meta <= 6'd0;
+        riu_read_addr_sync <= 6'd0;
+        riu_read_lower_meta <= 1'b0;
+        riu_read_lower_sync <= 1'b0;
+        riu_read_upper_meta <= 1'b0;
+        riu_read_upper_sync <= 1'b0;
         riu_addr_q       <= 6'd0;
         riu_wr_data_q    <= 16'd0;
         riu_wr_en_q      <= 1'b0;
         riu_lower_sel_q  <= 1'b0;
         riu_upper_sel_q  <= 1'b0;
     end else begin
-        riu_addr_q       <= i_riu_addr;
-        riu_wr_data_q    <= i_riu_wr_data;
-        riu_wr_en_q      <= i_riu_wr_en;
-        riu_lower_sel_q  <= i_riu_lower_sel;
-        riu_upper_sel_q  <= i_riu_upper_sel;
+        riu_wr_toggle_sync <= {riu_wr_toggle_sync[0], riu_wr_toggle};
+        // The source holds this payload from request until the returned RIU
+        // response.  Synchronize every bit before consuming it when the
+        // independently synchronized request toggle arrives; this is the
+        // standard bundled-data CDC protocol and is phase agnostic.
+        riu_wr_addr_meta <= riu_wr_addr_hold;
+        riu_wr_addr_sync <= riu_wr_addr_meta;
+        riu_wr_data_meta <= riu_wr_data_hold;
+        riu_wr_data_sync <= riu_wr_data_meta;
+        riu_wr_lower_meta <= riu_wr_lower_hold;
+        riu_wr_lower_sync <= riu_wr_lower_meta;
+        riu_wr_upper_meta <= riu_wr_upper_hold;
+        riu_wr_upper_sync <= riu_wr_upper_meta;
+        riu_read_addr_meta <= i_riu_addr;
+        riu_read_addr_sync <= riu_read_addr_meta;
+        riu_read_lower_meta <= i_riu_lower_sel;
+        riu_read_lower_sync <= riu_read_lower_meta;
+        riu_read_upper_meta <= i_riu_upper_sel;
+        riu_read_upper_sync <= riu_read_upper_meta;
+
+        riu_wr_en_q <= 1'b0;
+        if (riu_wr_toggle_sync[1] != riu_wr_toggle_seen) begin
+            riu_wr_toggle_seen <= riu_wr_toggle_sync[1];
+            riu_addr_q         <= riu_wr_addr_sync;
+            riu_wr_data_q      <= riu_wr_data_sync;
+            riu_lower_sel_q    <= riu_wr_lower_sync;
+            riu_upper_sel_q    <= riu_wr_upper_sync;
+            riu_wr_en_q        <= riu_wr_lower_sync | riu_wr_upper_sync;
+        end else begin
+            riu_addr_q         <= riu_read_addr_sync;
+            riu_lower_sel_q    <= riu_read_lower_sync;
+            riu_upper_sel_q    <= riu_read_upper_sync;
+        end
     end
 end
 // ---------------------------------------------------------------------------
@@ -398,6 +490,8 @@ wire [15:0] riu_rd_data_low;
 wire        riu_rd_valid_low;
 wire [15:0] riu_rd_data_upp;
 wire        riu_rd_valid_upp;
+wire [15:0] riu_rd_data_raw;
+wire        riu_rd_valid_raw;
 // ---------------------------------------------------------------------------
 // Status outputs
 // ---------------------------------------------------------------------------
@@ -414,13 +508,77 @@ RIU_OR #(
     .SIM_DEVICE          (SIM_DEVICE),
     .SIM_VERSION         (2.0)
 ) u_riu_or (
-    .RIU_RD_DATA         (o_riu_rd_data),
-    .RIU_RD_VALID        (o_riu_valid),
+    .RIU_RD_DATA         (riu_rd_data_raw),
+    .RIU_RD_VALID        (riu_rd_valid_raw),
     .RIU_RD_DATA_LOW     (riu_rd_data_low),
     .RIU_RD_DATA_UPP     (riu_rd_data_upp),
     .RIU_RD_VALID_LOW    (riu_rd_valid_low),
     .RIU_RD_VALID_UPP    (riu_rd_valid_upp)
 );
+
+// Return RIU data to DIV_CLK with the same toggle discipline used for writes.
+// The payload register is stable before the toggle reaches the destination;
+// two data stages then align it with the synchronized response event.
+reg [15:0] riu_response_data_hold;
+reg        riu_response_toggle;
+always @(posedge i_riu_clk) begin
+    if (i_riu_rst) begin
+        riu_response_data_hold <= 16'd0;
+        riu_response_toggle    <= 1'b0;
+    end else if (riu_rd_valid_raw) begin
+        riu_response_data_hold <= riu_rd_data_raw;
+        riu_response_toggle    <= ~riu_response_toggle;
+    end
+end
+
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [1:0] riu_response_toggle_sync;
+reg       riu_response_toggle_seen;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [15:0] riu_response_data_meta, riu_response_data_sync;
+reg [5:0] riu_request_addr_q;
+reg       riu_request_lower_q, riu_request_upper_q;
+wire      riu_request_changed =
+    (i_riu_addr != riu_request_addr_q) ||
+    (i_riu_lower_sel != riu_request_lower_q) ||
+    (i_riu_upper_sel != riu_request_upper_q);
+always @(posedge i_div_clk) begin
+    if (i_bsc_rst) begin
+        riu_response_toggle_sync <= 2'b00;
+        riu_response_toggle_seen <= 1'b0;
+        riu_response_data_meta   <= 16'd0;
+        riu_response_data_sync   <= 16'd0;
+        riu_request_addr_q       <= 6'd0;
+        riu_request_lower_q      <= 1'b0;
+        riu_request_upper_q      <= 1'b0;
+        o_riu_rd_data             <= 16'd0;
+        o_riu_valid               <= 1'b0;
+    end else begin
+        riu_response_toggle_sync <=
+            {riu_response_toggle_sync[0], riu_response_toggle};
+        riu_response_data_meta <= riu_response_data_hold;
+        riu_response_data_sync <= riu_response_data_meta;
+        riu_request_addr_q  <= i_riu_addr;
+        riu_request_lower_q <= i_riu_lower_sel;
+        riu_request_upper_q <= i_riu_upper_sel;
+
+        // Hold completion until the next transaction.  Each byte has its own
+        // toggle synchronizer, so a metastable event can legally make one
+        // byte observe a response one DIV_CLK later than another.  Sticky
+        // completion lets the parent safely AND all byte valid bits without
+        // requiring their CDC pulses to land on the same clock edge.
+        if (i_riu_wr_en || riu_request_changed)
+            o_riu_valid <= 1'b0;
+        if (riu_response_toggle_sync[1] !=
+            riu_response_toggle_seen) begin
+            riu_response_toggle_seen <= riu_response_toggle_sync[1];
+            if (!(i_riu_wr_en || riu_request_changed)) begin
+                o_riu_rd_data <= riu_response_data_sync;
+                o_riu_valid <= 1'b1;
+            end
+        end
+    end
+end
 
 // ---------------------------------------------------------------------------
 // Per-nibble readiness diagnostics
@@ -512,8 +670,8 @@ BITSLICE_CONTROL #(
 ) u_bsc_lower (
     .PLL_CLK            (i_pll_clkoutphy),
     .REFCLK             (1'b0),
-    .RIU_CLK            (i_div_clk),
-    .RST                (i_bsc_rst),
+    .RIU_CLK            (i_riu_clk),
+    .RST                (i_riu_rst),
     .EN_VTC             (i_bsc_en_vtc),
     .DLY_RDY            (dly_rdy_low),
     .VTC_RDY            (vtc_rdy_low),
@@ -618,8 +776,8 @@ BITSLICE_CONTROL #(
 ) u_bsc_upper (
     .PLL_CLK            (i_pll_clkoutphy),
     .REFCLK             (1'b0),
-    .RIU_CLK            (i_div_clk),
-    .RST                (i_bsc_rst),
+    .RIU_CLK            (i_riu_clk),
+    .RST                (i_riu_rst),
     .EN_VTC             (i_bsc_en_vtc),
     .DLY_RDY            (dly_rdy_upp),
     .VTC_RDY            (vtc_rdy_upp),
