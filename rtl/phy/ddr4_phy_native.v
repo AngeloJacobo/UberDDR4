@@ -1192,6 +1192,11 @@ module ddr4_phy_native #(
 
     // BITSLICE_CONTROL RIU registers used by read-gate calibration.
     localparam [5:0] RIU_ADDR_NIBBLE_CTRL0 = 6'h00;
+    // UG571 Table 2-39 defines NIBBLE_CTRL0[9] as the read-only GT_STATUS
+    // bit; reserved bits [15:12] and [7] are also not part of the writable
+    // control image.  A live gate status change must therefore not make a
+    // successfully restored register look like a failed RIU write.
+    localparam [15:0] RIU_NIBBLE_CTRL0_VERIFY_MASK = 16'h0d7f;
     localparam [5:0] RIU_ADDR_BS_CTRL       = 6'h05;
     localparam [5:0] RIU_ADDR_WL_DLY_RNK0  = 6'h2c;
     localparam [5:0] RIU_ADDR_RL_DLY_RNK0  = 6'h30;
@@ -1904,6 +1909,11 @@ module ddr4_phy_native #(
     (* mark_debug = "true" *) reg tx_diag_ctrl_valid_q;
     (* mark_debug = "true" *) reg [8:0] tx_diag_current_tap_q;
     (* mark_debug = "true" *) reg [15:0] tx_diag_riu_readback_q;
+    // The byte wrapper captures RIU write payloads into a bundled-data CDC
+    // holding register on this clock. Present address/data for one complete
+    // controller cycle before pulsing write-enable so that wrapper never
+    // captures the payload from the preceding read or write transaction.
+    (* mark_debug = "true" *) reg tx_diag_write_armed_q;
     (* mark_debug = "true" *) wire tx_diag_ce_any = |tx_dq_ce;
 
     wire tx_diag_input_valid = (i_tx_diag_dq < TOTAL_DQ);
@@ -1939,6 +1949,7 @@ module ddr4_phy_native #(
             tx_diag_ctrl_valid_q     <= 1'b0;
             tx_diag_current_tap_q    <= 9'd0;
             tx_diag_riu_readback_q   <= 16'd0;
+            tx_diag_write_armed_q    <= 1'b0;
             tx_diag_riu_override     <= 1'b0;
             tx_diag_riu_addr         <= 6'd0;
             tx_diag_riu_wr_data      <= 16'd0;
@@ -1962,6 +1973,13 @@ module ddr4_phy_native #(
             tx_dq_inc     <= 1'b0;
             tx_dq_en_vtc  <= 1'b1;
             o_tx_diag_ack <= 1'b0;
+
+            // Write states override this after first presenting their payload.
+            // All other states disarm the next transaction.
+            if ((tx_diag_state != TX_DIAG_WRITE_CTRL) &&
+                (tx_diag_state != TX_DIAG_WRITE_DELAY) &&
+                (tx_diag_state != TX_DIAG_RESTORE_CTRL))
+                tx_diag_write_armed_q <= 1'b0;
 
             case (tx_diag_state)
                 TX_DIAG_IDLE: begin
@@ -2041,8 +2059,12 @@ module ddr4_phy_native #(
                     // Interconnect writes are legal only while RIU_VALID is
                     // High.  A collision after this accepted cycle is still
                     // allowed; WAIT_CTRL_WRITE polls the committed value.
-                    if (tx_diag_riu_selected_valid) begin
+                    if (!tx_diag_write_armed_q) begin
+                        tx_diag_write_armed_q <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                    end else if (tx_diag_riu_selected_valid) begin
                         tx_diag_riu_wr_en <= 1'b1;
+                        tx_diag_write_armed_q <= 1'b0;
                         tx_diag_wait_q <= 6'd0;
                         tx_diag_state <= TX_DIAG_WAIT_CTRL_WRITE;
                     end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
@@ -2111,8 +2133,12 @@ module ddr4_phy_native #(
                     // INC=DEC=0 is the UG571 absolute-load operation.
                     tx_diag_riu_addr <= 6'h0b + tx_diag_map_q[2:0];
                     tx_diag_riu_wr_data <= {7'd0, tx_diag_target_q};
-                    if (tx_diag_riu_selected_valid) begin
+                    if (!tx_diag_write_armed_q) begin
+                        tx_diag_write_armed_q <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
+                    end else if (tx_diag_riu_selected_valid) begin
                         tx_diag_riu_wr_en <= 1'b1;
+                        tx_diag_write_armed_q <= 1'b0;
                         tx_diag_wait_q <= 6'd0;
                         tx_diag_state <= TX_DIAG_WAIT_DELAY_WRITE;
                     end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
@@ -2154,8 +2180,12 @@ module ddr4_phy_native #(
                     if (tx_diag_ctrl_valid_q) begin
                         tx_diag_riu_addr <= RIU_ADDR_NIBBLE_CTRL0;
                         tx_diag_riu_wr_data <= tx_diag_ctrl_q | 16'h0400;
-                        if (tx_diag_riu_selected_valid) begin
+                        if (!tx_diag_write_armed_q) begin
+                            tx_diag_write_armed_q <= 1'b1;
+                            tx_diag_wait_q <= 6'd0;
+                        end else if (tx_diag_riu_selected_valid) begin
                             tx_diag_riu_wr_en <= 1'b1;
+                            tx_diag_write_armed_q <= 1'b0;
                             tx_diag_wait_q <= 6'd0;
                             tx_diag_state <= TX_DIAG_WAIT_CTRL_RESTORE;
                         end else if (tx_diag_wait_q <
@@ -2176,8 +2206,9 @@ module ddr4_phy_native #(
                     if (tx_diag_wait_q < 6'd3) begin
                         tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
                     end else if (tx_diag_riu_selected_valid &&
-                                 (tx_diag_riu_selected_data ==
-                                  (tx_diag_ctrl_q | 16'h0400))) begin
+                                 (((tx_diag_riu_selected_data ^
+                                    (tx_diag_ctrl_q | 16'h0400)) &
+                                   RIU_NIBBLE_CTRL0_VERIFY_MASK) == 16'd0)) begin
                         tx_diag_riu_readback_q <=
                             tx_diag_riu_selected_data;
                         tx_diag_wait_q <= 6'd0;
@@ -2435,15 +2466,16 @@ module ddr4_phy_native #(
     reg [APP_RETURN_PTR_BITS-1:0] app_return_rd_ptr;
     (* mark_debug = "true" *) reg [APP_RETURN_PTR_BITS:0]
         app_return_count;
-    // Native FIFO Q is first-word-present. Capture the current head on the
-    // same rising edge that consumes it. The fabric register sees the stable
-    // pre-edge Q value, while RXTX_BITSLICE advances Q after that edge. This
-    // is a full-cycle path; the former falling-edge sampler limited Fmax.
+    // Native FIFO Q is first-word-present.  At tCK >= 1000 ps, sample the
+    // current head on the falling edge for which registered FIFO_RD_EN is High;
+    // the following rising edge consumes that same head.  Faster interfaces
+    // use the pre-edge Q value captured on the consuming rising edge so this
+    // high-fanout data path retains a full controller cycle for timing closure.
     reg [SERDES_RATIO*DFI_DATA_WIDTH-1:0] app_fifo_sample_data_q;
     (* mark_debug = "true" *) reg app_fifo_sample_valid_q;
     // Retained for ILA visibility of the preceding read request.  Q itself is
     // sampled from app_fifo_rd_en_q below and advances through the same
-    // one-cycle elastic stage as the captured FIFO head.
+    // one-word elastic stage as the captured FIFO head.
     (* mark_debug = "true" *) reg app_fifo_rd_en_sample_q;
     // A production PHY_RDEN window begins at the trained BL8 data boundary, so
     // one legal native-FIFO pop produces one complete eight-UI DQ word. Hold
@@ -3091,13 +3123,14 @@ module ddr4_phy_native #(
     end
 
     // RXTX_BITSLICE is first-word-present: app_fifo_rd_en_q identifies the
-    // current head that is consumed on this rising DIV_CLK edge. The fabric
-    // register captures the stable pre-advance head. The request register
-    // was formed only after every bit reported nonempty, and no other reader
+    // current head. At tCK >= 1000 ps it is sampled on the falling edge and
+    // consumed on the next rising DIV_CLK edge. At faster rates its stable
+    // pre-edge value is captured on that consuming rising edge. The request
+    // register was formed only after every bit reported nonempty, and no other reader
     // owns the FIFO in application mode, so the reservation cannot disappear
     // before it is consumed. Do not recompute the capture enable from
-    // FIFO_EMPTY at this boundary. Besides losing the final word when EMPTY
-    // asserts after a legal pop, that path crosses the FIFO_EMPTY decode and a
+    // FIFO_EMPTY at the sampling boundary. Besides losing the final word when
+    // EMPTY asserts after a legal pop, that path crosses the FIFO_EMPTY decode and a
     // 256-register CE fanout in one capture decision. At DDR4-1600 hardware
     // showed a single sample bit retaining the preceding word while all other
     // bits updated, precisely the failure mode of that marginal distributed
@@ -3105,10 +3138,13 @@ module ddr4_phy_native #(
     //
     // The Q-data bank is sampled unconditionally.  Only the compact valid bit
     // is qualified, so no FIFO status/control decode drives the data-register
-    // clock enables.
+    // clock enables. Hardware qualification places the safe crossover between
+    // DDR4-1866 (1071 ps, falling-edge capture) and DDR4-2133 (937 ps,
+    // rising-edge capture); the selection is static at elaboration.
     integer app_sample_lane, app_sample_bit;
     integer app_sample_phase, app_sample_idx;
-    always @(posedge i_controller_clk) begin
+    task app_fifo_capture;
+    begin
         if (sync_rst || !app_account_mode) begin
             app_fifo_sample_data_q <=
                 {(SERDES_RATIO*DFI_DATA_WIDTH){1'b0}};
@@ -3159,6 +3195,17 @@ module ddr4_phy_native #(
 `endif
         end
     end
+    endtask
+
+    generate
+        if (DDR4_CLK_PERIOD >= 1000) begin : gen_app_fifo_capture_negedge
+            always @(negedge i_controller_clk)
+                app_fifo_capture;
+        end else begin : gen_app_fifo_capture_posedge
+            always @(posedge i_controller_clk)
+                app_fifo_capture;
+        end
+    endgenerate
 
 `ifndef SYNTHESIS
     // Training deliberately combines RX_RST with a priming PHY_RDEN pattern,

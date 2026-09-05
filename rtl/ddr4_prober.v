@@ -290,10 +290,13 @@ module ddr4_prober #(
         // every stress word at a distinct address so no earlier error is
         // hidden by a later overwrite.  Half the region alternates all-zero
         // and all-one words; the other half uses the normal address-derived
-        // BIST pattern.  The depth exceeds the longest pre-failure interval
-        // observed during the validating full-memory BIST while remaining a
-        // bounded calibration cost independent of the installed capacity.
-        localparam integer BIST_TX_EYE_WORDS = 262144;
+        // BIST pattern. The scratch region is aligned around the address that
+        // actually failed, so it need not repeat the entire pre-failure BIST
+        // interval at every tap. The selected center is still accepted only
+        // after the complete BIST restarts at address zero; a false local pass
+        // therefore advances the exhaustive center-out candidate search rather
+        // than weakening the final qualification criterion.
+        localparam integer BIST_TX_EYE_WORDS = 8192;
         localparam integer BIST_TX_EYE_ADDR_BITS =
             $clog2(BIST_TX_EYE_WORDS);
         localparam integer BIST_TX_EYE_COUNT_BITS =
