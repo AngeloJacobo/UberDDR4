@@ -1168,10 +1168,11 @@ module ddr4_phy_native #(
                                native_riu_lower_sel;
     wire [BYTE_LANES-1:0] byte_riu_upper_sel =
         tx_diag_riu_override ? tx_diag_riu_upper_sel : native_riu_sel;
-    // RIU output-delay updates must pause BITSLICE_CONTROL VT tracking.  The
-    // diagnostic FSM holds this Low for the UG571 ten-clock guard intervals
-    // on both sides of every reversible update.
-    wire byte_bsc_en_vtc = bsc_en_vtc & ~tx_diag_riu_override;
+    // Keep nibble-wide BISC VT tracking enabled during the post-failure
+    // transaction. NIBBLE_CTRL0[10] hands only TX delay ownership to RIU;
+    // lowering BITSLICE_CONTROL.EN_VTC here also tears down the calibrated RX
+    // gate and previously left all pending reads without a return strobe.
+    wire byte_bsc_en_vtc = bsc_en_vtc;
     (* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
     reg [1:0] byte_bsc_en_vtc_sync;
 
@@ -1865,18 +1866,13 @@ module ddr4_phy_native #(
     // -----------------------------------------------------------------
     // Post-failure per-bit TX-delay controller
     // -----------------------------------------------------------------
-    // MIG leaves the individual RXTX_BITSLICE TX_CE/TX_LOAD ports idle and
-    // adjusts native output delays through BITSLICE_CONTROL's RIU.  UG571
-    // defines ODELAY00 at 0x0A (tristate) and ODELAY01..07 at 0x0B..0x11
-    // (physical bit-slice positions 0..6).  Temporarily set
-    // NIBBLE_CTRL0.DIS_DYN_MODE_TX, load the selected ODELAYxx register, and
-    // verify its RIU readback.  Once software-directed TX centering begins,
-    // retain DIS_DYN_MODE_TX for the selected nibble: UG571 defines that bit
-    // as the ownership switch that enables transmit delay-line RIU updates.
-    // Clearing it after each write returns the delay to dynamic MIG/BISC
-    // ownership and can silently discard the measured setting before BIST
-    // validation.  EN_VTC is still re-enabled after each transaction, so the
-    // TIME-format delay continues voltage/temperature compensation.
+    // EN_DYN_ODLY_MODE gives the memory-mode BITSLICE_CONTROL ownership of the
+    // output delays, so the individual RXTX_BITSLICE LOAD/CE pins are not the
+    // active control path. Follow UG571's supported RIU sequence instead:
+    // read NIBBLE_CTRL0, set DIS_DYN_MODE_TX, load the selected ODELAYxx, and
+    // verify every address-tagged readback. Memory traffic is drained by the
+    // prober for the complete handshake. Keep DIS_DYN_MODE_TX set after the
+    // first update so BISC cannot silently overwrite the measured TX center.
     localparam [4:0] TX_DIAG_IDLE              = 5'd0,
                      TX_DIAG_WAIT_VTC_OFF      = 5'd1,
                      TX_DIAG_READ_CTRL         = 5'd2,
@@ -2031,9 +2027,7 @@ module ddr4_phy_native #(
                 end
 
                 TX_DIAG_WAIT_CTRL_READ: begin
-                    if (tx_diag_wait_q < 6'd3) begin
-                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
-                    end else if (tx_diag_riu_selected_valid) begin
+                    if (tx_diag_riu_selected_valid) begin
                         tx_diag_ctrl_q <= tx_diag_riu_selected_data;
                         tx_diag_ctrl_valid_q <= 1'b1;
                         tx_diag_riu_readback_q <=
@@ -2041,8 +2035,6 @@ module ddr4_phy_native #(
                         tx_diag_wait_q <= 6'd0;
                         tx_diag_state <= TX_DIAG_WRITE_CTRL;
                     end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
-                        // BISC owns the RIU temporarily.  Keep the address
-                        // and nibble selection stable until it releases it.
                         tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
                     end else begin
                         o_tx_diag_error <= 1'b1;
@@ -2052,13 +2044,10 @@ module ddr4_phy_native #(
                 end
 
                 TX_DIAG_WRITE_CTRL: begin
-                    // Bit 10 disables fabric dynamic mode and transfers
-                    // output-delay ownership to the selected nibble's RIU.
+                    // Bit 10 transfers output-delay ownership to RIU without
+                    // disturbing the other live NIBBLE_CTRL0 gate controls.
                     tx_diag_riu_addr <= RIU_ADDR_NIBBLE_CTRL0;
                     tx_diag_riu_wr_data <= tx_diag_ctrl_q | 16'h0400;
-                    // Interconnect writes are legal only while RIU_VALID is
-                    // High.  A collision after this accepted cycle is still
-                    // allowed; WAIT_CTRL_WRITE polls the committed value.
                     if (!tx_diag_write_armed_q) begin
                         tx_diag_write_armed_q <= 1'b1;
                         tx_diag_wait_q <= 6'd0;
@@ -2077,18 +2066,13 @@ module ddr4_phy_native #(
                 end
 
                 TX_DIAG_WAIT_CTRL_WRITE: begin
-                    if (tx_diag_wait_q < 6'd3) begin
-                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
-                    end else if (tx_diag_riu_selected_valid &&
-                                 tx_diag_riu_selected_data[10]) begin
+                    if (tx_diag_riu_selected_valid &&
+                        tx_diag_riu_selected_data[10]) begin
                         tx_diag_riu_readback_q <=
                             tx_diag_riu_selected_data;
                         tx_diag_wait_q <= 6'd0;
                         tx_diag_state <= TX_DIAG_READ_DELAY;
                     end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
-                        // RIU writes are shadowed and can be deferred by
-                        // BISC.  Do not mistake a valid-but-stale readback for
-                        // a failed write; poll until ownership is visible.
                         tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
                     end else begin
                         tx_diag_riu_readback_q <=
@@ -2106,9 +2090,7 @@ module ddr4_phy_native #(
                 end
 
                 TX_DIAG_WAIT_DELAY_READ: begin
-                    if (tx_diag_wait_q < 6'd3) begin
-                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
-                    end else if (tx_diag_riu_selected_valid) begin
+                    if (tx_diag_riu_selected_valid) begin
                         tx_diag_riu_readback_q <=
                             tx_diag_riu_selected_data;
                         tx_diag_current_tap_q <=
@@ -2151,21 +2133,15 @@ module ddr4_phy_native #(
                 end
 
                 TX_DIAG_WAIT_DELAY_WRITE: begin
-                    if (tx_diag_wait_q < 6'd3) begin
-                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
-                    end else if (tx_diag_riu_selected_valid &&
-                                 (tx_diag_riu_selected_data[8:0] ==
-                                  tx_diag_target_q)) begin
+                    if (tx_diag_riu_selected_valid &&
+                        (tx_diag_riu_selected_data[8:0] ==
+                         tx_diag_target_q)) begin
                         tx_diag_riu_readback_q <=
                             tx_diag_riu_selected_data;
                         tx_diag_current_tap_q <= tx_diag_target_q;
                         tx_diag_wait_q <= 6'd0;
                         tx_diag_state <= TX_DIAG_RESTORE_CTRL;
                     end else if (tx_diag_wait_q < TX_DIAG_RIU_TIMEOUT) begin
-                        // A valid stale value can precede the deferred write;
-                        // continue polling until the requested tap commits.
-                        tx_diag_riu_readback_q <=
-                            tx_diag_riu_selected_data;
                         tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
                     end else begin
                         tx_diag_riu_readback_q <=
@@ -2203,12 +2179,10 @@ module ddr4_phy_native #(
                 end
 
                 TX_DIAG_WAIT_CTRL_RESTORE: begin
-                    if (tx_diag_wait_q < 6'd3) begin
-                        tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
-                    end else if (tx_diag_riu_selected_valid &&
-                                 (((tx_diag_riu_selected_data ^
-                                    (tx_diag_ctrl_q | 16'h0400)) &
-                                   RIU_NIBBLE_CTRL0_VERIFY_MASK) == 16'd0)) begin
+                    if (tx_diag_riu_selected_valid &&
+                        (((tx_diag_riu_selected_data ^
+                           (tx_diag_ctrl_q | 16'h0400)) &
+                          RIU_NIBBLE_CTRL0_VERIFY_MASK) == 16'd0)) begin
                         tx_diag_riu_readback_q <=
                             tx_diag_riu_selected_data;
                         tx_diag_wait_q <= 6'd0;
@@ -2228,8 +2202,6 @@ module ddr4_phy_native #(
                     if (tx_diag_wait_q < 6'd9) begin
                         tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
                     end else begin
-                        // Releasing the override restores the calibrated RIU
-                        // owner and raises BITSLICE_CONTROL EN_VTC.
                         tx_diag_riu_override <= 1'b0;
                         tx_diag_riu_lower_sel <= {BYTE_LANES{1'b0}};
                         tx_diag_riu_upper_sel <= {BYTE_LANES{1'b0}};
@@ -2241,8 +2213,9 @@ module ddr4_phy_native #(
                 TX_DIAG_WAIT_VTC_ON: begin
                     if (tx_diag_wait_q < 6'd9) begin
                         tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
-                    end else begin
+                    end else if (all_vtc_rdy) begin
                         o_tx_diag_ack <= 1'b1;
+                        tx_diag_wait_q <= 6'd0;
                         tx_diag_state <= TX_DIAG_WAIT_REQ_LOW;
                     end
                 end

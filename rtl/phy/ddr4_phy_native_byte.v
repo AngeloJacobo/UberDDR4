@@ -619,18 +619,55 @@ always @(posedge i_div_clk) begin
 end
 assign o_riu_gate_status_sticky = riu_gate_status_sync[1];
 
-// Return RIU data to DIV_CLK with the same toggle discipline used for writes.
-// The payload register is stable before the toggle reaches the destination;
-// two data stages then align it with the synchronized response event.
+// Return exactly one address-tagged RIU response for each settled read or
+// completed write. RIU_VALID is a port-availability level, not a per-read
+// pulse (UG571), so toggling a CDC event on every High cycle can alias an even
+// number of source transitions and associate data from the preceding address
+// with the current request. Wait three RIU clocks after the effective request
+// changes (or a write is launched), then capture one stable readback. The tag
+// prevents a late response from an abandoned request being accepted in DIV_CLK.
 reg [15:0] riu_response_data_hold;
 reg        riu_response_toggle;
+reg [5:0]  riu_response_addr_hold;
+reg        riu_response_lower_hold, riu_response_upper_hold;
+reg [5:0]  riu_response_addr_q;
+reg        riu_response_lower_q, riu_response_upper_q;
+reg [1:0]  riu_response_settle_q;
+reg        riu_response_pending_q;
+wire       riu_response_request_changed =
+    (riu_addr_q != riu_response_addr_q) ||
+    (riu_lower_sel_q != riu_response_lower_q) ||
+    (riu_upper_sel_q != riu_response_upper_q);
 always @(posedge i_riu_clk) begin
     if (i_riu_rst) begin
         riu_response_data_hold <= 16'd0;
         riu_response_toggle    <= 1'b0;
-    end else if (riu_rd_valid_raw) begin
-        riu_response_data_hold <= riu_rd_data_raw;
-        riu_response_toggle    <= ~riu_response_toggle;
+        riu_response_addr_hold <= 6'd0;
+        riu_response_lower_hold <= 1'b0;
+        riu_response_upper_hold <= 1'b0;
+        riu_response_addr_q    <= 6'd0;
+        riu_response_lower_q   <= 1'b0;
+        riu_response_upper_q   <= 1'b0;
+        riu_response_settle_q  <= 2'd0;
+        riu_response_pending_q <= 1'b1;
+    end else if (riu_wr_en_q || riu_response_request_changed) begin
+        riu_response_addr_q    <= riu_addr_q;
+        riu_response_lower_q   <= riu_lower_sel_q;
+        riu_response_upper_q   <= riu_upper_sel_q;
+        riu_response_settle_q  <= 2'd0;
+        riu_response_pending_q <= 1'b1;
+    end else if (riu_response_pending_q) begin
+        if (riu_response_settle_q != 2'd3) begin
+            riu_response_settle_q <= riu_response_settle_q + 1'b1;
+        end else if (riu_rd_valid_raw &&
+                     (riu_lower_sel_q || riu_upper_sel_q)) begin
+            riu_response_data_hold  <= riu_rd_data_raw;
+            riu_response_addr_hold  <= riu_addr_q;
+            riu_response_lower_hold <= riu_lower_sel_q;
+            riu_response_upper_hold <= riu_upper_sel_q;
+            riu_response_toggle     <= ~riu_response_toggle;
+            riu_response_pending_q  <= 1'b0;
+        end
     end
 end
 
@@ -639,6 +676,12 @@ reg [1:0] riu_response_toggle_sync;
 reg       riu_response_toggle_seen;
 (* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
 reg [15:0] riu_response_data_meta, riu_response_data_sync;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg [5:0] riu_response_addr_meta, riu_response_addr_sync;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg riu_response_lower_meta, riu_response_lower_sync;
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+reg riu_response_upper_meta, riu_response_upper_sync;
 reg [5:0] riu_request_addr_q;
 reg       riu_request_lower_q, riu_request_upper_q;
 wire      riu_request_changed =
@@ -651,6 +694,12 @@ always @(posedge i_div_clk) begin
         riu_response_toggle_seen <= 1'b0;
         riu_response_data_meta   <= 16'd0;
         riu_response_data_sync   <= 16'd0;
+        riu_response_addr_meta   <= 6'd0;
+        riu_response_addr_sync   <= 6'd0;
+        riu_response_lower_meta  <= 1'b0;
+        riu_response_lower_sync  <= 1'b0;
+        riu_response_upper_meta  <= 1'b0;
+        riu_response_upper_sync  <= 1'b0;
         riu_request_addr_q       <= 6'd0;
         riu_request_lower_q      <= 1'b0;
         riu_request_upper_q      <= 1'b0;
@@ -661,6 +710,12 @@ always @(posedge i_div_clk) begin
             {riu_response_toggle_sync[0], riu_response_toggle};
         riu_response_data_meta <= riu_response_data_hold;
         riu_response_data_sync <= riu_response_data_meta;
+        riu_response_addr_meta <= riu_response_addr_hold;
+        riu_response_addr_sync <= riu_response_addr_meta;
+        riu_response_lower_meta <= riu_response_lower_hold;
+        riu_response_lower_sync <= riu_response_lower_meta;
+        riu_response_upper_meta <= riu_response_upper_hold;
+        riu_response_upper_sync <= riu_response_upper_meta;
         riu_request_addr_q  <= i_riu_addr;
         riu_request_lower_q <= i_riu_lower_sel;
         riu_request_upper_q <= i_riu_upper_sel;
@@ -674,7 +729,10 @@ always @(posedge i_div_clk) begin
         if (riu_response_toggle_sync[1] !=
             riu_response_toggle_seen) begin
             riu_response_toggle_seen <= riu_response_toggle_sync[1];
-            if (!(i_riu_wr_en || riu_request_changed)) begin
+            if (!(i_riu_wr_en || riu_request_changed) &&
+                (riu_response_addr_sync == i_riu_addr) &&
+                (riu_response_lower_sync == i_riu_lower_sel) &&
+                (riu_response_upper_sync == i_riu_upper_sel)) begin
                 o_riu_rd_data <= riu_response_data_sync;
                 o_riu_valid <= 1'b1;
             end
