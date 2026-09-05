@@ -290,9 +290,9 @@ module ddr4_phy_native #(
     // the BL8 boundary. During the subsequent DQ-eye sweep, alternate MPR0
     // and MPR2 on successive READs. JEDEC MPR0 is observed at the XiPHY FIFO
     // as 1010_1010, exercising every data transition, while MPR2 identifies
-    // which command produced the returned word. Requiring the pattern that
-    // was actually requested prevents an adjacent PHY_RDEN cycle from looking
-    // like a valid eye merely because consecutive MPR reads repeat data.
+    // which command produced the returned word. Each newly loaded eye tap
+    // consumes one tagged primer return before it is measured, so a FIFO word
+    // retained from an earlier tap cannot qualify the new delay candidate.
     localparam [7:0] MPR_GATE_PATTERN = 8'b11110000;
     localparam [7:0] MPR_EYE_PATTERN  = 8'b10101010;
     localparam [7:0] MPR2_PATTERN     = MPR_GATE_PATTERN;
@@ -729,11 +729,10 @@ module ddr4_phy_native #(
     // Bank address BA[BA_BITS-1:0]
     (* mark_debug = "true" *) wire [SERDES_RATIO-1:0] dfi_read_command;
     (* mark_debug = "true" *) wire dfi_read_expected;
-    // Consecutive eye-training READs use different MPR locations.  A raw
-    // FIFO word from the preceding command cannot validate the current delay
-    // candidate even though both are individually legal MPR data.
+    // Consecutive eye-training READs use different MPR locations.  Combined
+    // with the per-tap primer below, the measured return is both fresh for the
+    // loaded delay and tagged with the location driven by its READ command.
     reg mpr_alt_page_q;
-    reg [7:0] mpr_command_pattern_q;
     reg [7:0] mpr_expected_pattern_q;
     wire [BA_BITS-1:0] native_mpr_bank = mpr_alt_page_q ?
         {{(BA_BITS-2){1'b0}}, 2'b10} : {BA_BITS{1'b0}};
@@ -743,15 +742,16 @@ module ddr4_phy_native #(
     always @(posedge i_controller_clk) begin
         if (sync_rst || !i_dfi_rdlvl_en) begin
             mpr_alt_page_q <= 1'b0;
-            mpr_command_pattern_q <= MPR0_PATTERN;
             mpr_expected_pattern_q <= MPR0_PATTERN;
         end else begin
             if (|dfi_read_command) begin
-                // Q produced by this candidate's first pop belongs to the
-                // preceding serialized READ.  Retain that command's page tag
-                // while recording the stable page launched now.
-                mpr_expected_pattern_q <= mpr_command_pattern_q;
-                mpr_command_pattern_q <=
+                // Associate the observation with the MPR location driven by
+                // this READ.  Eye candidates change the input delay between
+                // commands, so comparing against the preceding command tag
+                // can accept a stale FIFO word measured at the previous tap.
+                // Alternating MPR0/MPR2 makes such a word fail until the
+                // current command's distinct pattern reaches the reader.
+                mpr_expected_pattern_q <=
                     mpr_alt_page_q ? MPR2_PATTERN : MPR0_PATTERN;
             end
             // Keep BA stable throughout command serialization.  The return
@@ -3540,9 +3540,7 @@ module ddr4_phy_native #(
     reg       eye_observe_verify;
     reg [3:0] eye_observe_count;
     (* mark_debug = "true" *) reg eye_observe_seen;
-`ifdef SIM_NATIVE_DIAG_EYE_PRIME
     reg eye_prime_discard;
-`endif
     (* mark_debug = "true" *) reg [3:0] eye_observe_offset;
     reg [1:0] eye_verify_retries;
     // Pipeline the complete-byte comparison before it reaches the eye FSM.
@@ -4291,9 +4289,7 @@ module ddr4_phy_native #(
             eye_observe_count   <= 4'b0;
             eye_observe_seen    <= 1'b0;
             eye_observe_bit_seen <= {DQ_BITS{1'b0}};
-`ifdef SIM_NATIVE_DIAG_EYE_PRIME
             eye_prime_discard   <= 1'b1;
-`endif
             eye_observe_offset  <= 4'd8;
             eye_verify_retries  <= 2'b0;
             eye_mcl_base        <= 6'd7;
@@ -5368,9 +5364,7 @@ module ddr4_phy_native #(
                         if (phy_timer != 0) begin
                             if (phy_timer == 4'd3) begin
                                 idelay_load_lane[train_lane] <= 1'b1;
-`ifdef SIM_NATIVE_DIAG_EYE_PRIME
                                 eye_prime_discard <= 1'b1;
-`endif
                             end
                             phy_timer <= phy_timer - 1'b1;
                         end else if (|i_dfi_rddata_en) begin
@@ -5413,7 +5407,6 @@ module ddr4_phy_native #(
                                 iserdes_dq_q[train_lane * DQ_BITS],
                                 rx_dq_data[train_lane]);
 `endif
-`ifdef SIM_NATIVE_DIAG_EYE_PRIME
                             if (eye_prime_discard) begin
                                 // The asynchronous native FIFO can still
                                 // present the word written by the preceding
@@ -5427,7 +5420,6 @@ module ddr4_phy_native #(
                                 phy_state <= eye_observe_verify ?
                                     PHY_EYE_VERIFY : PHY_EYE_SWEEP;
                             end else
-`endif
                             if (eye_observe_verify) begin
                                 if (eye_observe_seen |
                                     eye_observe_match_q) begin
@@ -5803,9 +5795,7 @@ module ddr4_phy_native #(
                         if (phy_timer != 0) begin
                             if (phy_timer == 4'd3) begin
                                 idelay_load_lane[train_lane] <= 1'b1;
-`ifdef SIM_NATIVE_DIAG_EYE_PRIME
                                 eye_prime_discard <= 1'b1;
-`endif
                             end
                             phy_timer <= phy_timer - 1'b1;
                         end else if (!idelay_per_dq_at_center) begin
@@ -5854,10 +5844,8 @@ module ddr4_phy_native #(
                                 // of assuming a fixed CNTVALUEOUT latency.
                                 if (&rx_align_valid)
                                     idelay_load_lane[train_lane] <= 1'b1;
-`ifdef SIM_NATIVE_DIAG_EYE_PRIME
                                 if (&rx_align_valid)
                                     eye_prime_discard <= 1'b1;
-`endif
                             end
                             if ((phy_timer != 4'd3) || (&rx_align_valid))
                                 phy_timer <= phy_timer - 1'b1;
