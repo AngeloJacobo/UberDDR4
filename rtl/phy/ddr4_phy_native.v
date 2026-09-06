@@ -1888,16 +1888,19 @@ module ddr4_phy_native #(
                      TX_DIAG_WAIT_POST         = 5'd12,
                      TX_DIAG_WAIT_VTC_ON       = 5'd13,
                      TX_DIAG_WAIT_REQ_LOW      = 5'd14;
-    // UG571 permits the internal BISC sequencer to defer an RIU transaction
-    // by lowering RIU_VALID.  Normal output-delay registers complete in two
-    // RIU clocks, but wait substantially longer here so a collision can
-    // retire without turning a harmless maintenance access into a false
-    // diagnostic failure.
-    localparam [5:0] TX_DIAG_RIU_TIMEOUT = 6'd63;
+    // RIU_VALID is an availability indication, not a fixed-latency response.
+    // UG571 permits BISC to hold it Low while its own access is in progress;
+    // even though normal output-delay writes complete in two RIU clocks, the
+    // former 63-DIV_CLK limit could spuriously abort during arbitration. Keep
+    // a finite watchdog, but make it long relative to BISC maintenance.
+    localparam integer TX_DIAG_RIU_WAIT_W = 20;
+    localparam [TX_DIAG_RIU_WAIT_W-1:0] TX_DIAG_RIU_TIMEOUT =
+        {TX_DIAG_RIU_WAIT_W{1'b1}};
     (* mark_debug = "true" *) reg [4:0] tx_diag_state;
     (* mark_debug = "true" *) reg [7:0] tx_diag_dq_q;
     (* mark_debug = "true" *) reg [8:0] tx_diag_target_q;
-    (* mark_debug = "true" *) reg [5:0] tx_diag_wait_q;
+    (* mark_debug = "true" *) reg [TX_DIAG_RIU_WAIT_W-1:0]
+        tx_diag_wait_q;
     (* mark_debug = "true" *) reg [TX_DIAG_LANE_W-1:0]
         tx_diag_lane_q;
     (* mark_debug = "true" *) reg [3:0] tx_diag_map_q;
