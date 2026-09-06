@@ -24,6 +24,29 @@ DDR4-1250 is not claimed as a JEDEC speed bin. It was tested because the
 seller MIG project declares `C0.DDR4_MAX_PERIOD=1600`, and it is reported
 separately from the four standard rates.
 
+## Maximum native-PHY rate
+
+DDR4-2400 is the highest timing-supported standard rate for this native PHY
+on the AXKU3 `xcku3p-ffvb676-2-i`. A ceiling build at DDR4-2666 used the
+current RTL, a 333.333 MHz quarter-rate controller clock, a 750 ps DDR4 clock
+period, and a 2666.667 MHz `CLKOUTPHY`. Implementation closed ordinary setup
+and hold timing at WNS `+0.006 ns` and WHS `+0.009 ns`, with all 47,243
+routable nets complete and no routing errors.
+
+The build nevertheless fails the device pulse-width/minimum-period gate on 90
+endpoints. The `-2` speed file requires `TX_BITSLICE/CLK` period >= 3.195 ns,
+while DDR4-2666 provides 3.000 ns, for WPWS `-0.195 ns` and TPWS
+`-17.550 ns`. This is a characterized primitive limit, not a fabric path that
+placement or routing can repair. The corresponding DDR4-2400 clock period is
+3.333 ns and passes the same check by `+0.138 ns`.
+
+The parallel-clock primitive limit corresponds to approximately 2504 MT/s;
+because the next JEDEC bin above DDR4-2400 is DDR4-2666, DDR4-2400 is the
+maximum supported standard rate. The DDR4-2666 bitstream was not programmed
+or hardware-tested. Its diagnostic artifacts use the stem
+`artifacts/ddr2666_ceiling_status` and are retained only as negative timing
+evidence.
+
 ## Acceptance criteria
 
 A trial was accepted only when its final saved ILA capture satisfied all of
