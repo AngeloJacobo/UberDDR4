@@ -217,8 +217,13 @@ module ddr4_prober #(
     (* mark_debug = "true" *) reg [31:0] error_count;
     (* mark_debug = "true" *) reg        bist_fail_sticky;
     (* mark_debug = "true" *) reg        auto_reset_en;
+    localparam [3:0] BIST_AUTO_RESET_MAX = 4'd15;
+    (* mark_debug = "true" *) reg [3:0]  bist_auto_reset_count;
+    reg                                  bist_failed_reset_req_q;
     (* mark_debug = "true" *) wire       bist_pass;
     wire bist_diag_active;
+    wire bist_auto_reset_available = auto_reset_en &&
+        (bist_auto_reset_count < BIST_AUTO_RESET_MAX);
 
     // Module-scope CSR write-enable decode (visible to both gen_bist and gen_csr)
     wire csr_we = i_wb_dbg_cyc && i_wb_dbg_stb && i_wb_dbg_we;
@@ -227,6 +232,21 @@ module ddr4_prober #(
     // BIST Auto-Start (rising edge of calib_complete when BIST enabled)
     // -----------------------------------------------------------------
     wire prober_internal_reset = !i_rst_n || o_soft_reset_req || o_bist_failed_reset_req;
+
+    // Keep recovery history across the internal DDR reset it requests.  This
+    // makes a recovered final PASS auditable and also bounds repeated recovery
+    // when a persistent hardware fault cannot be repaired by retraining.
+    always @(posedge i_clk) begin
+        if (!i_rst_n) begin
+            bist_auto_reset_count <= 4'd0;
+            bist_failed_reset_req_q <= 1'b0;
+        end else begin
+            bist_failed_reset_req_q <= o_bist_failed_reset_req;
+            if (o_bist_failed_reset_req && !bist_failed_reset_req_q &&
+                (bist_auto_reset_count < BIST_AUTO_RESET_MAX))
+                bist_auto_reset_count <= bist_auto_reset_count + 1'b1;
+        end
+    end
 
     reg calib_complete_q;
     always @(posedge i_clk) begin
@@ -1284,6 +1304,8 @@ module ddr4_prober #(
                                     diag_done <= 1'b1;
                                     o_wb_cyc <= 1'b0;
                                     bist_state <= BIST_DONE;
+                                    if (bist_auto_reset_available)
+                                        o_bist_failed_reset_req <= 1'b1;
                                 end
                             end
                         end
@@ -1301,6 +1323,8 @@ module ddr4_prober #(
                                     diag_done <= 1'b1;
                                     o_wb_cyc <= 1'b0;
                                     bist_state <= BIST_DONE;
+                                    if (bist_auto_reset_available)
+                                        o_bist_failed_reset_req <= 1'b1;
                                 end else if (diag_tx_eye_restore_pending) begin
                                     // The production/BISC-maintained tap is
                                     // back in place; leave no diagnostic state
@@ -1310,6 +1334,8 @@ module ddr4_prober #(
                                     diag_done <= 1'b1;
                                     o_wb_cyc <= 1'b0;
                                     bist_state <= BIST_DONE;
+                                    if (bist_auto_reset_available)
+                                        o_bist_failed_reset_req <= 1'b1;
                                 end else begin
                                     if (!diag_tx_eye_baseline_valid) begin
                                         diag_tx_eye_baseline_tap <=
@@ -1529,6 +1555,8 @@ module ddr4_prober #(
                                     diag_done <= 1'b1;
                                     o_wb_cyc <= 1'b0;
                                     bist_state <= BIST_DONE;
+                                    if (bist_auto_reset_available)
+                                        o_bist_failed_reset_req <= 1'b1;
                                 end else if (o_phy_tx_diag_tap ==
                                              diag_tx_eye_center_tap) begin
                                     // Retain the centered tap and rerun every
@@ -1595,6 +1623,8 @@ module ddr4_prober #(
                             o_wb_cyc <= 1'b0;
                             o_wb_stb <= 1'b0;
                             bist_state <= BIST_DONE;
+                            if (bist_auto_reset_available)
+                                o_bist_failed_reset_req <= 1'b1;
                         end
                     endcase
                 end else case (bist_state)
@@ -1853,7 +1883,10 @@ module ddr4_prober #(
                         if (outstanding == 0) begin
                             o_wb_cyc   <= 1'b0;  // release WB bus ownership
                             bist_state <= BIST_DONE;
-                            if (bist_fail_sticky && auto_reset_en) begin // BIST failed and auto-reset is enabled, so request full DDR reset
+                            if (bist_fail_sticky &&
+                                bist_auto_reset_available) begin
+                                // BIST failed and bounded auto-reset recovery
+                                // is enabled, so request a full DDR retrain.
                                 o_bist_failed_reset_req <= 1'b1;
                             end
                         end
