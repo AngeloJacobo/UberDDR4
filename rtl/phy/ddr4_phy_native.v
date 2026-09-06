@@ -1896,17 +1896,21 @@ module ddr4_phy_native #(
     localparam integer TX_DIAG_RIU_WAIT_W = 20;
     localparam [TX_DIAG_RIU_WAIT_W-1:0] TX_DIAG_RIU_TIMEOUT =
         {TX_DIAG_RIU_WAIT_W{1'b1}};
+    localparam [3:0] TX_DIAG_RIU_RETRY_MAX = 4'd15;
     (* mark_debug = "true" *) reg [4:0] tx_diag_state;
     (* mark_debug = "true" *) reg [7:0] tx_diag_dq_q;
     (* mark_debug = "true" *) reg [8:0] tx_diag_target_q;
     (* mark_debug = "true" *) reg [TX_DIAG_RIU_WAIT_W-1:0]
         tx_diag_wait_q;
+    (* mark_debug = "true" *) reg [3:0] tx_diag_retry_q;
+    (* mark_debug = "true" *) reg [5:0] tx_diag_retry_count_q;
     (* mark_debug = "true" *) reg [TX_DIAG_LANE_W-1:0]
         tx_diag_lane_q;
     (* mark_debug = "true" *) reg [3:0] tx_diag_map_q;
     (* mark_debug = "true" *) reg [15:0] tx_diag_ctrl_q;
     (* mark_debug = "true" *) reg tx_diag_ctrl_valid_q;
     (* mark_debug = "true" *) reg [8:0] tx_diag_current_tap_q;
+    reg tx_diag_previous_valid_q;
     (* mark_debug = "true" *) reg [15:0] tx_diag_riu_readback_q;
     // The byte wrapper captures RIU write payloads into a bundled-data CDC
     // holding register on this clock. Present address/data for one complete
@@ -1942,11 +1946,14 @@ module ddr4_phy_native #(
             tx_diag_dq_q             <= 8'd0;
             tx_diag_target_q         <= 9'd0;
             tx_diag_wait_q           <= 6'd0;
+            tx_diag_retry_q          <= 4'd0;
+            tx_diag_retry_count_q    <= 6'd0;
             tx_diag_lane_q           <= {TX_DIAG_LANE_W{1'b0}};
             tx_diag_map_q            <= 4'd0;
             tx_diag_ctrl_q           <= 16'd0;
             tx_diag_ctrl_valid_q     <= 1'b0;
             tx_diag_current_tap_q    <= 9'd0;
+            tx_diag_previous_valid_q <= 1'b0;
             tx_diag_riu_readback_q   <= 16'd0;
             tx_diag_write_armed_q    <= 1'b0;
             tx_diag_riu_override     <= 1'b0;
@@ -1994,6 +2001,8 @@ module ddr4_phy_native #(
                         end else begin
                             tx_diag_dq_q <= i_tx_diag_dq;
                             tx_diag_target_q <= i_tx_diag_tap;
+                            tx_diag_retry_q <= 4'd0;
+                            tx_diag_previous_valid_q <= 1'b0;
                             tx_diag_lane_q <= i_tx_diag_dq / DQ_BITS;
                             tx_diag_map_q <=
                                 tx_diag_map_entry(i_tx_diag_dq);
@@ -2098,8 +2107,11 @@ module ddr4_phy_native #(
                             tx_diag_riu_selected_data;
                         tx_diag_current_tap_q <=
                             tx_diag_riu_selected_data[8:0];
-                        o_tx_diag_previous_tap <=
-                            tx_diag_riu_selected_data[8:0];
+                        if (!tx_diag_previous_valid_q) begin
+                            o_tx_diag_previous_tap <=
+                                tx_diag_riu_selected_data[8:0];
+                            tx_diag_previous_valid_q <= 1'b1;
+                        end
                         tx_diag_wait_q <= 6'd0;
                         tx_diag_state <=
                             (tx_diag_riu_selected_data[8:0] ==
@@ -2217,9 +2229,31 @@ module ddr4_phy_native #(
                     if (tx_diag_wait_q < 6'd9) begin
                         tx_diag_wait_q <= tx_diag_wait_q + 1'b1;
                     end else if (all_vtc_rdy) begin
-                        o_tx_diag_ack <= 1'b1;
-                        tx_diag_wait_q <= 6'd0;
-                        tx_diag_state <= TX_DIAG_WAIT_REQ_LOW;
+                        if (o_tx_diag_error &&
+                            (tx_diag_retry_q <
+                             TX_DIAG_RIU_RETRY_MAX)) begin
+                            // Each delay write is an idempotent absolute load,
+                            // and every failing path restores NIBBLE_CTRL0
+                            // before reaching this state. Re-enter through the
+                            // normal VTC handoff after a lost/late completion
+                            // instead of reporting a recoverable transport
+                            // event as a memory-training failure. Preserve the
+                            // first delay readback so the caller still sees the
+                            // original BISC-maintained tap after a retry.
+                            o_tx_diag_error <= 1'b0;
+                            tx_diag_retry_q <= tx_diag_retry_q + 1'b1;
+                            if (tx_diag_retry_count_q != 6'h3f)
+                                tx_diag_retry_count_q <=
+                                    tx_diag_retry_count_q + 1'b1;
+                            tx_diag_ctrl_valid_q <= 1'b0;
+                            tx_diag_riu_override <= 1'b1;
+                            tx_diag_wait_q <= 6'd0;
+                            tx_diag_state <= TX_DIAG_WAIT_VTC_OFF;
+                        end else begin
+                            o_tx_diag_ack <= 1'b1;
+                            tx_diag_wait_q <= 6'd0;
+                            tx_diag_state <= TX_DIAG_WAIT_REQ_LOW;
+                        end
                     end
                 end
 

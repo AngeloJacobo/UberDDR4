@@ -221,7 +221,7 @@ always @(posedge i_div_clk) begin
 end
 
 (* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
-reg [1:0] riu_wr_toggle_sync;
+reg [2:0] riu_wr_toggle_sync;
 reg       riu_wr_toggle_seen;
 (* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
 reg [5:0] riu_wr_addr_meta, riu_wr_addr_sync;
@@ -246,7 +246,7 @@ reg        riu_wr_en_q, riu_lower_sel_q, riu_upper_sel_q;
 
 always @(posedge i_riu_clk) begin
     if (i_riu_rst) begin
-        riu_wr_toggle_sync <= 2'b00;
+        riu_wr_toggle_sync <= 3'b000;
         riu_wr_toggle_seen <= 1'b0;
         riu_wr_addr_meta <= 6'd0;
         riu_wr_addr_sync <= 6'd0;
@@ -268,12 +268,12 @@ always @(posedge i_riu_clk) begin
         riu_lower_sel_q  <= 1'b0;
         riu_upper_sel_q  <= 1'b0;
     end else begin
-        riu_wr_toggle_sync <= {riu_wr_toggle_sync[0], riu_wr_toggle};
+        riu_wr_toggle_sync <= {riu_wr_toggle_sync[1:0], riu_wr_toggle};
         // The source holds this payload from request until the returned RIU
-        // response. Synchronize every bit before consuming it when the
-        // independently synchronized request toggle arrives. The required
-        // common-MMCM phase relationship makes the bundled-data sampling
-        // deterministic.
+        // response. Synchronize every bit, and delay the independently
+        // synchronized request event by one extra destination-clock stage.
+        // This guarantees the two-stage bundled payload is stable before the
+        // event is consumed, independent of relative MMCM phase.
         riu_wr_addr_meta <= riu_wr_addr_hold;
         riu_wr_addr_sync <= riu_wr_addr_meta;
         riu_wr_data_meta <= riu_wr_data_hold;
@@ -290,8 +290,8 @@ always @(posedge i_riu_clk) begin
         riu_read_upper_sync <= riu_read_upper_meta;
 
         riu_wr_en_q <= 1'b0;
-        if (riu_wr_toggle_sync[1] != riu_wr_toggle_seen) begin
-            riu_wr_toggle_seen <= riu_wr_toggle_sync[1];
+        if (riu_wr_toggle_sync[2] != riu_wr_toggle_seen) begin
+            riu_wr_toggle_seen <= riu_wr_toggle_sync[2];
             riu_addr_q         <= riu_wr_addr_sync;
             riu_wr_data_q      <= riu_wr_data_sync;
             riu_lower_sel_q    <= riu_wr_lower_sync;
@@ -672,7 +672,7 @@ always @(posedge i_riu_clk) begin
 end
 
 (* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
-reg [1:0] riu_response_toggle_sync;
+reg [2:0] riu_response_toggle_sync;
 reg       riu_response_toggle_seen;
 (* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
 reg [15:0] riu_response_data_meta, riu_response_data_sync;
@@ -690,7 +690,7 @@ wire      riu_request_changed =
     (i_riu_upper_sel != riu_request_upper_q);
 always @(posedge i_div_clk) begin
     if (i_bsc_rst) begin
-        riu_response_toggle_sync <= 2'b00;
+        riu_response_toggle_sync <= 3'b000;
         riu_response_toggle_seen <= 1'b0;
         riu_response_data_meta   <= 16'd0;
         riu_response_data_sync   <= 16'd0;
@@ -707,7 +707,7 @@ always @(posedge i_div_clk) begin
         o_riu_valid              <= 1'b0;
     end else begin
         riu_response_toggle_sync <=
-            {riu_response_toggle_sync[0], riu_response_toggle};
+            {riu_response_toggle_sync[1:0], riu_response_toggle};
         riu_response_data_meta <= riu_response_data_hold;
         riu_response_data_sync <= riu_response_data_meta;
         riu_response_addr_meta <= riu_response_addr_hold;
@@ -726,9 +726,12 @@ always @(posedge i_div_clk) begin
         // all byte-valid bits without requiring coincident response pulses.
         if (i_riu_wr_en || riu_request_changed)
             o_riu_valid <= 1'b0;
-        if (riu_response_toggle_sync[1] !=
+        // The response tag/data uses two payload synchronizer stages. Keep
+        // the event one stage deeper so a matching response can never be
+        // discarded merely because its tag arrived with the same edge.
+        if (riu_response_toggle_sync[2] !=
             riu_response_toggle_seen) begin
-            riu_response_toggle_seen <= riu_response_toggle_sync[1];
+            riu_response_toggle_seen <= riu_response_toggle_sync[2];
             if (!(i_riu_wr_en || riu_request_changed) &&
                 (riu_response_addr_sync == i_riu_addr) &&
                 (riu_response_lower_sync == i_riu_lower_sel) &&
