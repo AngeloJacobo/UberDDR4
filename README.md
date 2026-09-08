@@ -33,6 +33,15 @@ This project is funded through [NGI0 Entrust](https://nlnet.nl/entrust), a fund 
 
 # Getting Started
 
+## Linux example
+
+[Run Linux on AXKU3](projects/axku3_linux/README.md) with a VexRiscv processor,
+LiteX and UberDDR4 at DDR4-2400. The example includes setup, build, serial boot
+and hardware checks, using only the board's JTAG and USB-UART connections.
+It is based on a working demonstration with [known qualification limits](projects/axku3_linux/RESULTS.md).
+The cleaned-up integration still needs a fresh hardware check; it is not a
+production-qualified Linux platform.
+
 ## :heavy_check_mark: Instantiate Design
 
 For **Wishbone** integration, use [`rtl/ddr4_top.v`](rtl/ddr4_top.v) as the top module.

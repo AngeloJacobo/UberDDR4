@@ -1,0 +1,7 @@
+# Dependencies, downloaded images and generated outputs are reproducible,
+# not source files. Git-ignore does not stop OneDrive from syncing this folder.
+/build/
+# Keep machine-specific paths and Python caches out of the public example.
+local.ps1
+__pycache__/
+*.pyc

@@ -1,0 +1,51 @@
+{
+  "repositories": {
+    "migen": {
+      "url": "https://git.m-labs.hk/M-Labs/migen.git",
+      "commit": "4c2ae8dfeea37f235b52acb8166f12acaaae4f7c"
+    },
+    "litex": {
+      "url": "https://github.com/enjoy-digital/litex.git",
+      "commit": "8ae30928574e9b28e630473651d6b0e2b1cdcc77"
+    },
+    "pythondata-cpu-vexriscv": {
+      "url": "https://github.com/litex-hub/pythondata-cpu-vexriscv.git",
+      "commit": "642ecfed1c84460555d6d803d660cc60cfc1ecb6"
+    },
+    "pythondata-cpu-vexriscv-smp": {
+      "url": "https://github.com/litex-hub/pythondata-cpu-vexriscv_smp.git",
+      "commit": "217d23d7e9ad5556c17a73dc6ffc1971765f3d7c",
+      "linux": true
+    },
+    "pythondata-software-picolibc": {
+      "url": "https://github.com/litex-hub/pythondata-software-picolibc.git",
+      "commit": "6a13ccce7c575b32c102dd9dc52178505b81fe39"
+    },
+    "pythondata-software-compiler_rt": {
+      "url": "https://github.com/litex-hub/pythondata-software-compiler_rt.git",
+      "commit": "6eb76609c9627bf26635e57c63fb22cda7115887"
+    }
+  },
+  "python_packages": [
+    "pyserial==3.5",
+    "colorama==0.4.6",
+    "requests==2.32.5",
+    "PyYAML==6.0.2"
+  ],
+  "build_packages": [
+    "meson==1.9.0",
+    "ninja==1.13.0"
+  ],
+  "fdt": {
+    "version": "0.3.3",
+    "sha256": "6b2fae2e8dfa38e9b0f9666aa001dd25be74e893d293a8d60001438f732e9e47"
+  },
+  "gcc": {
+    "url": "https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v15.2.0-1/xpack-riscv-none-elf-gcc-15.2.0-1-win32-x64.zip",
+    "sha256": "85ef714dacd273b1dadf4af4892774520ac01915bfa6da816a56e7e41591e09e"
+  },
+  "linux": {
+    "url": "https://github.com/litex-hub/linux-on-litex-vexriscv/files/8331338/linux_2022_03_23.zip",
+    "sha256": "9ad7a043ce941024ccdcb08edcf0d627da0577a40be90579acb448c6b07fab48"
+  }
+}
