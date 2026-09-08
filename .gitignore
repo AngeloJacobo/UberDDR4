@@ -19,7 +19,7 @@ sim_result.log
 testbench/regression_logs/
 
 # Micron DDR4 model links/copies (created by setup_micron_model.sh).
-# Keep only the repository-owned wrapper under version control.
+# Keep only the repository-owned compatibility include shim under version control.
 testbench/micron/*
 !testbench/micron/ddr4_sdram_model_wrapper.sv
 

@@ -1,3 +1,6 @@
+# Four prove-mode tasks: map0/map1 and their bounded-stall variants.
+# Scope and environment assumptions: docs/VERIFICATION.md and
+# formal/ddr4_controller_formal.vh. This does not instantiate a physical PHY.
 [tasks]
 prove_map0
 prove_map1

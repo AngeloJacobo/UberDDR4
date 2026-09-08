@@ -5,11 +5,11 @@
 //
 // Purpose:  PHY for DDR4 controller targeting Xilinx UltraScale+ FPGAs.
 //  Handles OSERDESE3/ISERDESE3/IDELAYE3/ODELAYE3 primitives and the
-//  DFI 3.1 data path. Includes PHY-owned training FSM (gate, eye, WL).
+//  implemented DFI 3.1 data path. Includes PHY training (gate, eye, WL).
 //
 // Architecture overview:
 //  The PHY sits between the DFI 3.1 interface and the DDR4 SDRAM pins.
-//  One controller clock cycle = 4 DDR4 unit intervals (8:1 DDR SERDES).
+//  One controller clock cycle = 4 DDR4 CK periods = 8 data unit intervals.
 //
 //  Write path:  DFI wrdata -> OSERDESE3 (8:1 DDR) -> ODELAYE3 -> IOBUF -> pad
 //  Read path:   pad -> IOBUF -> IDELAYE3 -> ISERDESE3 (1:8 DDR) -> bitslip
@@ -17,18 +17,22 @@
 //  Clock path:  OSERDESE3 (constant 01010101 toggle) -> OBUFDS -> CK/CK#
 //  Cmd/Addr:    OSERDESE3 (SDR 4:1, doubled bits) -> OBUF -> DDR4 CA pins
 //
-//  Training FSM (runs once after IDELAYCTRL ready, driven by MC):
-//   1. Gate training:  Bitslip alignment using MPR page 0 pattern.
-//                      ISERDESE3 has no BITSLIP pin, so we do it in fabric
-//                      with a 16-bit barrel shifter per DQ bit.
-//   2. Eye training:   Sweep IDELAYE3 taps across the DQ data eye, find
-//                      first/last passing tap, load the center tap.
+//  Training FSM (after IDELAYCTRL ready, driven by MC; repeats on reset/retry):
+//   1. Gate handshake: Acknowledge without a separate gate search; the eye
+//                      search also establishes fabric bitslip alignment.
+//   2. Eye training:   Sweep IDELAYE3 taps and offsets 0..8 in the 16-bit
+//                      previous/current capture window; load and verify the
+//                      selected eye center, bitslip and on-time/late setting.
 //   3. Write leveling: Sweep ODELAYE3 DQS tap to find the 0->1 CK edge
 //                      on DQ[0]. DQ ODELAYE3 tracks DQS to keep 90 deg.
 //
-//  EN_VTC (voltage-temperature compensation): held LOW during training
+//  EN_VTC (voltage-temperature compensation): held LOW during eye/WL training
 //  so delay taps can be changed. Set HIGH in normal operation so the
 //  IDELAYE3/ODELAYE3 primitives track PVT drift automatically.
+//
+// Clocking and packing contract: docs/INTEGRATION.md and docs/ARCHITECTURE.md.
+// The component delay primitives use REFCLK_FREQUENCY=300.0; supply 300 MHz
+// on i_ref_clk and phase-related CK/quarter-rate clocks.
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -187,7 +191,7 @@ module ddr4_phy #(
     // MPR page 0, MPR2 register value = 8'h0F = 00001111 (JESD79-4D Table 56).
     // Serial readout sends bit[7] first: UI0=0, UI1=0, UI2=0, UI3=0,
     // UI4=1, UI5=1, UI6=1, UI7=1.
-    // ISERDESE3 8:1 DDR captures Q[0]=first bit received (UG571 Table 2-5):
+    // ISERDESE3 8:1 DDR captures Q[0]=first bit received (UG571, ISERDESE3 timing description):
     //   Q[0]=UI0=0, Q[1]=UI1=0, ..., Q[4]=UI4=1, ..., Q[7]=UI7=1
     //   -> Q[7:0] = 8'b11110000
     // Period = 8 UI: uniquely identifies all 8 possible bitslip values.
@@ -929,12 +933,13 @@ module ddr4_phy #(
     //                            newest bits   oldest bits
     //
     // Then extract 8 contiguous bits starting at offset `bitslip_count`
-    // (0..7, determined during gate training). This is equivalent to a
+    // (0..8, determined during eye training). This is equivalent to a
     // barrel shifter / bitslip by N positions:
     //
     //   bitslip=0 → window[7:0]   (all from previous capture)
     //   bitslip=3 → window[10:3]  (5 from previous, 3 from current)
-    //   bitslip=7 → window[14:7]  (all 8 from current, shifted)
+    //   bitslip=7 -> window[14:7] (1 from previous, 7 from current)
+    //   bitslip=8 -> window[15:8] (all from current capture)
     //
     // The training FSM finds the correct bitslip value by comparing
     // aligned_dq against the known MPR2 pattern (8'b11110000).
@@ -995,7 +1000,8 @@ module ddr4_phy #(
     // -----------------------------------------------------------------
     // DFI Read Data Packing + rddata_valid
     // Pack aligned ISERDESE3 outputs into flat o_dfi_rddata vector.
-    // rddata_valid follows rddata_en with 1-cycle capture latency.
+    // rddata_valid follows the capture pipeline; trained late lanes add a
+    // controller cycle. See rd_lat_extra and rddata_en_d1 below.
     //
     // How packing works:
     //   For each DQ bit, the aligned_dq[idx] byte contains 8 beats.

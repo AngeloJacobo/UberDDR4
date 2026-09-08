@@ -4,14 +4,15 @@
 // Project:  UberDDR4 - An Open Source DDR4 Controller
 //
 // Purpose:  Top-level native-mode DDR4 PHY for Xilinx UltraScale+ FPGAs,
-//  supporting up to DDR4-2400. Uses BITSLICE_CONTROL, RXTX_BITSLICE,
-//  TX_BITSLICE, and TX_BITSLICE_TRI primitives with an internal PLL
-//  (PLLE4_ADV) for high-speed clocking. The DFI 3.1 interface and
-//  training FSM are identical to the component-mode PHY.
+//  qualified through DDR4-2400 on the AXKU3 -2 device (see
+//  HARDWARE_QUALIFICATION.md). Uses BITSLICE_CONTROL, RXTX_BITSLICE,
+//  TX_BITSLICE and TX_BITSLICE_TRI with a local PLL per occupied I/O
+//  clock region. The controller-facing DFI subset shares port shapes with
+//  the component PHY, but latency, reset and training behavior differ.
 //
 // Architecture overview:
 //  The PHY sits between the DFI 3.1 interface and the DDR4 SDRAM pins.
-//  One controller clock cycle = 4 DDR4 unit intervals (8:1 DDR SERDES).
+//  One controller clock cycle = 4 DDR4 CK periods = 8 data unit intervals.
 //
 //  Write path:  DFI wrdata -> TX_BITSLICE (8:1 DDR) -> IOBUF -> pad
 //  Read path:   pad -> IOBUF -> RXTX_BITSLICE (1:8 DDR + FIFO) -> bitslip
@@ -20,10 +21,15 @@
 //  Cmd/Addr:    TX_BITSLICE (SDR 4:1, doubled bits) -> OBUF -> DDR4 CA pins
 //
 //  Training FSM (runs after reset sequencer completes, driven by MC):
-//   1. Gate training:  Sweep the native DQS-gate delay through RIU and
-//                      center the widest complete-MPR capture window.
-//   2. Eye training:   Sweep RX delay taps across the DQ data eye.
-//   3. Write leveling: Sweep TX DQS delay to find 0->1 CK edge.
+//   ddr4_top selects POST_WL_READ_TRAINING: write leveling first, then
+//   final read gate and eye training after the TX/DQS path is established.
+//   Gate training uses RIU and per-nibble capture observations; eye training
+//   sweeps RX delays and verifies MPR words before application reads.
+//   Native-only observation/centering states are decoded in docs/DEBUGGING.md.
+//
+//   i_controller_clk drives the local PLL inputs; i_ref_clk is the RIU clock,
+//   normally controller/2 from the same MMCM and phase. i_ddr4_clk is unused.
+//   See docs/INTEGRATION.md and example_demo/axku3/README.md before porting.
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -262,7 +268,8 @@ module ddr4_phy_native #(
     endfunction
 
     // -----------------------------------------------------------------
-    // PHY Training FSM state encoding (same as component-mode PHY)
+    // Native training encoding: state 6 differs from component mode, and
+    // states 13..15 are native-only. See docs/DEBUGGING.md for both maps.
     // -----------------------------------------------------------------
     localparam[3:0] PHY_IDLE          = 4'd0,
                     PHY_GATE_DONE     = 4'd1,
@@ -3646,7 +3653,7 @@ module ddr4_phy_native #(
     reg [8:0] eye_best_start [0:BYTE_LANES-1];
     wire [8:0] eye_center_candidate = best_start + (best_width >> 1);
 `ifdef SIM_NATIVE_DIAG_FINAL_EYE_RESET_ALIGN
-    // Directed proof for the calibration/application FIFO boundary.  The gate
+    // Directed simulation experiment for the calibration/application FIFO boundary.  The gate
     // and eye sweeps consume many source-synchronous words and can leave the
     // native FIFO pointers at an arbitrary modulo-8 phase.  While MPR mode is
     // still active, reset the RX FIFOs and require a fresh complete word from

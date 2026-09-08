@@ -6,15 +6,15 @@
 // Purpose:  Top-level simulation testbench for the UberDDR4 controller.
 //
 //  Structure:
-//    1. Clock generation  -  DDR4 CK (834ps), controller (CK/4), ref (300MHz)
+//    1. Clock generation  -  DDR4 CK (834ps), controller (CK/4), ref (300 MHz component; controller/2 native)
 //    2. Reset             -  active-low, held 100ns then released
 //    3. DUT               -  ddr4_top with MICRON_SIM=1 (shortened init timers)
 //    4. Micron models     -  two x8 DDR4 behavioral models (one per byte lane)
 //    5. Fly-by delay      -  lane 1 CK/CMD delayed by SIM_FLY_BY_DELAY ps
 //    6. Debug monitors    -  ROM phase, DFI/DDR4 command decoders, PHY training
-//    7. WB test stimulus  -  phases A..Q exercising all scheduler paths
+//    7. WB test stimulus  -  phases A..Z covering application data/address/timing cases
 //    8. Command monitor   -  DFI-level ACT/WR/RD/PRE counter & logger
-//    9. Timeout & summary -  hard 500us watchdog, final PASS/FAIL report
+//    9. Timeout & summary -  10 ms simulated-time watchdog, final PASS/FAIL report
 //
 //  The fly-by delay models real PCB daisy-chain routing skew: the DDR4
 //  clock, command, and address nets reach chip 1 later than chip 0. The
@@ -55,7 +55,7 @@ endmodule
 
 `default_nettype none
 
-// Compile both DFI-compatible PHYs, then select one with ddr4_top.PHY_IMPL.
+// Compile both implementations of the internal DFI subset; select via PHY_IMPL.
 // run_xsim.sh defines TB_USE_NATIVE_PHY only to select the testbench's top
 // parameter; this makes the simulation use the same public selection API as
 // a hardware design.
@@ -297,7 +297,7 @@ module ddr4_sim_top;
     wire                     wb_ack;
     wire [WB_DATA_BITS-1:0]  wb_rdata;
 
-    // Debug CSR port (separate WB B4 â€�? always accessible)
+    // Debug CSR port (separate WB B4, enabled in this testbench)
     reg        wb_dbg_cyc, wb_dbg_stb, wb_dbg_we;
     reg [3:0]  wb_dbg_addr;
     reg [31:0] wb_dbg_data;
@@ -921,7 +921,7 @@ module ddr4_sim_top;
         if (rst_n) begin
             prev_phy_state <= `TB_PHY_HIER.phy_state;
 
-            // Gate training (no-op â€�? responds immediately)
+            // Component gate handshake is a no-op; native mode performs gate training.
             if (prev_phy_state == 4'd0 && `TB_PHY_HIER.phy_state == 4'd1)
 `ifdef TB_USE_NATIVE_PHY
                 $display("[%0t] PHY native gate training started", $realtime);
@@ -1126,7 +1126,11 @@ module ddr4_sim_top;
         phase_n_wr_start = 0; phase_o_wr_start = 0; phase_q_wr_start = 0;
     end
 
-    // ADDR_MAPPING=1 address field positions
+    // ADDR_MAPPING=1 field positions. Named row/bank scenarios below describe
+    // this mapping with x4/x8 unless stated otherwise. Map0 and x16 reuse the
+    // same stimulus addresses but do not preserve every named bank scenario.
+    // Some later phases use literal historical addresses; data PASS does not
+    // prove the log caption's bank/row/timing coverage. See docs/VERIFICATION.md.
     localparam ROW_SHIFT = BG_BITS + (COL_BITS - COL_LOW) + BA_BITS;
     localparam BA_SHIFT  = BG_BITS + (COL_BITS - COL_LOW);
     localparam COL_SHIFT = BG_BITS;
@@ -1136,21 +1140,22 @@ module ddr4_sim_top;
                                     MID_ROW_OFF   = (1 << (ROW_BITS/2)) << ROW_SHIFT,
                                     LAST_ROW_OFF  = ((1 << ROW_BITS) - 4) << ROW_SHIFT;
 
-    // Base addresses: BG selection (bits [1:0])
+    // Base address values 0..3: four BGs for x4/x8 map1. For x16 map1,
+    // bit 1 belongs to the column, so these span two BGs and two columns.
     localparam [WB_ADDR_BITS-1:0] ADDR_BG0 = 0, ADDR_BG1 = 1,
                                     ADDR_BG2 = 2, ADDR_BG3 = 3;
 
-    // BA offsets (bits [10:9])
+    // BA offsets for map1 (bits [10:9] with x4/x8; [9:8] with x16)
     localparam [WB_ADDR_BITS-1:0] BA0_OFF = 0,
                                     BA1_OFF = (1 << BA_SHIFT),
                                     BA2_OFF = (2 << BA_SHIFT),
                                     BA3_OFF = (3 << BA_SHIFT);
 
-    // Column offsets (bits [8:2])
+    // Column offsets for map1 (bits [8:2] with x4/x8; [7:1] with x16)
     localparam [WB_ADDR_BITS-1:0] COL1_OFF = (1 << COL_SHIFT),
                                     COL2_OFF = (2 << COL_SHIFT);
 
-    // Row offset for row-miss testing (bits [26:11])
+    // Row offset for row-miss testing; width/position follows the parameters
     localparam [WB_ADDR_BITS-1:0] ROW1_OFF = (1 << ROW_SHIFT);
 
     // Composite addresses (backward-compatible names)
@@ -1188,7 +1193,7 @@ module ddr4_sim_top;
     // HOW IT WORKS (big picture):
     //   1. Test phases "push" transactions (writes/reads) into a queue.
     //   2. wb_pump_all() fires them onto the bus as fast as the slave
-    //      allows â€�? one per clock cycle unless STALL is asserted.
+    //      allows - one per clock cycle unless STALL is asserted.
     //   3. Read responses are verified automatically as ACKs come back.
     //
     // WHY: A real WB B4 pipelined master never inserts idle cycles
@@ -1200,28 +1205,22 @@ module ddr4_sim_top;
     // PROTOCOL SUMMARY (Wishbone B4 Pipelined Mode):
     //   - Master asserts CYC for the entire burst.
     //   - Master asserts STB each cycle with addr/data/we/sel.
-    //   - If STALL=0 at the clock edge â†’ request ACCEPTED.
-    //   - If STALL=1 at the clock edge â†’ HOLD same request, try again.
+    //   - If STALL=0 at the clock edge -> request ACCEPTED.
+    //   - If STALL=1 at the clock edge -> HOLD same request, try again.
     //   - Each accepted request produces exactly one ACK later (in order).
     //   - Master deasserts STB when no more requests to send.
     //   - Master keeps CYC high until the last ACK is received.
     //
     // DATA FLOW:
     //
-    //   wb_push_write/read()    wb_pump_all()          ACK checker
-    //         â�?‚                      â�?‚                      â�?‚
-    //         â–¼                      â�?‚                      â�?‚
-    //   â�?Œâ�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�??   pop front    â�?‚     on ACK: pop      â�?‚
-    //   â�?‚  txn_q   â�?‚ â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â–º bus â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â–º â�?Œâ�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�??
-    //   â�?‚ (pending)â�?‚  when !STALL   â�?‚                â�?‚ inflight_q  â�?‚
-    //   â�?�?â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?˜                â�?‚                â�?‚(waiting ACK)â�?‚
-    //                               â�?‚                â�?�?â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?˜
-    //                               â�?‚                      â�?‚
-    //                               â�?‚               if read: compare
-    //                               â�?‚               wb_rdata vs expected
+    //   wb_push_write/read() --> txn_q (pending requests)
+    //   wb_pump_all() presents the head request and waits for !STALL.
+    //   Acceptance moves that request from txn_q to inflight_q.
+    //   Each ACK removes the oldest inflight_q entry; reads compare
+    //   wb_rdata with that entry's expected value.
     // =================================================================
 
-    // Transaction descriptor â€�? one entry per WB request.
+    // Transaction descriptor - one entry per WB request.
     // For writes: 'data' = write data to put on the bus.
     // For reads:  'data' = expected read-back value (used for verification).
     typedef struct {
@@ -1242,7 +1241,7 @@ module ddr4_sim_top;
     initial rd_err_count = 0;
 
     // -----------------------------------------------------------------
-    // Push tasks â€�? add transactions to the pending queue.
+    // Push tasks - add transactions to the pending queue.
     // These are NON-BLOCKING: they just enqueue and return immediately.
     // Nothing happens on the bus until wb_pump_all() is called.
     // -----------------------------------------------------------------
@@ -1257,7 +1256,7 @@ module ddr4_sim_top;
     endtask
 
     // Queue a partial write (only bytes where sel=1 are written to DRAM;
-    // bytes where sel=0 keep their old value â€�? this exercises DDR4 DM_n).
+    // bytes where sel=0 keep their old value - this exercises DDR4 DM_n).
     task wb_push_write_masked(input [WB_ADDR_BITS-1:0] addr, input [WB_DATA_BITS-1:0] data, input [WB_SEL_BITS-1:0] sel);
         begin
             automatic wb_txn_t t;
@@ -1277,19 +1276,18 @@ module ddr4_sim_top;
     endtask
 
     // -----------------------------------------------------------------
-    // wb_pump_all â€�? The core pipelined driver.
+    // wb_pump_all - The core pipelined driver.
     //
     // Sends ALL queued transactions onto the WB bus at full speed,
     // then waits until every ACK has been received.
     //
-    // Timing diagram (no stalls):
-    //
-    //   CLK   â�?€â�??  â�?Œâ�?€â�?€â�??  â�?Œâ�?€â�?€â�??  â�?Œâ�?€â�?€â�??  â�?Œâ�?€â�?€â�??  â�?Œâ�?€â�?€â�??  â�?Œâ�?€â�?€â�??
-    //   CYC   â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€ (high entire time)
-    //   STB   â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€â�?€ (drops when queue empty)
-    //   STALL  _____________________________________ (slave not stalling)
-    //   ADDR   [A0][A1][A2][A3]                      (advances each cycle)
-    //   ACK    ___________[1][1][1][1]               (arrives later, in order)
+    // Example sampled edges, with no request stalls (ACK delay is illustrative):
+    //   edge:   0   1   2   3   4   5   6
+    //   CYC:    1   1   1   1   1   1   1  (kept high through final ACK)
+    //   STB:    1   1   1   1   0   0   0
+    //   STALL:  0   0   0   0   0   0   0
+    //   ADDR:  A0  A1  A2  A3   -   -   -
+    //   ACK:    0   0   0   1   1   1   1  (in accepted-request order)
     //
     // When STALL=1: addr/data/we/sel FREEZE until stall drops.
     // -----------------------------------------------------------------
@@ -1328,7 +1326,7 @@ module ddr4_sim_top;
 
                 // --- Request acceptance (request side) ---
                 // If STB=1 and STALL=0, the slave accepted our current request.
-                // Move it from txn_q â†’ inflight_q, then present the next one.
+                // Move it from txn_q -> inflight_q, then present the next one.
                 // If no more requests: drop STB (but keep CYC for remaining ACKs).
                 if (wb_stb && !wb_stall) begin
                     if (txn_q.size() > 0) begin
@@ -1340,12 +1338,12 @@ module ddr4_sim_top;
                             wb_data = txn_q[0].data;
                             wb_sel  = txn_q[0].sel;
                         end else begin
-                            // All requests sent â€�? stop strobing
+                            // All requests sent - stop strobing
                             wb_stb = 1'b0;
                         end
                     end
                 end
-                // If STALL=1: do nothing â€�? hold current signals unchanged.
+                // If STALL=1: do nothing - hold current signals unchanged.
                 // The slave will see the same request again next cycle.
             end
 
@@ -1364,9 +1362,9 @@ module ddr4_sim_top;
         end
     endtask
 
-    // Debug CSR port tasks (always accessible, 1-cycle latency).
+    // Debug CSR port tasks (enabled in this testbench, 1-cycle latency).
     // The slave is zero-wait-state: accepts on EDGE A, responds on EDGE B.
-    // No ACK polling needed â€�? deterministic 2-edge sequence.
+    // No ACK polling needed - deterministic 2-edge sequence.
     task wb_dbg_read(input [3:0] addr);
         begin
             wb_dbg_cyc  = 1'b1;
@@ -1499,7 +1497,7 @@ module ddr4_sim_top;
 
     `ifdef SIM_CSR_RESET_TEST
         // =============================================================
-        // CSR 0xC Reset Test â€�? exercises soft reset, auto-reset, BIST restart
+        // CSR 0xC Reset Test - exercises soft reset, auto-reset, BIST restart
         // =============================================================
         $display("[%0t] === CSR Reset Test: Phase 1 â€�? Soft Reset ===", $realtime);
         begin : csr_soft_reset_test
@@ -1512,7 +1510,7 @@ module ddr4_sim_top;
                 rd_err_count = rd_err_count + 1;
             end
 
-            // 1b. Read CSR[0xC] â€�? verify auto_reset_en is 1 (fail-safe default)
+            // 1b. Read CSR[0xC] - verify auto_reset_en is 1 (fail-safe default)
             wb_dbg_read(4'hC);
             if (wb_dbg_rdata[2] !== 1'b1) begin
                 $display("[%0t] FAIL: auto_reset_en not 1 at default (CSR[C]=0x%0h)", $realtime, wb_dbg_rdata);
@@ -1602,7 +1600,7 @@ module ddr4_sim_top;
                 $display("[%0t] FAIL: write-data fault escaped the BIST write phase", $realtime);
                 rd_err_count = rd_err_count + 1;
             end
-            // 2d. Wait for init_done to drop (BIST finishes â†’ auto-reset fires)
+            // 2d. Wait for init_done to drop (BIST finishes -> auto-reset fires)
             ar_timeout = 0;
             while (init_done && ar_timeout < 200000) begin
                 @(posedge controller_clk);
@@ -1729,16 +1727,17 @@ module ddr4_sim_top;
         // PATTERN USED IN PHASES A-H:
         //   1. Push N writes (to different bank groups / banks / rows)
         //   2. Push N reads to same addresses with expected data
-        //   3. Call wb_pump_all â€�? fires ALL of them back-to-back
+        //   3. Call wb_pump_all - fires ALL of them back-to-back
         //
-        // The controller must handle the writeâ†’read transitions
+        // The controller must handle the write->read transitions
         // internally (ACT, PRE, tWTR delays, etc.) using STALL to
         // throttle the master. We never manually wait between ops.
         // =============================================================
 
         // -- Phase A: Cold writes to 4 idle banks --
-        // All banks are closed â†’ controller must issue ACT before each WR.
-        // Tests: basic ACTâ†’WR path for 4 different bank groups.
+        // First accesses exercise ACT->WR if the selected banks are closed.
+        // Prior BIST/row iterations and refresh affect their initial state.
+        // Addresses span four BGs only in the x4/x8 map1 configuration.
         test_phase = "PHASE_A";
         $display("[%0t] === Phase A: Cold writes to idle banks (ACT->WR) ===", $realtime);
         wb_push_write(ROW0_BG0 + row_base, 128'h0A);
@@ -1751,10 +1750,10 @@ module ddr4_sim_top;
         wb_push_read(ROW0_BG3 + row_base, 128'h0D);
         wb_pump_all;
 
-        // -- Phase B: Bank hits â€�? same bank, same row already open --
-        // The row is still open from Phase A â†’ controller skips ACT,
+        // -- Phase B: Bank hits - same bank, same row already open --
+        // The row is still open from Phase A -> controller skips ACT,
         // issues WR directly (bank "hit"). Tests: hit path with no
-        // ACT/PRE overhead â€�? maximum throughput scenario.
+        // ACT/PRE overhead - maximum throughput scenario.
         test_phase = "PHASE_B";
         $display("[%0t] === Phase B: Bank hits  -  same row open (WR only) ===", $realtime);
         wb_push_write(ROW0_BG0 + row_base, 128'h1A);
@@ -1767,9 +1766,9 @@ module ddr4_sim_top;
         wb_push_read(ROW0_BG3 + row_base, 128'h1D);
         wb_pump_all;
 
-        // -- Phase C: Row miss â€�? same bank, DIFFERENT row --
-        // Row0 is open but we write to Row1 â†’ controller must:
-        //   PRE (close Row0) â†’ ACT (open Row1) â†’ WR
+        // -- Phase C: Row miss - same bank, DIFFERENT row --
+        // Row0 is open but we write to Row1 -> controller must:
+        //   PRE (close Row0) -> ACT (open Row1) -> WR
         // This is the most expensive path. The controller stalls us
         // while it sequences PRE+ACT timing (tRP + tRCD).
         test_phase = "PHASE_C";
@@ -1787,7 +1786,7 @@ module ddr4_sim_top;
         // -- Phase D: Post-refresh access --
         // We idle the bus and wait for the controller to issue a periodic
         // REF command (which closes all banks via PRE ALL). Then we write
-        // again â€�? verifying that the controller correctly re-opens banks
+        // again - verifying that the controller correctly re-opens banks
         // after a refresh event.
         test_phase = "WAIT_REF";
         $display("[%0t] === Waiting for refresh to close all banks... ===", $realtime);
@@ -1828,7 +1827,7 @@ module ddr4_sim_top;
         // Writes to BG0/BG1, then reads from BG0/BG1 (bank hits) and
         // BG2/BG3 (still hold Phase D data=0x3C/3D). This tests the
         // controller's ability to interleave writes and reads within a
-        // single pipelined burst â€�? no idle gap between the last write
+        // single pipelined burst - no idle gap between the last write
         // and the first read.
         test_phase = "PHASE_F";
         $display("[%0t] === Phase F: Read requests (ACT->RD, bank hit RD) ===", $realtime);
@@ -1842,14 +1841,14 @@ module ddr4_sim_top;
 
         // -- Phase G: Same-bank row thrashing (tRC stress) --
         // Three writes to the SAME bank (BG0/BA0) but alternating rows:
-        //   Row0 â†’ Row1 â†’ Row0 (each causes PRE+ACT = row miss)
+        //   Row0 -> Row1 -> Row0 (each causes PRE+ACT = row miss)
         // The minimum time between two ACTs to the same bank is tRC.
         // The controller must stall long enough to satisfy tRC.
         test_phase = "PHASE_G";
         $display("[%0t] === Phase G: Same-bank rapid re-access (tRC stress) ===", $realtime);
         wb_push_write(ROW0_BG0 + row_base, 128'h6A);  // open Row0
-        wb_push_write(ROW1_BG0 + row_base, 128'h6B);  // miss: PRE Row0 â†’ ACT Row1
-        wb_push_write(ROW0_BG0 + row_base, 128'h6C);  // miss: PRE Row1 â†’ ACT Row0
+        wb_push_write(ROW1_BG0 + row_base, 128'h6B);  // miss: PRE Row0 -> ACT Row1
+        wb_push_write(ROW0_BG0 + row_base, 128'h6C);  // miss: PRE Row1 -> ACT Row0
         wb_push_read(ROW0_BG0 + row_base, 128'h6C);   // last write wins
         wb_push_read(ROW1_BG0 + row_base, 128'h6B);
         wb_pump_all;
@@ -1870,13 +1869,13 @@ module ddr4_sim_top;
         wb_push_read(ROW0_BG1 + row_base, 128'h7B);   // RD from BG1
         wb_pump_all;
 
-        // -- Phase I: Writeâ†’Read data round-trip verification --
+        // -- Phase I: Write->Read data round-trip verification --
         // Each pattern targets a different failure mode:
-        //   all-F / all-0  â†’ stuck-at faults in DQ lines
-        //   A5/5A          â†’ byte-lane swap (adjacent lanes swapped)
-        //   DEAD_BEEF      â†’ general sanity (mixed nibbles)
-        //   half-bus F/0   â†’ upper vs lower 64-bit crossbar bugs
-        //   walking-1      â†’ single-bit shorts between DQ lines
+        //   all-F / all-0  -> stuck-at faults in DQ lines
+        //   A5/5A          -> byte-lane swap (adjacent lanes swapped)
+        //   DEAD_BEEF      -> general sanity (mixed nibbles)
+        //   half-bus F/0   -> upper vs lower 64-bit crossbar bugs
+        //   walking-1      -> single-bit shorts between DQ lines
         //
         // NOTE: write and read to the SAME address are queued
         // back-to-back (W0-R0-W1-R1-...). The WB B4 in-order guarantee
@@ -1917,7 +1916,7 @@ module ddr4_sim_top;
         // -- Phase J: Bulk pipelined write then bulk read --
         // Queues TB_DEPTH/2 (16) writes to consecutive addresses, then
         // 16 reads to the same addresses. All 32 transactions fire in
-        // one wb_pump_all call â€�? the bus never goes idle between them.
+        // one wb_pump_all call - the bus never goes idle between them.
         // gen_pattern_tb(idx) generates a deterministic 128-bit pattern
         // from the address index so we can verify each word independently.
         test_phase = "PHASE_J";
@@ -1942,11 +1941,11 @@ module ddr4_sim_top;
             end
         end
 
-        // -- Phase K: Readâ†’Write turnaround (bus contention stress) --
+        // -- Phase K: Read->Write turnaround (bus contention stress) --
         // After the DQ bus is used for a read, the PHY must turn around
         // the I/O direction before driving write data. The controller
-        // enforces a RDâ†’WR delay for this. We queue: WR-WR-RD-WR-WR-RD-RD
-        // so the controller sees a read immediately followed by writes â€�?
+        // enforces a RD->WR delay for this. We queue: WR-WR-RD-WR-WR-RD-RD
+        // so the controller sees a read immediately followed by writes -
         // it must stall the writes long enough for the PHY turnaround.
         test_phase = "PHASE_K";
         $display("[%0t] === Phase K: Read->Write turnaround (RD->WR delay) ===", $realtime);
@@ -1962,19 +1961,20 @@ module ddr4_sim_top;
         // -- Phase L: Byte-lane masking (DM verification) --
         // DDR4 has a data-mask pin (DM_n) that allows per-byte write
         // protection. When wb_sel has a bit=0, the corresponding byte
-        // is NOT written â€�? it retains its previous value in DRAM.
+        // is NOT written - it retains its previous value in DRAM.
         //
         // Test approach (each sub-test):
         //   1. Write a known background value (all-A, all-C, all-F)
         //   2. Issue a MASKED write with different data + partial sel
         //   3. Read back: unmasked bytes = new data, masked bytes = old
         //
-        // NOTE: We must pump the background write FIRST (separate
-        // wb_pump_all) so it's committed to DRAM before the masked write
-        // arrives. Otherwise the in-order pipeline would just see both
-        // writes queued together and the second overwrites the first.
+        // Pump the background write separately to isolate the masked-update test.
+        // Ordered queued writes should also preserve masked bytes; a later
+        // masked write is not supposed to erase the unselected background.
         //
-        // Skipped for x4 devices which have no DM pin (JESD79-4D Table 28).
+        // Skipped for x4 devices, which lack this DM_n mask function.
+        // These literal patterns/selects exercise the low 128 bits. Wider
+        // WB ports zero-extend them; this phase is not full-width mask coverage.
         test_phase = "PHASE_L";
         if (DEVICE_WIDTH == 4) begin
             $display("[%0t] === Phase L: SKIPPED (x4 has no DM pin) ===", $realtime);
@@ -2012,7 +2012,7 @@ module ddr4_sim_top;
 
         // -- Phase M: tFAW stress (5 rapid activates) --
         // DDR4 limits the number of row-activates in a time window:
-        // tFAW = "Four Activate Window" â€�? max 4 ACTs in any tFAW period.
+        // tFAW = "Four Activate Window" - max 4 ACTs in any tFAW period.
         // We force 5 ACTs back-to-back (all banks cold after refresh)
         // to verify the controller correctly delays the 5th ACT.
         test_phase = "PHASE_M";
@@ -2078,7 +2078,7 @@ module ddr4_sim_top;
         //   c) The master never sees corruption from refresh interleaving
         //
         // The inline driver is hand-coded (not using wb_pump_all) because
-        // we don't know in advance how many writes will be needed â€�? it
+        // we don't know in advance how many writes will be needed - it
         // depends on when the refresh timer fires.
         //
         // After the write storm completes, we do 8 verification reads
@@ -2112,12 +2112,12 @@ module ddr4_sim_top;
                 if (!wb_stall) begin
                     po_outstanding = po_outstanding + 1;
                     po_iter = po_iter + 1;
-                    // Rotate through 8 addresses across 2 bank groups
+                    // Rotate through 8 literal addresses; decoded banks depend on map/width
                     wb_addr = (6 << 10) | (((po_iter % 8) >> 2) << 8) | ((po_iter % 8) & 3);
                     wb_data = gen_pattern_tb(po_iter[7:0] % 8);
                 end
             end
-            // Done sending â€�? deassert STB, wait for remaining ACKs
+            // Done sending - deassert STB, wait for remaining ACKs
             wb_stb = 1'b0;
             while (po_outstanding > 0) begin
                 @(posedge controller_clk);
@@ -2140,10 +2140,9 @@ module ddr4_sim_top;
         end
 
         // -- Phase P: Address boundary corners --
-        // Writes to extreme address values to catch bit-routing bugs:
-        //   - Max column upper bits + max BG
-        //   - Max 10-bit address (all col+BG bits set)
-        //   - Combination of row=3 / BA=3 / max col / BG=3
+        // Read/write literal word addresses 0x0ff, 0x3ff and 0xfff. These are
+        // local bit-pattern boundaries, not the full memory range or a
+        // parameter-independent maximum column/row. The log labels are legacy.
         test_phase = "PHASE_P";
         $display("[%0t] === Phase P: Address boundary corners ===", $realtime);
         wb_push_write((63 << 2) | 3, 128'hBEEF_0001_BEEF_0001_BEEF_0001_BEEF_0001);
@@ -2159,13 +2158,13 @@ module ddr4_sim_top;
         $display("[%0t]   addr 1023 (max 10-bit)", $realtime);
         $display("[%0t]   row3/BA3/max_col/BG3 (addr 4095)", $realtime);
 
-        // -- Phase Q: All 16 banks exercised in one pipelined burst --
-        // DDR4 x8 has 4 bank groups Ã— 4 banks = 16 banks total.
-        // We write a unique pattern to each bank (encoding BG+BA in the
-        // data), then read all 16 back. All 32 transactions (16 WR + 16 RD)
-        // are queued at once and fired through a single wb_pump_all.
-        // This exercises the controller's full bank-state tracking and
-        // measures cross-BG interleaving throughput.
+        // -- Phase Q: Sixteen literal addresses in one pipelined burst --
+        // Each data pattern encodes loop indices pq_bg/pq_ba. They are not
+        // necessarily the physical BG/BA: the hardcoded shifts are retained.
+        // For default x8 map1, these addresses reach eight banks, not all 16
+        // (bit 8 is a column bit and bit 10 is fixed by 7<<10). The legacy
+        // log caption does not establish complete bank coverage.
+        // Queue 16 writes then 16 matching reads and measure elapsed cycles.
         test_phase = "PHASE_Q";
         $display("[%0t] === Phase Q: Multi-BG interleaving (16 banks) ===", $realtime);
         begin : phase_q_blk
@@ -2177,7 +2176,7 @@ module ddr4_sim_top;
             phase_q_start = cycle_count;
             phase_q_wr_start = wr_count;
 
-            // Queue 16 writes: one per bank (BG0-3 Ã— BA0-3)
+            // Queue the 4x4 index combinations using the literal address expression
             for (pq_ba = 0; pq_ba < 4; pq_ba = pq_ba + 1) begin
                 for (pq_bg = 0; pq_bg < 4; pq_bg = pq_bg + 1) begin
                     pq_addr = (7 << 10) | (pq_ba << 8) | pq_bg;
@@ -2237,7 +2236,7 @@ module ddr4_sim_top;
                 while (wb_stall) @(posedge controller_clk);
             end
 
-            // Gap: STB=0 for 5 cycles (CYC stays high â€�? this is the key test!)
+            // Gap: STB=0 for 5 cycles (CYC stays high - this is the key test!)
             wb_stb = 1'b0;
             repeat (5) @(posedge controller_clk);
 
@@ -2264,12 +2263,12 @@ module ddr4_sim_top;
             end
             wb_stb = 1'b0;
 
-            // Wait for all 8 write ACKs to flush through the pipeline.
-            // 40 cycles is generous (ack_pipe depth is ~20 max).
+            // Fixed 40-cycle drain delay for this directed case. It does not count
+            // ACKs and is not a general bound for arbitrary PHY/refresh latency.
             repeat (40) @(posedge controller_clk);
             wb_cyc = 1'b0; wb_we = 1'b0;
 
-            // Now verify all 8 writes using the proven wb_pump_all path
+            // Now verify all 8 writes using the common wb_pump_all checker
             for (pr_i = 0; pr_i < 8; pr_i = pr_i + 1) begin
                 wb_push_read((8 << 10) | pr_i, gen_pattern_tb(pr_i[7:0]));
             end
@@ -2284,7 +2283,7 @@ module ddr4_sim_top;
         // -- Phase S: Sustained alternating W-R-W-R (64 pairs) --
         // Mimics a DMA engine doing read-modify-write. Each cycle
         // (when not stalled) alternates between write and read to the
-        // SAME address â€�? the read must always return what was just written.
+        // SAME address - the read must always return what was just written.
         // This stresses tWTR/tRTW turnaround at maximum rate.
         test_phase = "PHASE_S";
         $display("[%0t] === Phase S: Sustained alternating W-R (64 pairs) ===", $realtime);
@@ -2315,7 +2314,7 @@ module ddr4_sim_top;
             integer pt_err_start, pt_i;
             reg [WB_ADDR_BITS-1:0] pt_base;
             pt_err_start = rd_err_count;
-            // Start 8 addresses before row boundary (row 4â†’5 transition)
+            // Start 8 addresses before row boundary (row 4->5 transition)
             // ROW_SHIFT puts the row field at the top. Address just below row5:
             pt_base = (4 << ROW_SHIFT) | ((1 << (COL_BITS - COL_LOW)) - 8) << COL_SHIFT;
 
@@ -2335,9 +2334,9 @@ module ddr4_sim_top;
 
         // -- Phase U: LFSR random address stress (128 transactions) --
         // Generates pseudo-random addresses using an LFSR, producing
-        // unpredictable bank/row access patterns. This catches bugs that
-        // only appear under non-deterministic traffic (e.g., bank-state
-        // machine transitions that never occur with structured patterns).
+        // a deterministic address sequence from a fixed seed. This broadens
+        // the request patterns exercised beyond the structured cases; it
+        // is repeatable pseudo-random testing, not exhaustive coverage.
         test_phase = "PHASE_U";
         $display("[%0t] === Phase U: LFSR random address stress (128 txns) ===", $realtime);
         begin : phase_u_blk
@@ -2437,7 +2436,7 @@ module ddr4_sim_top;
         // -- Phase X: Back-to-back CYC cycles (no idle between bursts) --
         // After wb_pump_all drops CYC, immediately start the next burst.
         // Tests that the slave correctly resets between bus cycles without
-        // needing idle time. 4 rapid burst pairs (write burst â†’ read burst).
+        // needing idle time. 4 rapid burst pairs (write burst -> read burst).
         test_phase = "PHASE_X";
         $display("[%0t] === Phase X: Back-to-back CYC cycles ===", $realtime);
         begin : phase_x_blk
@@ -2468,9 +2467,10 @@ module ddr4_sim_top;
         // -- Phase Y: Maximum outstanding under heavy stall --
         // Write to the SAME bank/row 32 times in rapid succession.
         // Since all target the same bank, the controller can issue one
-        // ACT then stream 32 WRs without PRE â€�? but internal pipeline
+        // ACT then stream 32 WRs without PRE - but internal pipeline
         // depth is limited. This pushes the controller's ack_pipe to
-        // its maximum occupancy and verifies no data is dropped.
+        // under sustained load and checks returned data. The phase does not
+        // independently assert that maximum occupancy was reached.
         test_phase = "PHASE_Y";
         $display("[%0t] === Phase Y: Same-bank pipeline saturation (32 hits) ===", $realtime);
         begin : phase_y_blk
@@ -2761,7 +2761,7 @@ module ddr4_sim_top;
     // After all WB phases + CSR checks + BIST re-trigger complete, we
     // wait for a few more refresh cycles to confirm the controller stays
     // healthy in idle. Then print a summary with cumulative command
-    // counts and a final PASS/FAIL verdict. The 500us watchdog below
+    // counts and a final PASS/FAIL verdict. The TB_TIMEOUT_PS watchdog below
     // catches any hang.
     // ===================================================================
     localparam NUM_REFRESH_CYCLES = 3;

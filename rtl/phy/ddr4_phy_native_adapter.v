@@ -4,7 +4,9 @@
 // This adapter gives the native UltraScale/UltraScale+ PHY the same DFI and
 // prober-facing ports as rtl/ddr4_phy.v.  It has a distinct module name so
 // both PHY implementations may be compiled together and selected by the
-// ddr4_top PHY_IMPL parameter.
+// ddr4_top PHY_IMPL parameter. Port compatibility does not imply identical
+// latency or training: ddr4_top also selects the native timing/order settings.
+// See docs/INTEGRATION.md for clocks, pin maps and the public integration API.
 ////////////////////////////////////////////////////////////////////////////////
 
 `default_nettype none
@@ -89,7 +91,7 @@ module ddr4_phy_native_adapter #(
 
     // Keep the component-PHY's simulation/debug hierarchy available at the
     // DFI boundary.  Existing benches intentionally inspect these per-lane
-    // training values through u_dut.u_phy without requiring a native-only
+    // training values through u_dut.gen_native_phy.u_phy without a native-only
     // testbench or any controller/prober changes.
     wire [3:0] phy_state = o_phy_state;
     wire [BYTE_LANES-1:0] rd_lat_extra = o_phy_rd_lat_extra;

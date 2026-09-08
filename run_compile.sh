@@ -5,16 +5,16 @@
 # Stages:
 #   lint      Verilator lint (controller, prober, phy, top)
 #   compile   Iverilog parse + Yosys synthesis check
-#   formal    SymbiYosys bounded model checking
+#   formal    SymbiYosys prove-mode tasks (see formal harness assumptions)
 #   sim       Vivado xsim simulation (single test or regression)
 #
 # Usage:
 #   ./run_compile.sh                     Default (lint+compile+formal+sim baseline)
-#   ./run_compile.sh --all               Everything (lint+compile+formal+formal-regr+sim+sim-regr)
+#   ./run_compile.sh --all               Expanded suite (lint+compile+formal-regr+sim-regr)
 #   ./run_compile.sh --lint              Verilator lint only
 #   ./run_compile.sh --compile           Iverilog + Yosys only
 #   ./run_compile.sh --formal            Formal single config (4 tasks)
-#   ./run_compile.sh --formal-regr       Formal regression (28 tasks)
+#   ./run_compile.sh --formal-regr       Formal regression (30 tasks; legacy runtime banner still says 28)
 #   ./run_compile.sh --sim [TEST]        Single sim test (default: baseline)
 #   ./run_compile.sh --sim-regr          Full sim regression (26 tests)
 #   ./run_compile.sh --no-sim            Lint + compile + formal (skip sim)
@@ -24,6 +24,10 @@
 #   x4 x4_map0 ddr4_1250 ddr4_1600 ddr4_1600_flyby
 #   ddr4_2133 ddr4_2133_flyby density_4g row_bits_14 row_bits_17
 #   train_fail csr_reset dm_stress
+#
+# Core lint/compile uses the component source set; native signoff is separate.
+# build_logs is recreated before option parsing, even for help. Preserve logs.
+# Scope, prerequisites and configuration matrix: docs/VERIFICATION.md.
 #
 # Engineer: Angelo C. Jacobo
 set -o pipefail

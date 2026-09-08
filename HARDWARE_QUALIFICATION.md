@@ -4,6 +4,20 @@ Qualification date: 2026-09-06 (Asia/Singapore)
 Device: AXKU3, `xcku3p-ffvb676-2-i`  
 Tool: Vivado 2022.2
 
+## Scope and provenance
+
+This is the dated standalone native-PHY BIST campaign, not a new qualification
+of every later release or the Linux SoC. The source wrapper is documented in
+[the AXKU3 example](example_demo/axku3/README.md); register interpretation and
+recovery behavior are in [Debugging](docs/DEBUGGING.md). Preserve the measured
+results and artifact hashes below when comparing a new implementation.
+
+The large `.tmp/freq_qual/` artifacts and campaign automation are not bundled
+in this release checkout. Paths below identify the author's retained campaign
+workspace, not files guaranteed to exist after cloning. Exact reproduction
+requires those matching artifacts, build settings and source lineage; the
+current example alone is not a bit-for-bit reconstruction recipe.
+
 ## Result
 
 The native PHY passed ten fresh FPGA programming and initialization trials at
@@ -28,7 +42,7 @@ separately from the four standard rates.
 
 DDR4-2400 is the highest timing-supported standard rate for this native PHY
 on the AXKU3 `xcku3p-ffvb676-2-i`. A ceiling build at DDR4-2666 used the
-current RTL, a 333.333 MHz quarter-rate controller clock, a 750 ps DDR4 clock
+RTL from that campaign, a 333.333 MHz quarter-rate controller clock, a 750 ps DDR4 clock
 period, and a 2666.667 MHz `CLKOUTPHY`. Implementation closed ordinary setup
 and hold timing at WNS `+0.006 ns` and WHS `+0.009 ns`, with all 47,243
 routable nets complete and no routing errors.
@@ -88,8 +102,8 @@ training.
 
 ## Exact artifacts and evidence
 
-The generated files are under `.tmp/freq_qual/` and are intentionally ignored
-by Git because of their size. Preserve both the `.bit` and matching `.ltx` for
+The campaign stored generated files under `.tmp/freq_qual/`, intentionally
+ignored by Git because of their size and absent from this release checkout. Preserve both the `.bit` and matching `.ltx` for
 each image.
 
 | Rate | Artifact stem | BIT SHA-256 | LTX SHA-256 | Ten-run evidence directory |
@@ -130,10 +144,11 @@ after the corresponding fixes and clean implementation gates.
 - AMD/Xilinx UG571 v1.16, *UltraScale Architecture SelectIO Resources User
   Guide*: `ug571-ultrascale-selectio.pdf`. RIU protocol was checked on pages
   325-327 and `NIBBLE_CTRL0` on page 329.
-- Local DDR4 specification: `ddr4.pdf`.
-- DFI specification: `DDR_PHY_Interface_Specification_v3_1 (1).pdf`.
-- Seller board material: `C:\Users\ajacobo\Downloads\AXKU3\AXKU3`.
-- Seller MIG reference project: `C:\Users\ajacobo\Downloads\AXKU3\ddr4_test`.
+- JEDEC JESD79-4D (July 2021), DDR4 SDRAM: `ddr4.pdf`.
+- DFI version 3.1 (March 21, 2014):
+  `DDR_PHY_Interface_Specification_v3_1 (1).pdf`. See [References](docs/REFERENCES.md).
+- Seller board material: the locally retained `AXKU3/` seller package (not bundled).
+- Seller MIG reference project: the locally retained `ddr4_test/` project (not bundled).
 - Seller MIG configuration:
   `ddr4_test.srcs\sources_1\ip\ddr4_core\ddr4_core.xci`, including
   `C0.DDR4_MAX_PERIOD=1600`, `C0.DDR4_tCK=750`, and speed grade `075E`.

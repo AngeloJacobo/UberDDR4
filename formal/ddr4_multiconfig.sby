@@ -1,3 +1,6 @@
+# Thirty prove-mode tasks: 24 rate/width/map cases, four bounded-stall
+# cases and two row-width cases. These task names define the actual count.
+# Scope/assumptions: docs/VERIFICATION.md and ddr4_controller_formal.vh.
 [tasks]
 ddr4_1600_x4_map0
 ddr4_1600_x4_map1

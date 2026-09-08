@@ -1,3 +1,6 @@
+# Internal regression helper: run_xsim.sh in a Windows Job Object.
+# Called by regression_test.sh with a checkout path, wall timeout and stop file.
+# See docs/VERIFICATION.md for cleanup scope and host concurrency limits.
 param(
     [Parameter(Mandatory = $true)]
     [string]$RepositoryRoot,
@@ -11,9 +14,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# A Windows Job Object gives the simulator one reliable lifetime boundary.
-# When this PowerShell process exits for any reason, KILL_ON_JOB_CLOSE removes
-# Bash and every Vivado/XSim descendant without depending on MSYS parent PIDs.
+# A Windows Job Object contains descendants that remain in the job.
+# KILL_ON_JOB_CLOSE closes that group; the timeout/stop path also uses the
+# fallback below for Xilinx loaders that break children away from the job.
 if (-not ('UberDDR4.NativeJob' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -78,8 +81,9 @@ $startedAt = Get-Date
 
 function Stop-OwnedXilinxTools {
     # Vivado's loader can break xvlog/xelab/xsim out of an inherited Job.
-    # The regression lock guarantees one suite per workspace; restrict this
-    # fallback further to simulator tools created during this owned run.
+    # The regression lock excludes another suite in this checkout only. This
+    # fallback filters names/start times, not repository paths, and can stop
+    # another concurrent XSim run on this host. See docs/VERIFICATION.md.
     $names = @('xvlog', 'xelab', 'xsim', 'xsimk')
     Get-Process -ErrorAction SilentlyContinue | Where-Object {
         $names -contains $_.ProcessName -and
@@ -151,7 +155,8 @@ try {
     }
 }
 finally {
-    # Closing the last job handle is the only tree-cleanup operation needed.
+    # Close remaining contained descendants. Breakaway cleanup is performed
+    # above on timeout/stop; it is not implied by closing this job handle.
     [void][UberDDR4.NativeJob]::CloseHandle($job)
     if ($null -ne $process) {
         $process.Dispose()

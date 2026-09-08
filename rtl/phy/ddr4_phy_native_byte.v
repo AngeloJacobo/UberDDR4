@@ -3,6 +3,9 @@
 // UltraScale and UltraScale+ devices. The explicit lower/upper-nibble
 // structure mirrors the physical BITSLICE layout and is intentionally kept
 // visible for placement review against an implemented design.
+// i_div_clk carries parallel data; i_riu_clk services register transactions.
+// The parent supplies same-MMCM/same-phase PLL-input and RIU clocks for
+// memory RL_DLY_RNK operations (UG571 Table 2-54). See docs/ARCHITECTURE.md.
 
 `timescale 1ps / 1ps
 `default_nettype none
@@ -70,9 +73,9 @@ module ddr4_phy_native_byte #(
     output wire [3:0]           o_dbg_nibble_ready,
     // Each asynchronous DQ FIFO has its own registered read enable.
     input  wire [DQ_BITS-1:0]   i_fifo_rd_en,
-    // Per-byte RIU access. Read-gate registers target only the upper nibble
-    // that owns DQS. Write-level registers target both nibbles so all eight
-    // DQ bits retain the same trained TX phase as DQS.
+    // Per-byte RIU access. Explicit lower/upper selects target each physical
+    // nibble; gate training may address them separately. Write-level updates
+    // coordinate both nibbles so DQ retains the intended phase relative to DQS.
     input  wire [5:0]           i_riu_addr,
     input  wire [15:0]          i_riu_wr_data,
     input  wire                 i_riu_wr_en,

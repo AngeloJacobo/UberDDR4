@@ -9,11 +9,15 @@
 #
 # Prerequisites:
 #   source /path/to/Vivado/2023.1/settings64.sh   # sets $XILINX_VIVADO
-#   ./UberDDR4/testbench/setup_micron_model.sh     # creates model symlinks
+#   bash testbench/setup_micron_model.sh     # links/copies installed vendor model files
 #
 # Usage:
-#   ./UberDDR4/testbench/run_xsim.sh          # from repo root
-#   ./UberDDR4/testbench/run_xsim.sh --clean   # delete xsim.dir first
+#   bash testbench/run_xsim.sh          # from repo root
+#   bash testbench/run_xsim.sh --clean   # delete xsim.dir first
+#
+# See docs/VERIFICATION.md for defaults, numeric defines on Windows,
+# simulation versus wall timeouts and generated files. Direct runs overwrite
+# XSim outputs; do not overlap with another simulation in this checkout.
 #
 # Environment:
 #   EXTRA_DEFINES  -  extra xvlog -d flags, e.g. "-d SIM_FLY_BY_DELAY=200"

@@ -3,10 +3,11 @@
 // Purpose: provides a second, structurally independent implementation
 // of the Wishbone-to-DDR4 address decode. The formal harness feeds the
 // same wb_addr into this module and into the controller's pipeline
-// registers, then asserts the outputs match. If the controller's decode
-// has a bug (wrong bit slice, swapped fields, etc.), the mismatch fires
-// an assertion failure that the solver cannot satisfy -- catching the
-// bug with no simulation required.
+// registers, then asserts the outputs match under its active guards. This
+// catches disagreements with the reference mapping in the constrained model;
+// it does not independently validate a board's physical memory geometry.
+// wb_addr is a burst-word address; COL_LOW zero bits are appended to col.
+// See docs/VERIFICATION.md for task configuration and assumptions.
 //
 // Supports both address mappings:
 //   map0: {row, bg, ba, col_upper}

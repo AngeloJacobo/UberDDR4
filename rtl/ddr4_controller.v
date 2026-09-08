@@ -4,8 +4,11 @@
 // Project:  UberDDR4 - An Open Source DDR4 Controller
 //
 // Purpose:  DDR4 SDRAM controller targeting Xilinx UltraScale+ FPGAs.
-//  4:1 memory controller with DFI 3.1 PHY interface, 16-bank tracking
-//  with bank group awareness, and Wishbone B4 pipelined host interface.
+//  Quarter-rate controller with a DFI 3.1 subset and Wishbone B4 pipelining.
+//  Tracks 16 banks for x4/x8 or 8 banks for x16, including bank-group timing.
+//  This scheduler has no Xilinx primitives; the supplied PHYs are device-specific.
+//  See docs/ARCHITECTURE.md for timing assumptions and docs/INTEGRATION.md
+//  for the public top-level contract. The direct controller port is internal.
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -53,10 +56,11 @@ module ddr4_controller #(
     // Set to 1 when simulating with Micron DDR4 model (shortens power on duration)
     parameter[0:0] MICRON_SIM = 0,
     // Address mapping:
-    //   0 = sequential {row, bg, ba, col}
-    //   1 = BG-interleaved {row, ba, col_hi, bg, col_lo} (recommended, every back-to-back read or write uses tCCD_S)
+    //   0 = WB burst-word address {row, bg, ba, col_upper}
+    //   1 = WB burst-word address {row, ba, col_upper, bg}; sequential words rotate BG
+    // Low COL_LOW DRAM column bits are inserted as zeros for BL8 alignment.
     parameter[1:0] ADDR_MAPPING = 1,
-    // On-die termination during WRITE
+    // Mode-register termination configuration (verify against board/device loading)
     //   RTT_NOM  (MR1 A10:A8): 000=off, 001=RZQ/4, 010=RZQ/2, 011=RZQ/6,
     //                           100=RZQ/1, 101=RZQ/5, 110=RZQ/3, 111=RZQ/7
     //   RTT_WR   (MR2 A11:A9): 000=off, 001=RZQ/2, 010=RZQ/1, 011=Hi-Z,
@@ -64,15 +68,15 @@ module ddr4_controller #(
     //   RTT_PARK (MR5 A8:A6):  000=off, 001=RZQ/4, 010=RZQ/2, 011=RZQ/6,
     //                           100=RZQ/1, 101=RZQ/5, 110=RZQ/3, 111=RZQ/7
     // Refer to JESD79 Section 4.1: ODT Mode Register and ODT State Table
-    parameter[2:0] RTT_NOM  = 3'b001, // DRAM turns ON RTT_NOM if it sees ODT asserted (setting RTT_NOM is enough for single-rank config)
+    parameter[2:0] RTT_NOM  = 3'b001, // DRAM turns ON RTT_NOM if it sees ODT asserted (this is the default single-rank termination choice)
                    RTT_WR   = 3'b000, // The rank that is being written to provide termination regardless of ODT pin status
                    RTT_PARK = 3'b000, //  Default parked value when ODT is low
     // Output driver impedance during READS (MR1 A2:A1): 0=RZQ/7 (34ohm), 1=RZQ/5 (48ohm)
     parameter[0:0] DRIVE_IMP = 0,
     // CAS Latency override (0=auto from DDR4_CLK_PERIOD)
-    //   Auto picks worst-case CL that works with ALL speed bins (JESD79-4D Tables 147-150):
+    //   Auto uses the conservative table below; check the actual device speed bin:
     //   DDR4-1600=12, DDR4-1866=14, DDR4-2133=16, DDR4-2400=18
-    //   Override with a lower value for faster bins (e.g. CL=16 for DDR4-2400R)
+    //   A CL override also changes this implementation's tRCD/tRP assumptions.
     parameter[5:0] CL = 0,
     // CAS Write Latency override (0=auto from DDR4_CLK_PERIOD)
     //   Auto values from JESD79-4D Table 21 (1tCK write preamble):
@@ -81,7 +85,7 @@ module ddr4_controller #(
     // DFI PHY write latency, in controller (1:4 DFI) clocks.  The
     // controller advances wrdata/wrdata_en by this amount so it arrives at
     // the DRAM exactly CWL after WRITE.  Component PHYs use 0; the native
-    // BITSLICE PHY uses 1 to cover its registered TX word.
+    // BITSLICE PHY uses 2 in ddr4_top to cover its registered TX path.
     parameter[1:0] TPHY_WRLAT = 0,
     // Additional reset-exit guard, in controller clocks, between the DFI CKE
     // assertion and the first MRS command.  This covers PHY-specific initial
@@ -123,7 +127,7 @@ module ddr4_controller #(
     input wire                       i_wb_cyc,   // Bus cycle active (held for entire burst)
     input wire                       i_wb_stb,   // Transfer strobe (qualifies we/addr/data/sel)
     input wire                       i_wb_we,    // Write enable (1=write, 0=read)
-    input wire[WB_ADDR_BITS-1:0]     i_wb_addr,  // Byte address (burst-aligned)
+    input wire[WB_ADDR_BITS-1:0]     i_wb_addr,  // BL8 burst-word address (not a byte address)
     input wire[WB_DATA_BITS-1:0]     i_wb_data,  // Write data from master
     input wire[WB_SEL_BITS-1:0]      i_wb_sel,   // Byte-lane select (1 bit per byte of write data)
     output reg                       o_wb_stall, // Pipeline stall (high when slave cannot accept new request)
@@ -298,8 +302,8 @@ module ddr4_controller #(
      * Values are in picoseconds unless suffixed _nCK (DDR4
      * clock cycles). ps_to_nCK() converts ps to DDR4 clocks;
      * The scheduler keeps a countdown counter per bank /
-     * bank-group; a command fires only after its counter
-     * reaches zero.
+     * bank-group; scheduling checks counter <= 1 because the
+     * selected command reaches the registered DFI output next cycle.
      ************************************************************/
 
     // ----- Latency (JESD79-4D Tables 147-153) -----
@@ -316,10 +320,10 @@ module ddr4_controller #(
                                                       32_000;  //DDR4-2400+
     // tRCD : ACT-to-READ/WRITE -- row activate to column access delay
     // tRP  : PRE command period -- time to close a row before opening another
-    // Derived from CL since CL=nRCD=nRP for all JEDEC speed bins
-    // (Tables 147-153). The auto CL values match the worst-case nRCD at
-    // each speed grade, so CL*tCK satisfies tRCD for any DDR4 part
-    // (including cross-speed scenarios like DDR4-2400 running at 1600).
+    // This implementation derives both from CL*tCK using the selected table
+    // or override. Verify the actual part's tAA/tRCD/tRP and legal CL set,
+    // especially when downclocking or overriding CL; the formula alone is
+    // not a guarantee for every device/speed-bin combination.
     localparam tRCD_ps = CL_nCK * DDR4_CLK_PERIOD;
     localparam tRP_ps  = tRCD_ps;
     // tRC  : ACT-to-ACT (same bank) = tRAS + tRP
@@ -402,6 +406,8 @@ module ddr4_controller #(
                           (DENSITY == 4)  ? 260_000 : //4Gb
                                             160_000;  //2Gb
     // tREFI : Average periodic refresh interval (normal temp <=85°C)
+    // Fixed normal-temperature 1x refresh. No automatic 85 C threshold switch
+    // to the shorter high-temperature interval; see docs/INTEGRATION.md.
     localparam tREFI_ps = 7_800_000; // 7.8us (Table 43)
 
     // ----- Write Leveling (JESD79-4D Tables 172-173) -----
@@ -1899,12 +1905,12 @@ module ddr4_controller #(
                     // latency, so ddr4_top supplies it with a larger watchdog.
                     CALIB_GATE_WAIT: begin
                         if (calib_timer == 0) begin // T_RDLVL_MAX expired
-                            // CALIB_RETRY_MAX is not yet exceed so repeat gate training
+                            // Retry budget remains; repeat gate training
                             if (calib_retry_count < CALIB_RETRY_MAX) begin 
                                 calib_retry_count <= calib_retry_count + 1'b1;
                                 calib_state <= CALIB_GATE_EN;
                                 calib_gap_timer <= T_RDLVL_EN;
-                            end else begin // CALIB_RETRY_MAX is now exceeded so stop
+                            end else begin // Retry budget is exhausted; stop
                                 calib_state <= CALIB_ERROR;
                             end
                         end else if (&i_dfi_rdlvl_resp) begin // all byte lanes are done
@@ -1943,12 +1949,12 @@ module ddr4_controller #(
                     // (rdlvl_resp=all 1s) or timeout → retry/error.
                     CALIB_EYE_WAIT: begin
                         if (calib_timer == 0) begin // T_RDLVL_MAX expired
-                            // CALIB_RETRY_MAX is not yet exceed so repeat read eye training
+                            // Retry budget remains; repeat read-eye training
                             if (calib_retry_count < CALIB_RETRY_MAX) begin
                                 calib_retry_count <= calib_retry_count + 1'b1;
                                 calib_state <= CALIB_EYE_EN;
                                 calib_gap_timer <= T_RDLVL_EN;
-                            end else begin // CALIB_RETRY_MAX is now exceeded SO STOP
+                            end else begin // Retry budget is exhausted; stop
                                 calib_state <= CALIB_ERROR;
                             end
                         end else if (&i_dfi_rdlvl_resp) begin // all byte lanes are done
@@ -1984,7 +1990,7 @@ module ddr4_controller #(
                     end
 
                     // Assert wrlvl_en — DRAM is already in WL mode
-                    // (ROM addr 25 wrote MR1 with A7=1). Wait for PHY.
+                    // (the selected WL window programmed MR1 A7=1). Wait for PHY.
                     CALIB_WL_EN: begin
                         o_dfi_wrlvl_en <= 1'b1;
                         if (calib_gap_timer == 0) begin
@@ -2008,12 +2014,12 @@ module ddr4_controller #(
                     CALIB_WL_WAIT: begin
                         o_dfi_wrlvl_strobe <= 1'b0;
                         if (calib_timer == 0) begin // T_WRLVL_MAX expired
-                            // CALIB_RETRY_MAX is not yet exceed so repeat gate training
+                            // Retry budget remains; repeat write leveling
                             if (calib_retry_count < CALIB_RETRY_MAX) begin
                                 calib_retry_count <= calib_retry_count + 1'b1;
                                 calib_state <= CALIB_WL_EN;
                                 calib_gap_timer <= T_WRLVL_EN;
-                            end else begin // CALIB_RETRY_MAX is now exceeded so stop
+                            end else begin // Retry budget is exhausted; stop
                                 calib_state <= CALIB_ERROR;
                             end
                         end else if (&i_dfi_wrlvl_resp) begin // all byte lanes are done
@@ -2486,10 +2492,10 @@ module ddr4_controller #(
         end
     endfunction
 
-    // CL_generator: return worst-case CAS Latency for the given DDR4 clock period.
-    // Picks the highest CL supported by ALL speed bins at each speed grade,
-    // so the auto value works with any DDR4 part (JESD79-4D Tables 147-153).
-    // Override via CL parameter (nonzero = use directly) for faster bins.
+    // CL_generator: return the implementation's conservative latency table value.
+    // A nonzero CL override is used directly and also changes tRCD/tRP above.
+    // Verify the resulting mode-register encoding and all device timing limits;
+    // table branches above qualified hardware rates are not hardware signoff.
     function integer CL_generator(input integer ddr4_clk_period);
         begin
             if (CL != 0)                       CL_generator = {26'b0, CL}; //manual override

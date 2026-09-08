@@ -6,8 +6,9 @@
 // Purpose:  Combined BIST engine and debug CSR register file. The BIST
 //  exercises the DDR4 data path via sequential (burst), stress-addressed
 //  (row/bank thrashing), and alternating write/read patterns through a
-//  Wishbone B4 master port. The debug CSR provides read-only register
-//  access to controller, PHY, and BIST status.
+//  Wishbone B4 master port. The separate debug CSR exposes status and,
+//  when BIST is compiled in, CONTROL start/reset/recovery writes.
+//  Register layout, reset lifetime and destructive-test use: docs/DEBUGGING.md.
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -43,18 +44,18 @@ module ddr4_prober #(
               /* verilator lint_off UNUSEDPARAM */
               ROW_BITS           = 16,
               /* verilator lint_on UNUSEDPARAM */
-    // Set to 1 when simulating with Micron DDR4 model (adjusts timing checks)
+    // Simulation only: restricts the BIST address counter to 10 bits
     parameter[0:0] MICRON_SIM    = 0,
-    // BIST_MODE: 0=disabled, 1=half-range (each phase covers half the address space),
-    //            2=full-range (each phase covers the full address space)
+    // BIST_MODE: 0=disabled, 1=partitioned counters (burst 1/4, stress 1/2, alt 1/4),
+    //            2=full-range counters in each phase. Top-level default is 1.
     parameter[1:0] BIST_MODE     = 2,
-    // BIST burst write per-byte-lane masking: 0=disabled (full-word writes),
-    // 1=enabled (cycles through byte lanes one at a time to stress DM path)
+    // BIST burst-write masking: 0=full-word writes; 1=one byte position of
+    // the full WB burst per write (WB_SEL_BITS writes, not BYTE_LANES writes)
     parameter[0:0] BIST_DM_TEST     = 1,
     // Hardware diagnostic: after the first BIST mismatch, drain all older
-    // requests and reread that exact address repeatedly without rewriting it.
-    // This distinguishes a stored/write-path error from an intermittent
-    // receive-path error. Keep disabled in production builds.
+    // requests and first reread the exact address without rewriting it. Native
+    // follow-up may adjust TX delay, rewrite/retest and retrain. Rereads are
+    // diagnostic evidence, not definitive fault attribution. Destructive mode.
     parameter[0:0] BIST_REREAD_DIAG = 0,
     // Debug CSR register file: 0=disabled (saves area), 1=enabled
     parameter      DEBUG_CSR_ENABLE = 1
@@ -62,11 +63,11 @@ module ddr4_prober #(
     input  wire                     i_clk,              // System clock (same as controller clock)
     input  wire                     i_rst_n,            // Active-low synchronous reset
     // Calibration status from controller
-    (* mark_debug = "true" *) input  wire                     i_calib_complete,   // Pulses high when DDR4 init + PHY training finishes successfully
+    (* mark_debug = "true" *) input  wire                     i_calib_complete,   // Level high after DDR4 init + PHY training; rising edge starts BIST
     (* mark_debug = "true" *) input  wire                     i_calib_error,      // High if calibration retries exhausted (unrecoverable training failure)
-    // Init status (sticky — set once after calibration + optional BIST)
+    // Init status (latched until external or internal soft/BIST reset)
     (* mark_debug = "true" *) output reg                      o_init_done,        // Latches high once calibration passes AND BIST passes (or BIST disabled)
-    (* mark_debug = "true" *) output reg                      o_init_failed,      // Latches high on calibration error OR BIST data mismatch; mutually exclusive with o_init_done
+    (* mark_debug = "true" *) output reg                      o_init_failed,      // Calibration/startup BIST failure latch; not universally exclusive with init_done
     // BIST status
     (* mark_debug = "true" *) output wire                     o_bist_busy,        // High while BIST FSM is actively issuing/checking memory transactions
     (* mark_debug = "true" *) output reg                      o_bist_failed_reset_req,   // Auto-reset request: asserted after BIST fail when CSR auto_reset_en is set
@@ -77,9 +78,9 @@ module ddr4_prober #(
     output reg                      o_wb_we,            // Write enable: 1=write, 0=read
     output reg  [WB_ADDR_BITS-1:0]  o_wb_addr,          // DDR4 word address
     output reg  [WB_DATA_BITS-1:0]  o_wb_data,          // Write data (full cache-line width)
-    output reg  [WB_SEL_BITS-1:0]   o_wb_sel,           // Byte-lane select (one-hot when BIST_DM_TEST=1, all-ones otherwise)
+    output reg  [WB_SEL_BITS-1:0]   o_wb_sel,           // Byte select; one-hot in masked burst writes, otherwise full-word
     input  wire                     i_wb_stall,         // Backpressure from controller: request not accepted this cycle
-    input  wire                     i_wb_ack,           // Acknowledge: read data valid or write committed
+    input  wire                     i_wb_ack,           // Acknowledge: returned read data or controller write completion; not DRAM readback
     input  wire [WB_DATA_BITS-1:0]  i_wb_data,          // Read data returned by controller
     // Wishbone B4 — Debug CSR port (pipelined, zero-wait-state, independent of DRAM path)
     input  wire                     i_wb_dbg_cyc,       // CSR bus cycle
@@ -87,8 +88,8 @@ module ddr4_prober #(
     input  wire                     i_wb_dbg_we,        // CSR write enable
     input  wire [3:0]               i_wb_dbg_addr,      // CSR register address (selects 1 of 16 registers)
     /* verilator lint_off UNUSEDSIGNAL */
-    input  wire [31:0]              i_wb_dbg_data,      // CSR write data (only [2:0] used for control reg)
-    input  wire [3:0]               i_wb_dbg_sel,       // CSR byte select (unused, always full-word)
+    input  wire [31:0]              i_wb_dbg_data,      // CONTROL [1:0] are W1 strobes; every write also assigns recovery-enable [2]
+    input  wire [3:0]               i_wb_dbg_sel,       // CSR byte select is ignored; it does not mask CONTROL writes
     /* verilator lint_on UNUSEDSIGNAL */
     output wire                     o_wb_dbg_stall,     // Always 0: CSR port never stalls
     output reg                      o_wb_dbg_ack,       // Registered ACK (1-cycle latency)
@@ -101,12 +102,12 @@ module ddr4_prober #(
     (* mark_debug = "true" *) input  wire                     i_refresh_idle,     // Refresh timer in idle countdown — scheduler free to issue user commands
     (* mark_debug = "true" *) input  wire [NUM_BANKS-1:0]     i_bank_status,      // Per-bank status: 1=row open (active), 0=precharged (idle)
     // Status from PHY (flat packed, exposed via CSR for training debug)
-    (* mark_debug = "true" *) input  wire [3:0]               i_phy_state,        // PHY training FSM state (0=IDLE, 3=GATE_DONE, 7=EYE_DONE, 11=WL_DONE)
+    (* mark_debug = "true" *) input  wire [3:0]               i_phy_state,        // PHY training FSM state (0=IDLE, 1=GATE_DONE, 7=EYE_DONE, 11=WL_DONE; PHY-specific others)
     input  wire [9*BYTE_LANES-1:0]  i_phy_idelay_center, // 9b per lane: IDELAY tap at center of read data eye
     input  wire [9*BYTE_LANES-1:0]  i_phy_wl_tap,       // 9b per lane: ODELAY tap where DQS aligns to CK at DRAM
     input  wire [4*BYTE_LANES-1:0]  i_phy_bitslip,      // 4b per lane: ISERDES barrel-shift aligning capture to burst boundary
-    input  wire [3*BYTE_LANES-1:0]  i_phy_train_fail,   // Per lane: {wl_fail, eye_fail, gate_fail} — sticky failure flags
-    // Extended training debug (CSR 0x8, 0x9, 0xD, 0xE readback)
+    input  wire [3*BYTE_LANES-1:0]  i_phy_train_fail,   // Packed groups: {wl_fail[BL-1:0], eye_fail[BL-1:0], gate_fail[BL-1:0]}
+    // Extended training debug (CSR 0x6..0x9; 0xE/0xF are reserved zero)
     input  wire [9*BYTE_LANES-1:0]  i_phy_best_width,   // 9b per lane: eye width in IDELAY taps
     input  wire [9*BYTE_LANES-1:0]  i_phy_best_start,   // 9b per lane: first passing IDELAY tap
     /* verilator lint_off UNUSEDSIGNAL */
@@ -177,8 +178,8 @@ module ddr4_prober #(
     //
     // All three phases always run.  BIST_MODE controls addressing:
     //   0 = disabled (BIST does not run)
-    //   1 = partitioned: phases cover contiguous, non-overlapping
-    //       slices that together span the full BIST address range
+    //   1 = partitioned: phase input counters cover contiguous, non-overlapping
+    //       slices; stress_addr() remaps them, so physical regions can overlap
     //       (burst: 0→BURST_END, random: BURST_END+1→RANDOM_END,
     //        alt: RANDOM_END+1→ALT_END)
     //   2 = full-range: every phase independently covers the entire
@@ -225,7 +226,8 @@ module ddr4_prober #(
     wire bist_auto_reset_available = auto_reset_en &&
         (bist_auto_reset_count < BIST_AUTO_RESET_MAX);
 
-    // Module-scope CSR write-enable decode (visible to both gen_bist and gen_csr)
+    // CONTROL side-effect decode is NOT gated by DEBUG_CSR_ENABLE or byte selects.
+    // Tie unused debug CYC/STB/WE low, even with CSR responses disabled.
     wire csr_we = i_wb_dbg_cyc && i_wb_dbg_stb && i_wb_dbg_we;
 
     // -----------------------------------------------------------------
@@ -1954,7 +1956,7 @@ module ddr4_prober #(
     //   0x5 -- BIST_STATUS:   BIST FSM state, busy, pass, fail, init_done/failed
     //   0x6 -- LANE0_TRAINING: IDELAY center, WL DQS tap, bitslip, best_start
     //   0x7 -- LANE1_TRAINING: Same fields (if BYTE_LANES > 1)
-    //   0x8 -- EYE_HEALTH:    Eye width per lane, rd_lat_extra, en_vtc
+    //   0x8 -- EYE_HEALTH:    Lane 0/1 widths, BL latency flags, en_vtc
     //   0x9 -- WRITE_PATH:    DQ ODELAY taps, DQS BISC baselines (both lanes)
     //   0xA -- CONFIG:        Static readback (BYTE_LANES, BIST_MODE)
     //   0xB -- VERSION:       IP version (major.minor, currently 0.1)
@@ -2040,7 +2042,7 @@ module ddr4_prober #(
                 end
                 // --- 0x8: EYE_HEALTH ---
                 // [8:0]=Lane 0 best_width, [17:9]=Lane 1 best_width,
-                // [19:18]=rd_lat_extra, [20]=en_vtc
+                // [18+BYTE_LANES-1:18]=rd_lat_extra, [18+BYTE_LANES]=en_vtc
                 4'h8: csr_data_r = {11'd0,
                                     i_phy_en_vtc,
                                     i_phy_rd_lat_extra,
@@ -2049,6 +2051,7 @@ module ddr4_prober #(
                 // --- 0x9: WRITE_PATH ---
                 // [7:0]=Lane 0 wl_dq_tap, [15:8]=Lane 1 wl_dq_tap,
                 // [23:16]=Lane 0 dqs_initial_tap, [31:24]=Lane 1 dqs_initial_tap
+                // Each 9-bit count loses its MSB in this legacy 8-bit readback.
                 4'h9: csr_data_r = {i_phy_dqs_initial_tap[16:9],
                                     i_phy_dqs_initial_tap[7:0],
                                     i_phy_wl_dq_tap[16:9],
@@ -2087,7 +2090,7 @@ module ddr4_prober #(
     end endgenerate
 
     // -----------------------------------------------------------------
-    // Init Status (sticky registers)
+    // Init Status (cleared by prober_internal_reset, not by BIST start alone)
     // -----------------------------------------------------------------
     always @(posedge i_clk) begin
         if (prober_internal_reset) begin

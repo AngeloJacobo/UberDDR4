@@ -1,11 +1,14 @@
 ################################################################################
 # AXKU3 DDR4 bring-up constraints
 # Board: ALINX AXKU3, XCKU3P-FFVB676-2-I
-# DRAM:  2 x MT40A512M16LY-062E (32-bit, DDR4-1600)
+# DRAM:  2 x MT40A512M16LY-062E (32-bit; current wrapper targets DDR4-2400)
 #
 # Pin locations and electrical standards are taken from the board vendor's
 # working DDR4 example project.  Add this file as a constraints source and use
 # axku3_uberddr4 as the Vivado top-level module.
+# This file also creates/connects ILA debug cores; it is not a pin-only XDC.
+# Keep the native ACMD Bank 66/data Bank 67 maps and PLL topology aligned.
+# Clocking Wizard setup and evidence requirements: README.md in this directory.
 ################################################################################
 
 create_clock -period 5.000 -name sys_clk_200 -waveform {0.000 2.500} [get_ports sys_clk_p]

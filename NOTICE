@@ -1,0 +1,29 @@
+UberDDR4 source notices
+======================
+
+The original UberDDR4 controller, PHY, top and prober files carry Angelo
+Jacobo's GNU GPL version 3-or-later notices. COPYING supplies the unmodified
+GNU GPL version 3 text referenced by those headers. Existing file-level
+copyright and license notices remain authoritative.
+
+The following imported ZipCPU/Dan Gisselquist modules retain their own Apache
+License 2.0 notices and upstream references:
+  rtl/axi/axi_addr.v
+  rtl/axi/axim2wbsp.v
+  rtl/axi/aximrd2wbsp.v
+  rtl/axi/aximwr2wbsp.v
+  rtl/axi/skidbuffer.v
+  rtl/axi/wbarbiter.v
+  formal/fwb_slave.v
+
+rtl/axi/sfifo.v carries Gisselquist Technology's public-domain dedication
+and warranty disclaimer, retained in its header.
+
+See those headers for attribution and the license reference. This inventory
+does not assign a new license to files without an explicit license notice.
+
+AMD/Xilinx primitive libraries, generated IP, and the Micron behavioral model
+are external dependencies with their own supplied terms. The model setup
+script links or copies files from the user's installed Vivado distribution;
+the vendor model is not included in this source release. The Linux project
+manages additional external software and toolchain dependencies separately.

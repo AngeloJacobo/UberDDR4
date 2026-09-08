@@ -1,9 +1,12 @@
 ////////////////////////////////////////////////////////////////////////////////
 // Native PHY primitive-reset sequencer
 //
-// The order and wait counts follow the UltraScale/UltraScale+ native PHY
-// startup requirements. Keep the sequence cycle-exact: controller start-up
-// timing accounts for this fixed PHY latency.
+// Sequences PLL lock, BITSLICE_CONTROL/BITSLICE reset release, delay ready,
+// VTC ready, TBYTE and PHY read enable. The programmed settle counts are
+// fixed; total startup time also depends on the incoming ready/lock signals.
+// The controller's separate TPHY_INIT_LAT=9 native guard covers initial CA/CKE
+// serialization, not this entire readiness sequence. See docs/ARCHITECTURE.md.
+// i_clk is the native controller/DIV clock; reset asserts asynchronously.
 ////////////////////////////////////////////////////////////////////////////////
 
 `default_nettype none

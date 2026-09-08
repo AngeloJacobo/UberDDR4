@@ -4,8 +4,11 @@
 // Project:  UberDDR4 - An Open Source DDR4 Controller
 //
 // Purpose:  Top module which instantiates ddr4_top and an AXI4-to-Wishbone
-//  bridge (ZipCPU axim2wbsp).  Use this as the top module when integrating
-//  UberDDR4 with an AXI4 interconnect.
+//  bridge (ZipCPU axim2wbsp). Retained component-PHY data-path wrapper.
+//  It does not forward native topology or connect the separate debug port.
+//  With DEBUG_CSR_ENABLE=1, the extra upper address bit is truncated by
+//  ddr4_top and aliases DRAM; it does not select a CSR window.
+//  See docs/INTEGRATION.md, AXI wrapper limitations, before using it.
 //
 //  The AXI byte address is wider than the WB word address by AXI_LSBS
 //  bits (= log2(data_width_bytes)).  The bridge strips these LSBs and
@@ -59,6 +62,7 @@ module ddr4_top_axi #(
                    WB_SEL_BITS   = WB_DATA_BITS / 8,
                    COL_LOW       = $clog2(SERDES_RATIO * 2),
                    WB_ADDR_BITS  = ROW_BITS + BG_BITS + BA_BITS + COL_BITS - COL_LOW,
+                   // Legacy extra bit: discarded at the narrower ddr4_top DRAM port.
                    EXT_ADDR_BITS = WB_ADDR_BITS + DEBUG_CSR_ENABLE,
                    // AXI_LSBS: number of byte-offset bits stripped by the
                    // bridge (AXI uses byte addresses, WB uses word addresses)

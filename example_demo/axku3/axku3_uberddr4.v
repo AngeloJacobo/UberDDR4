@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////////////////
-// AXKU3 DDR4 bring-up top level
+// AXKU3 DDR4 bring-up top level (build/clock/IP instructions: README.md here)
 //
 // Board: ALINX AXKU3, XCKU3P-FFVB676-2-I
 // DRAM:  two Micron MT40A512M16LY-062E (2 x x16 = 32-bit interface)
@@ -89,8 +89,8 @@ module axku3_uberddr4 (
      );
 
     // Keep the controller in reset until the manually-created Clocking Wizard
-    // has locked.  This is an asynchronous assertion path as required by
-    // ddr4_top.i_rst_n.
+    // has locked. The pushbutton asynchronously clears this wrapper register;
+    // lock is sampled on controller_clk. The core also has synchronous state.
     reg ddr4_rst_n;
     always @(posedge controller_clk, negedge rst_n) begin
         if (!rst_n) begin
@@ -104,12 +104,13 @@ module axku3_uberddr4 (
 
     // No external traffic generator is connected. BIST_MODE=2 owns the main
     // Wishbone port during bring-up; all external Wishbone inputs are inactive.
-    // Status is sticky inside ddr4_top, so the display persists after training.
+    // Status persists until external or internal recovery reset. Runtime status
+    // and recovery counters require ILA; DEBUG_CSR_ENABLE does not remove probes.
     ddr4_top #(
         // Quarter-rate DFI relationship for a 300 MHz controller clock and
         // 1.2 GHz DDR4 CK (DDR4-2400).  Integer picosecond parameters round
-        // downward so all computed JEDEC delays remain
-        // conservative relative to the exact 833.333 ps hardware tCK.
+        // downward; verify derived timing against the actual memory and clocks.
+        // These integers are not an independent proof of every JEDEC minimum.
         .CONTROLLER_CLK_PERIOD(3_332),
         .DDR4_CLK_PERIOD      (833),
         .DEVICE_WIDTH          (16),
@@ -117,7 +118,7 @@ module axku3_uberddr4 (
         .COL_BITS              (10),
         .BYTE_LANES            (4),    // two x16 devices = four byte lanes
         .DENSITY               (8),
-        // 0 = component PHY (current board-validated configuration).
+        // 0 = component PHY; 1 = native PHY used by this AXKU3 example.
         // Set to 1 after adding the native PHY source files to the project.
         // ddr4_top then applies the native PHY's required DFI timing itself.
         .PHY_IMPL              (1),

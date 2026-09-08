@@ -2,15 +2,15 @@
 // AXKU3 board-level DDR4 LED bring-up simulation
 //
 // Instantiates the real axku3_uberddr4 top level, including its Clock Wizard
-// instances.  Two x16 Micron DDR4 models represent the AXKU3 board's two
+// instance. Two x16 Micron DDR4 models represent the AXKU3 board's two
 // MT40A512M16LY-062E devices.  The test completes when the design asserts an
 // initialization terminal status and therefore changes the LED output.
 //
 // Compile the Clock Wizard simulation products together with this file:
-//   clk_wiz_0/sim/clk_wiz_0.v and clk_wiz_1/sim/clk_wiz_1.v
+//   clk_wiz_0/sim/clk_wiz_0.v and its generated submodules
 //
-// Configure the Micron model for the 8 Gb x16 part and tCK = 1.250 ns
-// (DDR4-1600).
+// Configure the Micron model for the 8 Gb x16 part at the current wrapper
+// rate, DDR4-2400 (nominal tCK 0.833333 ns). See ../README.md.
 ////////////////////////////////////////////////////////////////////////////////
 
 `timescale 1ps / 1ps
@@ -28,7 +28,7 @@ module axku3_uberddr4_sim_top;
 
     import arch_package::*;
 
-    localparam TIMEOUT_PS = 2_000_000_000; // 2 ms: includes real 200 us + 500 us DRAM waits
+    localparam TIMEOUT_PS = 2_000_000_000; // 2 ms simulated-time watchdog; MICRON_SIM below shortens DRAM waits
     localparam TB_DENSITY = _8G;
 
     // ------------------------------------------------------------------------

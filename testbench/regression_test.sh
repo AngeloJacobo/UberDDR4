@@ -7,8 +7,12 @@
 #
 # Usage:
 #   export XILINX_VIVADO=/path/to/Vivado/2023.1
-#   ./UberDDR4/testbench/regression_test.sh          # run all tests
-#   ./UberDDR4/testbench/regression_test.sh 3 5 7    # run specific tests
+#   bash testbench/regression_test.sh          # run all tests
+#   bash testbench/regression_test.sh 3 5 7    # run specific tests
+#
+# The 26-entry matrix is ALL_TESTS below. Recreates regression_logs and
+# uses a per-checkout regression lock; direct simulator runs bypass that lock.
+# Native/component wall limits and Windows cleanup scope: docs/VERIFICATION.md.
 #
 # Engineer: Angelo C. Jacobo
 #
@@ -209,7 +213,7 @@ ALL_TESTS=(
     "train_fail        834  8   2  0    1  1  0  8  16  DDR4_8G_X8   FIXED_2400  TRAIN_FAIL"
     # CSR reset test
     "csr_reset         834  8   2  0    1  1  0  8  16  DDR4_8G_X8   FIXED_2400  CSR_RESET"
-    # Data-mask stress test (per-byte-lane writes, ~16x longer burst phase)
+    # Data-mask stress test (per-WB-byte writes, 16x burst-write transactions for two lanes)
     "dm_stress         834  8   2  0    1  1  1  8  16  DDR4_8G_X8   FIXED_2400  -"
 )
 

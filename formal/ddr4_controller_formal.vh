@@ -1,39 +1,24 @@
-// ddr4_controller_formal.vh -- Formal properties for ddr4_controller.v
-// Included inside ddr4_controller.v under `ifdef FORMAL
+// ddr4_controller_formal.vh -- Controller properties under FORMAL
+// Included inside ddr4_controller.v; not a standalone module.
 //
-// PURPOSE:
-//   Mathematically prove (via k-induction) that this DDR4 controller:
-//   - Never violates the Wishbone B4 bus protocol
-//   - Never violates JEDEC DDR4 command timing (tRCD, tRP, tCCD, etc.)
-//   - Never loses, duplicates, or reorders requests in its pipeline
-//   - Never stalls the bus longer than the worst-case row-miss latency
-//   - Always fires commands at the earliest legal cycle (no wasted BW)
+// Scope: scheduler timing, Wishbone ordering, pipeline bookkeeping, address
+// decode and write-data propagation under the assumptions in this harness.
+// The SBY files use prove mode with k-induction. A successful task establishes
+// its assertions only within that constrained model, not arbitrary board/PHY
+// behavior, analog margins, all initialization sequences or all configurations.
+// See docs/VERIFICATION.md for task selection, depth and coverage limits.
 //
-// HOW IT WORKS (k-induction in brief):
-//   The solver tries to find a bug in two ways:
-//   1. "Base case": start from reset, simulate N cycles, check asserts
-//   2. "Induction step": assume asserts hold for N cycles, prove they
-//      hold at cycle N+1 (from ANY reachable state)
-//   If both pass, the property holds for ALL time, not just N cycles.
+// fwb_slave supplies the bus contract. A two-entry mini_fifo shadows request
+// order, f_addr_decode cross-checks address fields, and anyconst bank/group
+// selectors let assertions range over arbitrary valid banks without unrolling
+// a separate copy for each one. Property 23 checks write data and byte masks.
 //
-// KEY TECHNIQUES:
-//   - fwb_slave (ZipCPU): monitors the Wishbone B4 pipelined bus for
-//     protocol violations (stall rules, outstanding count, etc.)
-//   - mini_fifo oracle: a 2-entry FIFO shadows the pipeline, tracking
-//     each accepted WB request from accept to scheduler fire. Proves
-//     the pipeline never loses, duplicates, or reorders requests.
-//   - f_addr_decode: independent address decoder cross-checks the
-//     controller's internal decode. Any mismatch between the oracle's
-//     decode and the pipeline registers triggers an assertion failure.
-//   - anyconst bank/BG: universally quantified -- the solver picks a
-//     fixed bank (or BG) and proves the property for it, which covers
-//     all possible values without iterating.
-//   - Induction-strengthening assumes: some invariants (f_outstanding,
-//     CKE/ODT consistency, training-FSM exclusion) must be stated as
-//     "assume" rather than "assert" in the induction step. This is
-//     because the solver can construct states that are technically
-//     unreachable but satisfy the N-cycle assumption window. The base
-//     case proves these invariants hold from reset, ensuring soundness.
+// Assumptions on outstanding count, CKE/ODT/reset phase consistency, ROM range
+// and calibration exclusion apply to both base and induction checks wherever
+// enabled. They are not separately proven merely because the base case passes.
+// The bounded-stall configuration further constrains refresh/init stimulus,
+// pipe_stall and idle stall counts. Review these assumptions before extending
+// the conclusions or reusing this harness with a different PHY.
 //
 // Properties:
 //   1. Wishbone B4 protocol (fwb_slave)
@@ -60,15 +45,17 @@
 //  21. Column address integrity in cmd_d (WR/RD)
 //  22. Cover properties -- reachability (write/read ACK, all scheduler
 //      actions, anticipation co-fire, dual-slot, multi-read pipeline)
+//  23. Write-data and byte-mask shadow pipeline
 //
 // Timing properties coverage:
-//  All JEDEC timing (tRCD, tRP, tRAS, tRC, tCCD_L/S, tRRD_L/S,
-//  tWTR_L/S, tWR, tRTP, tFAW) proven by decomposition into:
+//  Implemented scheduler constraints (tRCD, tRP, tRAS, tRC, tCCD_L/S,
+//  tRRD_L/S, tWTR_L/S, tWR, tRTP, tFAW) are checked by decomposition:
 //    Prop 10: "counters gate commands" (can't fire while counter > 1)
 //    Prop 12: "counters loaded correctly" (JEDEC min loaded after cmd)
 //    Prop  7: same as 10 but for per-BG counters (tCCD, tRRD, tWTR)
 //    Prop 13: tFAW sliding window
-//  Together: correct load + correct gate = timing always met.
+//  Correct loads and gates establish the encoded timing constraints under
+//  this model. They do not independently validate device-bin parameter choices.
 //
 //  Why not a single "gap >= tXXX" assert? Such an assert would need
 //  a timestamp per bank — but timestamps exceed the induction depth
@@ -155,9 +142,9 @@ fwb_slave #(
 
 // Prop 18: Pipeline occupancy equals fwb_slave's outstanding counter.
 // A request lives in exactly one of: stage1, stage2, or ack_pipe.
-// Used as assume because fwb_slave's internal counters (f_nreqs, f_nacks)
-// are free at induction step 0 — no RTL invariant can constrain them.
-// Base case passes from reset; assume prevents unreachable induction states.
+// This equality is an assumption in both base and induction checks when
+// enabled. It constrains the relation between separate bookkeeping models;
+// this statement itself is not an independently proven outstanding invariant.
 always @* begin
     if (reset_done && i_wb_cyc && i_rst_n)
         assume(f_outstanding ==
@@ -167,17 +154,16 @@ end
 
 // ===================================================================
 // 2. CKE / ODT / RESET_N All-Phase Consistency
-// DDR4 requires these signals to be identical across all 4 DFI phases
-// every cycle. cmd_d is registered, so we check after at least one
+// This implementation holds CKE/ODT/RESET_N equal across its four phases.
+// That is a controller scheduling choice, not a universal DFI requirement.
+// cmd_d is registered, so we check after at least one
 // sequential evaluation (f_past_valid) to avoid spurious induction
 // failures from arbitrary initial register state.
 // ===================================================================
-// Why assume (not assert): cmd_d is a register array that Yosys
-// flattens into individual flip-flops. The solver can't "see" that
-// the scheduler always writes the same CKE/ODT/RESET_N to all 4
-// slots — it treats each slot's register as independent. Base case
-// proves consistency from reset; the asserts below verify the
-// registered DFI outputs match.
+// The model assumes cmd_d phase consistency. The assertions below check
+// the registered outputs under that assumption; they do not prove the source
+// cmd_d relationship. Flattening registers does not itself establish or
+// invalidate an invariant.
 always @* begin
     if (i_rst_n) begin
         assume(cmd_d[0][CMD_CKE] == cmd_d[1][CMD_CKE]);
@@ -258,10 +244,9 @@ end
 // Once reset_done is asserted (at ROM addr 32), instruction_address
 // advances to ROM_ADDR_REF_START (33) in the same cycle and never
 // goes below it again (cycles 33→34→35→33).
-// Must remain assume: the relationship between reset_done and
-// instruction_address spans 33 ROM steps — far beyond induction depth.
-// Base case proves it from reset (instruction_address starts at 0,
-// reset_done starts at 0, both transition together at addr 32).
+// The harness assumes this post-init range to keep the model in the
+// intended operating phase. It does not separately prove the entire ROM
+// startup sequence or this assumed relation from reset.
 // ===================================================================
 always @* begin
     if (i_rst_n && reset_done)
@@ -278,7 +263,7 @@ end
 // ===================================================================
 // reset_done and calib_state are independent registers --  the FSM
 // transition from training to DONE spans many more cycles than depth 8.
-// Must remain assume (base case proves from reset).
+// The following exclusion is an assumption, not a separate startup proof.
 always @* begin
     if (i_rst_n) begin
         if (calib_state != CALIB_IDLE && calib_state != CALIB_DONE
@@ -292,13 +277,9 @@ end
 //
 // Shadow FIFO independently tracks WB requests through the 2-stage
 // pipeline. Write to FIFO on wb_accept, read on sched_write/sched_read.
-// Proves: (a) pipeline never loses or duplicates requests (Prop 5),
-//         (b) address/direction preserved through pipeline (Prop 6).
-//
-// DDR4's registered cmd_d means the FIFO data and pipeline registers
-// are structurally disconnected (same issue as Props 2 and 18). So
-// their correlation must be stated as assumes for induction, with
-// the base case proving they always match from reset.
+// Assertions check occupancy (Prop 5) and preserved address/direction
+// (Prop 6), within the bus/calibration assumptions established above.
+// The FIFO/pipeline data-correlation statements below are assertions.
 // ===================================================================
 
 // -- mini_fifo instantiation --
@@ -378,8 +359,8 @@ f_addr_decode #(
 // solver desynchronizes FIFO/pipeline state during init (when the
 // occupancy assertions are guarded), then triggers a false failure
 // at the init->normal transition.
-// Base case proves this from reset: stage_pending cleared by reset,
-// wb_accept blocked by stall, FIFO starts empty.
+// The assertions below check this idle invariant under the common harness
+// assumptions; reset clears the pipeline and initializes the FIFO empty.
 always @* begin
     if (i_rst_n && (!reset_done || !o_calib_complete)) begin
         assert(!stage1_pending);
@@ -969,12 +950,10 @@ always @* begin
     end
 end
 
-// PHY contract: rddata_valid arrives within the designed ACK pipe latency,
-// so pipe_stall never activates. Guaranteed when ACK_PIPE_WIDTH matches
-// the PHY's actual tphy_rdlat. The non-bounded tasks (prove_map0/1)
-// prove ordering correctness WITHOUT this assumption (i.e., even if the
-// PHY is slow). The bounded tasks additionally prove stall is bounded
-// given the PHY meets its timing contract.
+// Bounded-stall abstraction: assume that PHY return behavior never causes
+// pipe_stall. This is not a proof that a physical PHY meets a latency bound.
+// Non-bounded tasks omit this additional assumption but still retain the
+// common bus, outstanding-count and calibration assumptions.
 always @* begin
     if (reset_done && i_rst_n)
         assume(!pipe_stall);
@@ -1127,8 +1106,9 @@ end
 
 // ===================================================================
 // 22. Cover Properties --  reachability confirmation
-// Proves the design can reach interesting operating states. Without
-// these, an over-constrained model could vacuously pass all asserts.
+// Reachability targets for a separate cover-mode run. The checked-in SBY
+// tasks use prove mode; merely including cover statements does not establish
+// they were reached or rule out every source of vacuous assertion success.
 // ===================================================================
 
 // Basic reachability: pipeline produces ACKs

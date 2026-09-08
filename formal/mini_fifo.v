@@ -11,7 +11,10 @@
 //     address fields (Prop 6), cross-checked by f_addr_decode.
 //
 // If the pipeline ever drops, duplicates, or reorders a request, the
-// FIFO falls out of sync and the assertion fires.
+// FIFO can expose the disagreement through harness assertions, subject to
+// their guards and assumptions. This helper is used at FIFO_WIDTH=1 (2 entries);
+// read_data_next uses logical pointer inversion and is specific to that width.
+// See docs/VERIFICATION.md for the scope of the surrounding proof.
 //
 // Reused from UberDDR3 (ZipCPU pattern).
 //

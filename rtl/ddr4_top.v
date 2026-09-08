@@ -4,22 +4,26 @@
 // Project:  UberDDR4 - An Open Source DDR4 Controller
 //
 // Purpose:  Top module instantiating the DDR4 controller, PHY, and optional
-//  BIST/debug prober, connected via a DFI 3.1 internal bus.  Use this as the
+//  BIST/debug prober, connected via the implemented DFI 3.1 subset. Use this as the
 //  top module for Wishbone integration.
 //
 //  Architecture:
-//    User WB ----+--> [WB Mux] --> ddr4_controller <--DFI--> ddr4_phy --> DDR4
+//    User WB ----+--> [WB Mux] --> ddr4_controller <--DFI--> selected PHY --> DDR4
 //                |        ^
 //                |        |
 //                +-> ddr4_prober (BIST engine)
 //
-//    Debug WB -------> ddr4_prober (CSR register file, always accessible)
+//    Debug WB -------> ddr4_prober (CSR register file, when enabled)
 //
 //  Two independent Wishbone ports:
 //    - DRAM port: pipelined, used for data traffic and BIST.  BIST has
-//      priority when active; user transactions stalled until complete.
+//      priority when active; user transactions stalled until complete. Drain
+//      outstanding application requests before requesting runtime BIST/reset.
 //    - Debug CSR port: pipelined, zero-wait-state.  Accessible at all
-//      times regardless of controller calibration state or BIST activity.
+//      times when enabled, regardless of calibration state or BIST activity.
+//      Tie unused debug inputs low; see docs/DEBUGGING.md for CONTROL caveats.
+//
+//  Integration, clock contracts, packing and limits: docs/INTEGRATION.md.
 //
 // Engineer: Angelo C. Jacobo
 //
@@ -62,11 +66,11 @@ module ddr4_top #(
               BYTE_LANES = 2,
     // Device density in Gb: 2, 4, 8, or 16
               DENSITY = 8,
-    // Set to 1 when simulating with Micron DDR4 model (adjusts timing checks)
+    // Simulation only: shortens init waits and BIST address counter; never enable in hardware
     parameter[0:0] MICRON_SIM = 0,
     // Address mapping:
-    //   0 = sequential {row, bg, ba, col}
-    //   1 = BG-interleaved {row, ba, col_hi, bg, col_lo} (recommended)
+    //   0 = WB burst-word address {row, bg, ba, col_upper}
+    //   1 = WB burst-word address {row, ba, col_upper, bg}; low 3 DRAM column bits are zero
     parameter[1:0] ADDR_MAPPING = 1,
     // On-die termination (JESD79-4D MR1/MR2/MR5)
     //   RTT_NOM  (MR1 A10:A8): 000=off, 001=RZQ/4, 010=RZQ/2, 011=RZQ/6,
@@ -81,13 +85,13 @@ module ddr4_top #(
     // Output driver impedance (MR1 A2:A1): 0=RZQ/7 (34ohm), 1=RZQ/5 (48ohm)
     parameter[0:0] DRIVE_IMP = 0,
     // CAS Latency override (0=auto from DDR4_CLK_PERIOD)
-    //   Auto values: DDR4-1600=10, DDR4-1866=13, DDR4-2133=15, DDR4-2400=16
+    //   Auto values: DDR4-1600=12, DDR4-1866=14, DDR4-2133=16, DDR4-2400=18
     parameter[5:0] CL = 0,
     // CAS Write Latency override (0=auto from DDR4_CLK_PERIOD)
     //   Auto values: DDR4-1600=9, DDR4-1866=10, DDR4-2133=11, DDR4-2400=12
     parameter[4:0] CWL = 0,
     // PHY implementation:
-    //   0 = component PHY (rtl/ddr4_phy.v, portable reference implementation)
+    //   0 = component PHY (rtl/ddr4_phy.v, Xilinx component SERDES/delay primitives)
     //   1 = native UltraScale/UltraScale+ BITSLICE PHY
     //
     // The controller-facing timing compensation is derived from this choice.
@@ -95,13 +99,13 @@ module ddr4_top #(
     // by a board-level instantiation overriding only one of them.
     parameter[0:0] PHY_IMPL = 0,
     // BIST / debug prober configuration
-    //   BIST_MODE: 0=disabled, 1=half-range, 2=full-range (all three phases always run)
+    //   BIST_MODE: 0=disabled, 1=partitioned counters (1/4, 1/2, 1/4), 2=full range per phase
     parameter[1:0] BIST_MODE = 1,
-    //   BIST_DM_TEST: 0=full-word burst writes, 1=per-byte-lane writes (stress DM path)
-    //   Auto-disabled for x4 devices (no DM pin on x4, JESD79-4D Table 2)
+    //   BIST_DM_TEST: 0=full-word burst writes, 1=one write per byte position of the full WB burst (stress DM)
+    //   Defaults off for x4 devices, which lack the implemented DM_n mask function
     parameter[0:0] BIST_DM_TEST = (DEVICE_WIDTH == 4) ? 0 : 1,
-    // First-error repeated-read hardware diagnostic. Disabled by default and
-    // intended only for board bring-up builds.
+    // First-error diagnostic: rereads, optional native TX adaptation and retests.
+    // Destructive bring-up mode; disabled by default. See docs/DEBUGGING.md.
     parameter[0:0] BIST_REREAD_DIAG = 0,
     // Debug CSR register file: 0=disabled (saves area), 1=enabled
     parameter DEBUG_CSR_ENABLE = 1,
@@ -131,17 +135,21 @@ module ddr4_top #(
               COL_LOW = $clog2(SERDES_RATIO * 2),
               WB_ADDR_BITS = ROW_BITS + BG_BITS + BA_BITS + COL_BITS - COL_LOW
 ) (
+    // Component: controller=CK/4, DDR4 clock=CK, ref=300 MHz.
+    // Native: controller drives local PLLs, ref is RIU (normally controller/2);
+    // i_ddr4_clk is unused. Native controller/RIU must share an MMCM and phase.
     input wire i_controller_clk, i_ddr4_clk, i_ref_clk,
     input wire i_rst_n,
     // Wishbone B4 — DRAM data path (pipelined)
     input wire i_wb_cyc, i_wb_stb, i_wb_we,
+    // One address selects a full BL8 burst; there is no CSR-select address bit.
     input wire [WB_ADDR_BITS-1:0] i_wb_addr,
     input wire [WB_DATA_BITS-1:0] i_wb_data,
     input wire [WB_SEL_BITS-1:0] i_wb_sel,
     output wire o_wb_stall, o_wb_ack,
     output wire [WB_DATA_BITS-1:0] o_wb_data,
     // Wishbone B4 — Debug CSR port (pipelined, independent of DRAM path).
-    // Always accessible regardless of controller calibration state.
+    // Available during calibration when enabled. Tie unused inputs to zero.
     input wire i_wb_dbg_cyc, i_wb_dbg_stb, i_wb_dbg_we,
     input wire [3:0] i_wb_dbg_addr,
     input wire [31:0] i_wb_dbg_data,

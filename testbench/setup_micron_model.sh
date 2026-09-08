@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# setup_micron_model.sh  -  Create symlinks for the Micron DDR4 behavioral model
+# setup_micron_model.sh  -  Install links/copies for the Micron DDR4 behavioral model
 #
-# The Micron DDR4 model ships with Vivado and cannot be redistributed.
-# This script creates symlinks in testbench/micron/ pointing to the model
+# The Micron DDR4 model is supplied externally by Vivado. Follow the license
+# shipped with that vendor model; this repository does not redistribute it.
+# This script prefers symlinks in testbench/micron/ pointing to the model
 # files in your Vivado installation, so both the CLI flow (run_xsim.sh)
-# and the Vivado GUI can compile them directly.
+# and the Vivado GUI can compile them directly; Windows may use copies.
+# See docs/VERIFICATION.md for the expected model directory and setup scope.
 #
 # Prerequisites:
 #   source /path/to/Vivado/2023.1/settings64.sh   # sets $XILINX_VIVADO
