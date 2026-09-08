@@ -2,7 +2,8 @@
 """Prepare Linux boot files on the host; does not build a kernel or use the board.
 
 Inputs: generated csr.json and the checksum-pinned kernel/OpenSBI/initramfs.
-Outputs: board-specific DTS/DTB, copied images, ordered boot.json and hashes.
+Outputs: board-specific DTS/DTB, kernel/OpenSBI copies, initramfs with banner
+files, ordered boot.json and input/overlay/output hashes.
 The address/layout checks keep images inside RAM and prevent overlap.
 """
 
@@ -32,6 +33,59 @@ EXPECTED_INPUT_SHA256 = {
     "opensbi.bin": "f083d87ed8c607fa5f31a5aa46253e6aada9a7c47965daf9098f5069844f969a",
     "rootfs.cpio": "6b06ecb4da84007459ea94571602a9ea31d16bbbea4e5df10d263fccebf38caa",
 }
+
+
+# LiteX logo/tagline from its BIOS; UberDDR4 artwork for the AXKU3 example.
+BANNER_TEXT = r"""
+        __   _ __      _  __
+       / /  (_) /____ | |/_/
+      / /__/ / __/ -_)>  <
+     /____/_/\__/\__/_/|_|
+   Build your hardware, easily!
+
+ _   _ _               ____  ____  ____  _  _
+| | | | |__   ___ _ __ |  _ \|  _ \|  _ \| || |
+| | | | '_ \ / _ \ '__|| | | | | | | |_) | || |_
+| |_| | |_) |  __/ |   | |_| | |_| |  _ <|__   _|
+ \___/|_.__/ \___|_|   |____/|____/|_| \_\  |_|
+
+       LiteX + VexRiscv + UberDDR4
+              ALINX AXKU3
+"""
+
+
+def banner_files():
+    """Root-owned files added to the pinned Buildroot filesystem."""
+    return (
+        ('etc/profile.d', 0o040755, b''),
+        ('etc/uberddr4-banner', 0o100644, BANNER_TEXT.encode('ascii')),
+        ('usr/bin/uber-banner', 0o100755,
+         b'#!/bin/sh\ncat /etc/uberddr4-banner\n'),
+        ('etc/profile.d/uberddr4.sh', 0o100644,
+         b'# Display only when entering an interactive login shell.\n'
+         b'if [ -n "$PS1" ]; then\n    /usr/bin/uber-banner\nfi\n'),
+    )
+
+
+def build_banner_overlay():
+    """Deterministic newc archive, concatenated after the upstream trailer.
+
+    Linux initramfs accepts multiple archives; a separate trailer keeps their
+    inode/hard-link namespaces independent. Preserve all upstream bytes.
+    """
+    archive = bytearray()
+    entries = (*banner_files(), ('TRAILER!!!', 0, b''))
+    for ino, (name, mode, data) in enumerate(entries, 1):
+        filename = name.encode('ascii') + b'\0'
+        fields = (ino, mode, 0, 0, 2 if mode == 0o040755 else 1,
+                  0, len(data), 0, 0, 0, 0, len(filename), 0)
+        archive.extend(b'070701' + ''.join(f'{v:08x}' for v in fields).encode('ascii'))
+        archive.extend(filename)
+        archive.extend(b'\0' * (-len(archive) % 4))
+        archive.extend(data)
+        archive.extend(b'\0' * (-len(archive) % 4))
+    archive.extend(b'\0' * (-len(archive) % 512))
+    return bytes(archive)
 
 
 def require(condition, message):
@@ -176,15 +230,21 @@ def main():
     for name, source in inputs.items():
         shutil.copyfile(source, output_dir / name)
 
+    initramfs = output_dir / "rootfs.cpio"
+    overlay = build_banner_overlay()
+    with initramfs.open('ab') as stream:
+        stream.write(b'\0' * (-stream.tell() % 4))
+        stream.write(overlay)
+
     dts = generate_dts(
         csr,
-        initrd=str(inputs["rootfs.cpio"]),
+        initrd=str(initramfs),
         polling=False,
         root_device="ram0",
     )
     dts = adapt_board_dts(dts, csr)
     dts = reserve_rv32_last_page(dts, csr)
-    validate_dts(dts, csr, inputs["rootfs.cpio"].stat().st_size)
+    validate_dts(dts, csr, initramfs.stat().st_size)
     dts_path = output_dir / "rv32.dts"
     dts_path.write_text(dts, encoding="utf-8", newline="\n")
 
@@ -199,9 +259,13 @@ def main():
     parsed_dtb = fdt.parse_dtb(dtb)
     validate_rv32_reservation(parsed_dtb)
     normalized = parsed_dtb.to_dts()
-    for text in ("0x41000000", "0x4139B400", "serial@f0001000",
+    for text in ("0x41000000", "serial@f0001000",
                  "interrupt-controller@f0c00000", "clint@f0010000"):
         require(text in normalized, f"DTB round-trip lost required content: {text}")
+    chosen = parsed_dtb.get_node('/chosen')
+    require(list(chosen.get_property('linux,initrd-end').data) ==
+            [LOAD_ADDRESSES['rootfs.cpio'] + initramfs.stat().st_size],
+            'DTB does not cover the complete banner initramfs')
     (output_dir / "rv32.dtb").write_bytes(dtb)
 
     file_sizes = {name: (output_dir / name).stat().st_size
@@ -223,6 +287,12 @@ def main():
     manifest = {
         "source_archive_sha256":
             "9ad7a043ce941024ccdcB08edcf0d627da0577a40be90579acb448c6b07fab48".lower(),
+        "input_files_sha256": dict(EXPECTED_INPUT_SHA256),
+        "initramfs_overlay": {
+            "sha256": hashlib.sha256(overlay).hexdigest(),
+            "bytes": len(overlay),
+            "files": [name for name, _, _ in banner_files()],
+        },
         "csr_json_sha256": sha256(csr_path),
         "fdt_version": fdt.__version__,
         "load_addresses": boot,

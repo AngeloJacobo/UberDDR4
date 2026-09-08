@@ -55,6 +55,82 @@ and are not required to build or run the release. The completed campaign was
 `linux_uberddr4_2400_20260908_203837`; these results apply to the exact bitstream
 and payload hashes above, not to subsequent unbuilt RTL revisions.
 
+## Banner payload and interactive console update
+
+After the hardware campaign above, payload preparation was extended to append
+an uncompressed 1,536-byte CPIO archive containing the LiteX/UberDDR4 banner,
+the executable `uber-banner` command, and an interactive-login profile hook.
+The original downloaded initramfs remains byte-for-byte intact as the first
+archive. The generated DTB covers the enlarged initramfs and retains the RV32
+last-page reservation. Kernel, OpenSBI and FPGA bitstream are unchanged by this
+update.
+
+The regenerated default DDR4-2400 payload has these SHA-256 hashes:
+
+| File | SHA-256 |
+| --- | --- |
+| `rootfs.cpio` | `b48d88260e0411c3870de84d526d5a8c65a1b8a3c9c063eee618ca172753fbf2` |
+| `rv32.dtb` | `7eecd118e731e5b2c3a22e85d849127e2fba6c1b556acca0fda22094f2a93589` |
+
+The initramfs is 3,783,168 bytes, loaded at `0x41000000` with exclusive end
+`0x4139ba00`. Repeated preparation produced identical manifests and payload
+hashes. Independent CPIO extraction verified the banner contents and executable
+permissions. Shell checks verified exact banner output and the interactive-only
+login hook; DTB checks verified the full initramfs range and last-page reservation.
+All 44 offline regression tests passed, including positive-acknowledgement,
+CRC-error, missing-reply, bounded-wait and pipelined-mode recovery checks.
+
+`console.ps1` now inserts a 5 ms pause after each transmitted byte, including
+pasted input, while retaining the 1 Mbaud link and unrestricted receive output.
+Host checks covered its CLI, byte preservation across multiple writes, pacing,
+empty writes and short-write errors without opening a serial port.
+
+The original upload failure recorded a roughly 400 ms host pause followed by
+an `E` response. The BIOS emits `E` after 250 ms of idle time even without a
+partially received frame. A controlled FPGA test using the upstream response
+handler reproduced the same error by pausing the host for 400 ms between
+frames. The host now handles queued timeout replies in a bounded response
+window for the default single-frame transfer, still requiring a positive `K`
+acknowledgement. CRC errors and unknown-command replies retain their failure
+handling; pipelined transfers retain upstream behavior. Recovery counters are
+recorded in `.sfl.json`.
+
+Campaign `linux_banner_verified_20260908_234658` passed two consecutive full
+program/upload/Linux tests with 251-byte packets and one outstanding packet.
+The bitstream used in this campaign was SHA-256
+`09ca92da1f4b3ce8557d765066b7b0bbd87330150afa9209985fba38dac9befc`,
+with WNS +0.096 ns, WHS +0.010 ns, WPWS +0.039 ns and zero routing errors.
+It was already built before the banner/transport changes; those changes did
+not rebuild or modify it. This is a different artifact from the earlier
+ten-trial bitstream recorded above.
+
+The first trial required no timeout recovery. The second deliberately paused
+the host for 400 ms, 800 ms and 400 ms after frames 100, 11000 and 35000. The
+loader recovered five queued timeout replies across these three events,
+retaining 251-byte packets without restarting an upload. Both trials passed
+the BIOS 2 MiB and 64 MiB checks, all four complete-image CRC readbacks, Linux
+boot with the automatic banner, the exact 16 MiB zero-file hash and repeated
+random-file hashes. These results apply to the payload hashes in this section.
+
+A subsequent live Linux check used the exact `console.ps1` pacing code to
+transmit 3,252 command bytes, including a 2,048-byte known-content payload split
+across short commands. Its SHA-256 matched
+`eb076a2ec6ced9ee2e823e098446513cf5b2bb60fbcb04e6c85dc23dedaa414a`.
+The check also verified `uber-banner`, the exact stored banner hash, the README's
+hardware-ROM reader, the reserved last RAM page and a zero bus-error count.
+A single command around 1 KiB hit the shell line editor's length limit; pacing
+does not remove that limit. The README now explains using shorter lines and
+prints the assembled hardware identifier in one operation to avoid interleaved
+terminal echo.
+
+One earlier reprogram after the controlled failure produced no fresh BIOS
+output despite JTAG reporting success. Its cause was not established; another
+reprogram restored output and the final two-trial campaign above passed. This
+startup observation remains a limitation, not a claim of fault-free startup.
+Completed diagnostic and qualification records, including failures, are kept
+locally under the Git-ignored `evidence/2026-09-08-banner-and-uart/` folder.
+See the [README](README.md) for updating the payload and using the console.
+
 ## Historical debugging branch
 
 On 2026-09-08, the earlier debugging-branch Linux configuration passed ten consecutive FPGA

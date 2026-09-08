@@ -278,6 +278,38 @@ class AXKU3LinuxTargetTest(unittest.TestCase):
                 terminal.read_sfl_reply()
             self.assertTrue(terminal.trace_path.is_file())
 
+    def test_idle_bios_timeout_requires_following_positive_ack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            terminal = TracedLiteXTerm(True, None, "0x40000000", None, False,
+                trace_path=Path(directory) / 'sfl.json', stable_timeouts=True)
+            terminal.outstanding = 1
+            terminal.port = Mock()
+            terminal.port.read.side_effect = [b'E', b'E', b'K']
+            self.assertTrue(terminal.receive_upload_response())
+            self.assertEqual(terminal.timeout_reply_recoveries, 1)
+            self.assertEqual(terminal.recovered_timeout_replies, 2)
+            for replies in ([b'E', b''], [b'E', b'C'], [b'E', b'U']):
+                terminal.port.read.side_effect = replies
+                with self.assertRaises(SFLUploadError):
+                    terminal.receive_upload_response()
+            self.assertEqual(terminal.timeout_reply_recoveries, 1)
+
+    def test_timeout_reply_recovery_is_bounded_and_not_pipelined(self):
+        with tempfile.TemporaryDirectory() as directory:
+            terminal = TracedLiteXTerm(True, None, "0x40000000", None, False,
+                trace_path=Path(directory) / 'sfl.json', stable_timeouts=True)
+            terminal.outstanding = 1
+            terminal.port = Mock()
+            terminal.port.read.return_value = b'E'
+            with patch('serial_trace.time.monotonic', side_effect=range(100)):
+                with self.assertRaises(SFLUploadError):
+                    terminal.receive_upload_response(timeout=10)
+            terminal.outstanding = 2
+            terminal.port.read.side_effect = [b'E', b'K']
+            with self.assertRaises(SFLUploadError):
+                terminal.receive_upload_response()
+            self.assertEqual(terminal.timeout_reply_recoveries, 0)
+
     def test_hardware_transcript_is_persisted_incrementally(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trial_uart.bin"
