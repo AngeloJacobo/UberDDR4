@@ -8,10 +8,13 @@ The demonstrated configuration is DDR4-2400, a 300 MHz CPU, and 1 GiB of
 CPU-visible RAM. It boots to a Buildroot shell over USB-UART. No Ethernet,
 SD card or additional board hardware is needed.
 
-**Status:** based on a working hardware demonstration. This cleaned-up version
-uses unchanged controller RTL and still needs a fresh bitstream/hardware check.
-Startup BIST is disabled; earlier BIST failures and one Linux file-hash mismatch
-remain unresolved. See [RESULTS.md](RESULTS.md) before relying on it.
+**Status:** the tested bitstream uses the master controller RTL and passes
+routed timing/DRC checks. A reproduced zero-file failure was traced to the
+pinned RV32 kernel allocating its unsafe final virtual page. Payload generation
+now reserves that 4 KiB page; this correction passed ten consecutive hardware
+program/upload/boot/test cycles and a further known-pattern check. Startup BIST
+remains disabled and its earlier failures remain open.
+See [RESULTS.md](RESULTS.md) for recorded results and limits.
 
 ## Where to start reading
 
@@ -103,6 +106,10 @@ UART port. Replace COM6 with the CP210x port shown in Device Manager:
 .\boot.ps1 -Port COM6
 .\console.ps1 -Port COM6
 ```
+
+If you prepared the payload before the RV32 last-page fix, first run
+`.\prepare_linux_payload.ps1`. This regenerates the device tree and requires
+no synthesis or routing. Boot rejects a stale device tree before programming.
 
 Run the console command only after boot finishes. Boot programs the FPGA,
 checks RAM, uploads and verifies the Linux images, then runs userspace checks.

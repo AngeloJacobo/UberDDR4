@@ -5,3 +5,6 @@
 local.ps1
 __pycache__/
 *.pyc
+
+# Local failure captures and qualification archives are retained for diagnosis.
+/evidence/

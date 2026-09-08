@@ -97,6 +97,42 @@ def adapt_board_dts(dts, csr):
     return dts
 
 
+# The pinned RV32 kernel maps this page at 0xfffff000. Its copy routines
+# cannot handle an exclusive end pointer wrapping to zero. Keep it out of
+# the allocator, equivalent to the later upstream RISC-V last-page fix.
+RV32_RESERVED_PAGE = 0x7FFFF000
+RV32_PAGE_SIZE = 0x1000
+
+
+def reserve_rv32_last_page(dts, csr):
+    ram = csr["memories"]["main_ram"]
+    require((int(ram["base"]), int(ram["size"])) == (0x40000000, 0x40000000),
+            "RV32 last-page reservation requires the 1 GiB RAM window")
+    node = """
+            rv32-last-page@7ffff000 {
+                reg = <0x7ffff000 0x1000>;
+                no-map;
+            };
+"""
+    dts, count = re.subn(r'(reserved-memory\s*\{[^{}]*ranges;)', lambda m: m[0] + node, dts)
+    require(count == 1, "Expected exactly one reserved-memory node")
+    return dts
+
+
+def validate_rv32_reservation(tree):
+    """Check the parsed tree, including after flattening, not just DTS text."""
+    try:
+        node = tree.get_node("/reserved-memory/rv32-last-page@7ffff000")
+    except ValueError as error:
+        raise RuntimeError("Missing RV32 last-page reservation; run prepare_linux_payload.ps1") from error
+    require(node is not None, "Missing RV32 last-page reservation; regenerate the payload")
+    reg = node.get_property("reg")
+    require(reg is not None and list(reg.data) == [RV32_RESERVED_PAGE, RV32_PAGE_SIZE],
+            "Wrong RV32 last-page reservation range")
+    require(node.get_property("no-map") is not None,
+            "RV32 last-page reservation must have no-map")
+
+
 def validate_dts(dts, csr, initrd_size):
     require('litex,soc-controller' not in dts,
             'Reset-free controller must not bind the incompatible Linux driver')
@@ -147,6 +183,7 @@ def main():
         root_device="ram0",
     )
     dts = adapt_board_dts(dts, csr)
+    dts = reserve_rv32_last_page(dts, csr)
     validate_dts(dts, csr, inputs["rootfs.cpio"].stat().st_size)
     dts_path = output_dir / "rv32.dts"
     dts_path.write_text(dts, encoding="utf-8", newline="\n")
@@ -155,10 +192,13 @@ def main():
     # pinned by version/hash in dependencies.json, avoiding a global dtc install.
     import fdt
     device_tree = fdt.parse_dts(dts)
+    validate_rv32_reservation(device_tree)
     dtb = device_tree.to_dtb(version=17)
     require(struct.unpack(">I", dtb[:4])[0] == 0xD00DFEED,
             "Generated DTB has the wrong flattened-device-tree magic")
-    normalized = fdt.parse_dtb(dtb).to_dts()
+    parsed_dtb = fdt.parse_dtb(dtb)
+    validate_rv32_reservation(parsed_dtb)
+    normalized = parsed_dtb.to_dts()
     for text in ("0x41000000", "0x4139B400", "serial@f0001000",
                  "interrupt-controller@f0c00000", "clint@f0010000"):
         require(text in normalized, f"DTB round-trip lost required content: {text}")

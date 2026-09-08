@@ -8,6 +8,7 @@ A failure stops the campaign; it is not silently retried or counted as a pass.
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import re
@@ -17,6 +18,8 @@ import time
 import zlib
 from pathlib import Path
 from serial_trace import TracedLiteXTerm
+from prepare_linux_payload import validate_rv32_reservation
+import fdt
 
 import serial
 from serial.tools import list_ports
@@ -211,7 +214,61 @@ def upload_and_test(port_name, baudrate, xsdb, tcl, bitstream, boot_json,
         return test_userspace(port, transcript, software_megabytes)
 
 
+def capture_zero_failure(port, transcript, software_megabytes):
+    """Copy the preserved failed file to the host; never turn failure into pass."""
+    if not hasattr(transcript, "path"):
+        return
+    report = {}
+    stem = transcript.path.with_suffix("")
+    try:
+        start = len(transcript)
+        write_console(port, b"gzip -c /tmp/uberddr4_test.bin | base64\n")
+        read_until(port, transcript, ROOT_PROMPTS, 120, "failed zero-file capture", start)
+        lines = transcript[start:].splitlines()
+        encoded = b"".join(line.strip() for line in lines
+                           if re.fullmatch(rb"[A-Za-z0-9+/]{4,}={0,2}", line.strip()))
+        compressed = base64.b64decode(encoded, validate=True)
+        stem.with_name(stem.name + "_failed_file.gz").write_bytes(compressed)
+        decoder = zlib.decompressobj(31)
+        limit = software_megabytes * 1024 * 1024
+        contents = decoder.decompress(compressed, limit + 1)
+        require(decoder.eof and len(contents) == limit,
+                "Captured file is incomplete or has unexpected size")
+        destination = stem.with_name(stem.name + "_failed_file.bin")
+        destination.write_bytes(contents)
+        digest = hashlib.sha256(contents).hexdigest()
+        observed = re.findall(rb"UBER_ZERO_HASH=([0-9a-fA-F]{64})", transcript[:start])
+        reported = observed[-1].decode("ascii").lower() if observed else None
+        first_bad = []
+        count = 0
+        for offset, byte in enumerate(contents):
+            if byte:
+                count += 1
+                if len(first_bad) < 64:
+                    first_bad.append({"offset": offset, "value": byte})
+        report.update(bytes=len(contents), sha256=digest, reported_sha256=reported,
+                      matches_reported_hash=digest == reported, nonzero_bytes=count,
+                      first_nonzero=first_bad)
+        print(f"FAILED_FILE_SAVED={destination}", flush=True)
+    except Exception as error:
+        report["capture_error"] = str(error)
+        print(f"Failed-file capture incomplete: {error}; original failure retained", flush=True)
+    try:
+        stem.with_name(stem.name + "_failed_file.json").write_text(json.dumps(report, indent=2))
+    except OSError as error:
+        print(f"Cannot save capture report: {error}; original failure retained", flush=True)
+
+
 def test_userspace(port, transcript, software_megabytes):
+    try:
+        return _test_userspace(port, transcript, software_megabytes)
+    except RuntimeError as error:
+        if "Zero file" in str(error):
+            capture_zero_failure(port, transcript, software_megabytes)
+        raise
+
+
+def _test_userspace(port, transcript, software_megabytes):
     """Check existing CSRs, known-zero contents and repeatability of random data.
 
 The zero-file digest has a host-computed expected value. Matching random-file
@@ -243,7 +300,6 @@ Check zeros before overwriting that file, preserving the evidence on failure.
         ("echo UBER_HASH1=$(sha256sum /tmp/uberddr4_test.bin | cut -d' ' -f1)", 60),
         ("sync", 30),
         ("echo UBER_HASH2=$(sha256sum /tmp/uberddr4_test.bin | cut -d' ' -f1)", 60),
-        ("rm -f /tmp/uberddr4_test.bin", 10),
     )
     for command, timeout in commands:
         command_start = len(transcript)
@@ -303,6 +359,10 @@ Check zeros before overwriting that file, preserving the evidence on failure.
             "Known-content userspace RAM hash differs from host expectation")
     require(len(sizes) == 1 and int(sizes[0]) == software_megabytes * 1024 * 1024,
             "Random userspace RAM file has the wrong size")
+    # Delete only after every data/size/status assertion has passed.
+    start = len(transcript)
+    write_console(port, b"rm -f /tmp/uberddr4_test.bin\n")
+    read_until(port, transcript, ROOT_PROMPTS, 10, "successful test-file cleanup", start)
     return {
         "bytes": len(transcript),
         "status": status,
@@ -351,6 +411,8 @@ def main():
         boot = json.load(stream)
     require(list(boot)[-1] == "opensbi.bin" and boot["opensbi.bin"] == "0x40f00000",
             "boot.json does not jump to OpenSBI")
+    require(boot.get("rv32.dtb") == "0x40ef0000", "Missing or misplaced board device tree")
+    validate_rv32_reservation(fdt.parse_dtb((boot_json.parent / "rv32.dtb").read_bytes()))
     port_name = select_port(args.port)
     output_dir.mkdir(parents=True, exist_ok=False)
     bit_digest = sha256(bitstream)

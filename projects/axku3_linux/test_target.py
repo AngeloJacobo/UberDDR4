@@ -11,6 +11,9 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 import io
+import base64
+import gzip
+import hashlib
 import json
 from pathlib import Path
 
@@ -32,9 +35,11 @@ from axku3_uberddr4 import (
     litex_builder,
 )
 from linux_hardware_trials import PersistentTranscript, read_until, main as trials_main, value as transcript_value
-from prepare_linux_payload import LOAD_ADDRESSES, adapt_board_dts
+import fdt
+from prepare_linux_payload import (LOAD_ADDRESSES, adapt_board_dts,
+                                   reserve_rv32_last_page, validate_rv32_reservation)
 from serial_trace import TracedLiteXTerm, SFLUploadError
-from linux_hardware_trials import ROOT_PROMPTS, write_console, test_userspace
+from linux_hardware_trials import ROOT_PROMPTS, write_console, test_userspace, capture_zero_failure
 
 
 RTL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "rtl"))
@@ -212,6 +217,32 @@ class AXKU3LinuxTargetTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Unexpected software-reset'):
             adapt_board_dts(dts, csr)
 
+    @staticmethod
+    def reserved_tree():
+        dts = '/dts-v1/; / { #address-cells = <1>; #size-cells = <1>; reserved-memory { #address-cells = <1>; #size-cells = <1>; ranges; opensbi@40f00000 { reg = <0x40f00000 0x80000>; }; }; };'
+        csr = {'memories': {'main_ram': {'base': 0x40000000, 'size': 0x40000000}}}
+        dts = dts.replace("{", "{\n").replace(";", ";\n")
+        return fdt.parse_dts(reserve_rv32_last_page(dts, csr))
+
+    def test_last_page_reserved_in_flattened_payload(self):
+        tree = fdt.parse_dtb(self.reserved_tree().to_dtb(version=17))
+        validate_rv32_reservation(tree)
+        node = tree.get_node('/reserved-memory/opensbi@40f00000')
+        self.assertEqual(list(node.get_property('reg').data), [0x40f00000, 0x80000])
+
+    def test_unsafe_or_incomplete_last_page_reservation_is_rejected(self):
+        tree = self.reserved_tree()
+        node = tree.get_node('/reserved-memory/rv32-last-page@7ffff000')
+        node.get_property('reg').data[0] = 0x7fffe000
+        with self.assertRaisesRegex(RuntimeError, 'reservation range'):
+            validate_rv32_reservation(tree)
+        node.get_property('reg').data[0] = 0x7ffff000
+        node.remove_property('no-map')
+        with self.assertRaisesRegex(RuntimeError, 'no-map'):
+            validate_rv32_reservation(tree)
+        with self.assertRaisesRegex(RuntimeError, 'reservation'):
+            validate_rv32_reservation(fdt.parse_dts('/dts-v1/;\n/ {\n};\n'))
+
     def test_hardware_transcript_csr_parser(self):
         transcript = bytearray(b"noise\r\nUBER_STATUS=0x000010d0\r\n")
         self.assertEqual(transcript_value(transcript, "UBER_STATUS"), 0x10D0)
@@ -316,13 +347,92 @@ class AXKU3LinuxTargetTest(unittest.TestCase):
                 test_userspace(Mock(), transcript, 16)
         self.assertFalse(any(b'/dev/urandom' in data or b'rm -f' in data for data in sent))
 
+    def test_failed_zero_file_is_captured_and_checked_on_host(self):
+        contents = bytearray(1024 * 1024)
+        contents[0x4fe0:0x5000] = bytes(range(32))
+        digest = hashlib.sha256(contents).hexdigest()
+        encoded = base64.b64encode(gzip.compress(contents))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trial_uart.bin"
+            transcript = PersistentTranscript(path)
+            transcript.extend(b"UBER_ZERO_HASH=" + digest.encode() + b"\n")
+            def receive(*args, **kwargs):
+                transcript.extend(b"gzip -c /tmp/uberddr4_test.bin | base64\n" + encoded + b"\nroot@buildroot:~# ")
+            with patch('linux_hardware_trials.write_console'), \
+                 patch('linux_hardware_trials.read_until', side_effect=receive), \
+                 patch('linux_hardware_trials.sys.stdout', new_callable=io.StringIO):
+                capture_zero_failure(Mock(), transcript, 1)
+            self.assertEqual((Path(directory) / "trial_uart_failed_file.bin").read_bytes(), contents)
+            report = json.loads((Path(directory) / "trial_uart_failed_file.json").read_text())
+            self.assertTrue(report["matches_reported_hash"])
+            self.assertEqual(report["nonzero_bytes"], 31)
+
+    def test_capture_error_does_not_replace_original_zero_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = PersistentTranscript(Path(directory) / "trial_uart.bin")
+            with patch('linux_hardware_trials._test_userspace',
+                       side_effect=RuntimeError("Zero file hash mismatch; file preserved")), \
+                 patch('linux_hardware_trials.write_console', side_effect=RuntimeError("UART unavailable")), \
+                 patch('linux_hardware_trials.sys.stdout', new_callable=io.StringIO):
+                with self.assertRaisesRegex(RuntimeError, "Zero file hash mismatch"):
+                    test_userspace(Mock(), transcript, 1)
+            report = json.loads((Path(directory) / "trial_uart_failed_file.json").read_text())
+            self.assertEqual(report["capture_error"], "UART unavailable")
+
+    def test_bad_random_hash_stops_before_delete(self):
+        transcript = bytearray(b"OpenSBI\nLinux version\n32-bit RISC-V Linux running on LiteX / VexRiscv-SMP.\n")
+        sent = []
+        values = dict(UBER_STATUS="0x000000d0", UBER_TRAIN_FAIL="0x0",
+                      UBER_CORRECT="0x0", UBER_ERROR="0x0", UBER_BIST_STATUS="0x40",
+                      UBER_CONFIG="0x40", UBER_VERSION="0x1", UBER_INIT_PROGRESS="0x80",
+                      UBER_ZERO_SIZE="1048576", UBER_FILE_SIZE="1048576",
+                      UBER_ZERO_HASH=hashlib.sha256(bytes(1048576)).hexdigest(),
+                      UBER_HASH1="1"*64, UBER_HASH2="2"*64, UBER_COMMAND_RC="0")
+        def send(port, data):
+            sent.append(data)
+        def receive(port, received, *args, **kwargs):
+            command = sent[-1].decode()
+            if command.startswith("echo UBERDDR4_SWTEST_BEGIN"):
+                received.extend(b"UBERDDR4_SWTEST_BEGIN\n")
+            for name, value in values.items():
+                if command.startswith("echo " + name + "="):
+                    received.extend((name + "=" + value + "\n").encode())
+        with patch('linux_hardware_trials.write_console', side_effect=send), \
+             patch('linux_hardware_trials.read_until', side_effect=receive):
+            with self.assertRaisesRegex(RuntimeError, "RAM hashes are absent or unequal"):
+                test_userspace(Mock(), transcript, 1)
+        self.assertFalse(any(b"rm -f" in command for command in sent))
+
+    def test_stale_payload_is_rejected_before_board_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('design.bit', 'program.tcl', 'xsdb', 'opensbi.bin'):
+                (root / name).write_bytes(b'test fixture')
+            boot = root / 'boot.json'
+            boot.write_text(json.dumps({'rv32.dtb': '0x40ef0000', 'opensbi.bin': '0x40f00000'}))
+            tree = self.reserved_tree()
+            tree.get_node('/reserved-memory').remove_subnode('rv32-last-page@7ffff000')
+            (root / 'rv32.dtb').write_bytes(tree.to_dtb(version=17))
+            argv = ['trials', '--data-rate', '2400', '--bitstream', str(root / 'design.bit'),
+                    '--boot-json', str(boot), '--xsdb', str(root / 'xsdb'),
+                    '--program-tcl', str(root / 'program.tcl'),
+                    '--output-dir', str(root / 'results')]
+            with patch('sys.argv', argv), patch('linux_hardware_trials.select_port') as select, \
+                 patch('linux_hardware_trials.upload_and_test') as upload:
+                with self.assertRaisesRegex(RuntimeError, 'prepare_linux_payload.ps1'):
+                    trials_main()
+                select.assert_not_called()
+                upload.assert_not_called()
+            self.assertFalse((root / 'results').exists())
+
     def test_completed_trial_survives_later_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in ('design.bit', 'program.tcl', 'xsdb', 'opensbi.bin'):
                 (root / name).write_bytes(b'test fixture')
             boot = root / 'boot.json'
-            boot.write_text(json.dumps({'opensbi.bin': '0x40f00000'}))
+            boot.write_text(json.dumps({'rv32.dtb': '0x40ef0000', 'opensbi.bin': '0x40f00000'}))
+            (root / 'rv32.dtb').write_bytes(self.reserved_tree().to_dtb(version=17))
             output = root / 'results'
             argv = ['trials', '--trials', '2', '--data-rate', '2400',
                     '--bitstream', str(root / 'design.bit'), '--boot-json', str(boot),
