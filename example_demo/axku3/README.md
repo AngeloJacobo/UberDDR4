@@ -29,9 +29,7 @@ make clean                # delete build/
 configuration the next section describes by hand, then synthesizes, implements
 and checks routed timing. Negative setup, hold or pulse-width slack stops the
 build before a bitstream is written; `make ALLOW_FAILING_TIMING=1` writes one
-anyway, for debugging only. The XDC builds ILA cores, so `write_debug_probes`
-saves `build/axku3_uberddr4.ltx` beside the bitstream and `make program` loads
-it as the probe file. Every output, including `build/vivado.log`, stays in
+anyway, for debugging only. Every output, including `build/vivado.log`, stays in
 `build/`, which Git ignores.
 
 Vivado must be on PATH, or name it with `make VIVADO=/path/to/vivado`. Windows
@@ -56,9 +54,9 @@ performs the same ones.
 2. Add `axku3_uberddr4.v`, the four root RTL files (`ddr4_top.v`,
    `ddr4_controller.v`, `ddr4_phy.v`, `ddr4_prober.v`) and all four
    `rtl/phy/ddr4_phy_native*.v` files. Set synthesis top to `axku3_uberddr4`.
-3. Add `axku3_uberddr4.xdc` from this directory as a constraint file. It contains
-   package/I/O constraints **and ILA creation/probe commands**. It is specific
-   to this wrapper and its hierarchy; do not treat it as a generic pin-only XDC.
+3. Add `axku3_uberddr4.xdc` from this directory as a constraint file. Its pin
+   maps are specific to this wrapper and its hierarchy; do not treat it as a
+   generic pin-only XDC.
 4. Create one Clocking Wizard IP named `clk_wiz_0`. Configure a 200 MHz
    single-ended input named `clk_in1` with **No Buffer**: the wrapper already
    instantiates the differential IBUFDS and BUFG. Use one MMCM to generate the
@@ -74,8 +72,8 @@ performs the same ones.
    clock, and `ref300_clk` is 150 MHz here. Generate the IP output products.
 5. Synthesize and implement. Inspect all implementation errors and warnings,
    setup/hold/pulse-width timing, routing completeness, DRC and CDC reports.
-   Check the native dedicated-clock placement and that the expected ILA probes
-   resolve. Save the matching `.bit` and `.ltx` before programming the board.
+   Check the native dedicated-clock placement. Save the matching `.bit` before
+   programming the board.
 
 The same-MMCM, same-phase controller/RIU relationship is required by the native
 memory delay programming described in UG571 Table 2-54. Independent Clocking
@@ -95,9 +93,8 @@ of every derived timing against the actual device and implemented clocks.
 It enables full-range BIST (`BIST_MODE=2`), disables byte-mask stress
 (`BIST_DM_TEST=0`), enables the native post-failure diagnostic
 (`BIST_REREAD_DIAG=1`) and disables the external CSR response
-(`DEBUG_CSR_ENABLE=0`). ILA/debug attributes remain present. The nominal clean
-full-range result is **0x0c000000 = 201,326,592 matching reads**, zero errors.
-Diagnostic/recovery activity must also be inspected, not inferred from the LED.
+(`DEBUG_CSR_ENABLE=0`). The nominal clean full-range result is
+**0x0c000000 = 201,326,592 matching reads**, zero errors.
 
 LED0 reports `init_done`; all four LEDs report `init_failed` with failure taking
 priority. Status clears on reset, including internal recovery. The active-low
@@ -106,11 +103,20 @@ the wrapper's reset register. Startup calibration includes DDR4 initialization,
 native delay readiness, write leveling, final read training and then BIST.
 Wait for actual completion; no fixed wall-clock completion time is guaranteed.
 
-For a failed run, retain its ILA capture and timing/build identity before reset.
-Inspect training state/failure flags, read-eye widths, per-lane trained mCL,
-BIST comparison counts, RIU status and bounded-recovery count. The historical
-qualification's final criteria are more informative than the LED alone.
-BIST and its diagnostics overwrite memory.
+This wrapper carries no on-chip observability: it builds no debug cores and
+`DEBUG_CSR_ENABLE=0` leaves the CSR port unanswered, so the LEDs are the only
+runtime status the board reports. The earlier debug cores in this example were
+removed because they could not meet timing at 300 MHz.
+
+A pass/fail LED is weaker evidence than the historical qualification's final
+criteria, which read training state and failure flags, read-eye widths, per-lane
+trained mCL, BIST comparison counts, RIU status and the bounded-recovery count.
+Recovering any of those means adding observability back and rebuilding: set
+`DEBUG_CSR_ENABLE=1` and drive the debug Wishbone port, or add your own debug
+cores. Either costs timing margin at this clock, so close timing again before
+trusting a run. Capture what you add before resetting a failed board; status
+clears on reset, including internal recovery. BIST and its diagnostics overwrite
+memory.
 
 ## Board-level simulation
 

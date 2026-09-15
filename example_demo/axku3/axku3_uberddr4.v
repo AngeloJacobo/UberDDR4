@@ -104,8 +104,8 @@ module axku3_uberddr4 (
 
     // No external traffic generator is connected. BIST_MODE=2 owns the main
     // Wishbone port during bring-up; all external Wishbone inputs are inactive.
-    // Status persists until external or internal recovery reset. Runtime status
-    // and recovery counters require ILA; DEBUG_CSR_ENABLE does not remove probes.
+    // Status persists until external or internal recovery reset. With no debug
+    // cores and DEBUG_CSR_ENABLE=0, the LEDs are the only runtime status.
     ddr4_top #(
         // Quarter-rate DFI relationship for a 300 MHz controller clock and
         // 1.2 GHz DDR4 CK (DDR4-2400).  Integer picosecond parameters round
@@ -142,7 +142,7 @@ module axku3_uberddr4 (
         .BIST_MODE             (2),
         .BIST_DM_TEST          (0),
         // Board bring-up diagnostic: on the first mismatch, reread the same
-        // address 32 times so ILA can distinguish write storage from RX noise.
+        // address 32 times to distinguish write storage from RX noise.
         .BIST_REREAD_DIAG      (1),
         .DEBUG_CSR_ENABLE      (0)
     ) u_ddr4_top (

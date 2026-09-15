@@ -91,10 +91,6 @@ synth_ip [get_ips clk_wiz_0]
 
 ################################################################################
 # Synthesis
-#
-# The constraint file carries the package pins and the ILA cores together, as
-# the manual project in README.md does. Its create_debug_core commands match
-# nothing until the netlist exists, so synthesis reports them as unmatched.
 ################################################################################
 add_files -norecurse $sources
 add_files -fileset constrs_1 -norecurse $constraints
@@ -226,10 +222,5 @@ if {![timing_met $summary]} {
 }
 
 write_bitstream -force [file join $build_dir $project.bit]
-# The constraint file builds ILA cores, so the matching probe file has to be
-# saved with the bitstream; the hardware manager cannot recover it afterwards.
-if {[llength [get_debug_cores -quiet]] > 0} {
-    write_debug_probes -force [file join $build_dir $project.ltx]
-}
 
 puts "BITSTREAM: [file join $build_dir $project.bit]"

@@ -3,9 +3,8 @@
 #
 #   vivado -mode batch -source program.tcl -tclargs build/axku3_uberddr4.bit
 #
-# A .ltx of the same name is loaded as the probe file when it exists, so the
-# ILA cores this design builds come up in the hardware manager. Programming is
-# volatile: this writes the device, not the board's configuration flash.
+# Programming is volatile: this writes the device, not the board's
+# configuration flash.
 ################################################################################
 
 if {[llength $argv] < 1} {
@@ -18,7 +17,6 @@ if {![file exists $bitstream]} {
     puts "ERROR: no such bitstream: $bitstream"
     exit 1
 }
-set probes [file rootname $bitstream].ltx
 
 open_hw_manager
 connect_hw_server
@@ -35,11 +33,6 @@ current_hw_device [lindex $devices 0]
 refresh_hw_device -update_hw_probes false [current_hw_device]
 
 set_property PROGRAM.FILE $bitstream [current_hw_device]
-if {[file exists $probes]} {
-    set_property PROBES.FILE $probes [current_hw_device]
-} else {
-    puts "NOTE: no probe file at $probes; the ILA cores will not be decoded."
-}
 program_hw_devices [current_hw_device]
 refresh_hw_device [current_hw_device]
 
