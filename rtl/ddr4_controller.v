@@ -320,11 +320,13 @@ module ddr4_controller #(
                                                       32_000;  //DDR4-2400+
     // tRCD : ACT-to-READ/WRITE -- row activate to column access delay
     // tRP  : PRE command period -- time to close a row before opening another
-    // This implementation derives both from CL*tCK using the selected table
-    // or override. Verify the actual part's tAA/tRCD/tRP and legal CL set,
-    // especially when downclocking or overriding CL; the formula alone is
-    // not a guarantee for every device/speed-bin combination.
-    localparam tRCD_ps = CL_nCK * DDR4_CLK_PERIOD;
+    // CL*tCK covers the typical case but can undercount when a DDR4 part
+    // is downclocked below its rated speed grade (the JEDEC nCK floor
+    // still applies).  tRCD_ps_floor() returns the JEDEC minimum per
+    // grade (slowest speed-bin, Tables 147-153) to guarantee correctness
+    // for any part in that grade.
+    localparam tRCD_ps = max_fn(CL_nCK * DDR4_CLK_PERIOD,
+                                tRCD_ps_floor(DDR4_CLK_PERIOD));
     localparam tRP_ps  = tRCD_ps;
     // tRC  : ACT-to-ACT (same bank) = tRAS + tRP
     localparam tRC_ps  = tRAS_ps + tRP_ps;
@@ -2523,6 +2525,18 @@ module ddr4_controller #(
             else if (ddr4_clk_period >= 750)   CWL_generator = 14;     //DDR4-2666
             else if (ddr4_clk_period >= 625)   CWL_generator = 16;     //DDR4-2933/3200
             else                               CWL_generator = 16;
+        end
+    endfunction
+
+    // tRCD_ps_floor: JEDEC minimum tRCD (ps) per speed grade, using the
+    // slowest speed-bin of each grade (JESD79-4D Tables 147-153).  
+    function integer tRCD_ps_floor(input integer ddr4_clk_period);
+        begin
+            if      (ddr4_clk_period >= 1_500) tRCD_ps_floor = 16_000; // TS_1500 / <=DDR4-1333
+            else if (ddr4_clk_period >= 1_250) tRCD_ps_floor = 15_000; // DDR4-1600L (Table 147)
+            else if (ddr4_clk_period >= 1_071) tRCD_ps_floor = 13_920; // DDR4-1866M (Table 148)
+            else if (ddr4_clk_period >= 937)   tRCD_ps_floor = 13_130; // DDR4-2133N (Table 149)
+            else                               tRCD_ps_floor = 12_500; // DDR4-2400+ (Tables 150-153)
         end
     endfunction
 
