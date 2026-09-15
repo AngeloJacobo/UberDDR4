@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pre-synthesis checks for the retained small, non-Linux bring-up target.
 
-build.ps1 uses this only with -Linux:$false. The normal Linux build instead
+`uberddr4.sh build --no-linux` uses this. The normal Linux build instead
 uses validate_linux_generated.py. Neither validator tests physical DDR4.
 """
 

@@ -1,4 +1,4 @@
-"""Download the host dependencies listed in dependencies.json; called by setup.ps1.
+"""Download the host dependencies in dependencies.json; called by `uberddr4.sh setup`.
 
 Git sources, Python packages, compiler and Linux images stay in the given cache
 directories. No drivers, registry values or global Python installs are changed.
@@ -18,9 +18,29 @@ import zipfile
 
 from prepare_cpu import checked_source, RELATIVE
 
+# Long paths are enabled per invocation so a checkout never depends on the
+# host's global Git or Windows settings. Child git processes inherit it.
+GIT = ('git', '-c', 'core.longpaths=true')
+
 
 def run(*args):
     subprocess.run([str(arg) for arg in args], check=True)
+
+
+def submodule_command(target, spec):
+    """Return the argv initializing only the submodules a dependency declares.
+
+    Submodules are opt-in per repository. The CPU packages carry the
+    VexRiscv/SpinalHDL Scala sources that regenerate netlists this project
+    already consumes as checked-in Verilog, and VexRiscv nests a test-data
+    submodule deep enough to break Git for Windows outright with
+    "fatal: '$GIT_DIR' too big". Naming the few paths the build really needs
+    keeps setup portable instead of relying on host long-path settings.
+    """
+    paths = spec.get('submodules')
+    if not paths:
+        return None
+    return [*GIT, '-C', str(target), 'submodule', 'update', '--init', '--recursive', '--', *paths]
 
 
 def sha256(path):
@@ -70,9 +90,11 @@ def main():
     for name, spec in lock['repositories'].items():
         target = (args.linux_root if spec.get('linux') else args.deps_root) / name
         if not target.exists():
-            run('git', 'clone', '--no-checkout', spec['url'], target)
-            run('git', '-C', target, 'checkout', '--detach', spec['commit'])
-            run('git', '-C', target, 'submodule', 'update', '--init', '--recursive')
+            run(*GIT, 'clone', '--no-checkout', spec['url'], target)
+            run(*GIT, '-C', target, 'checkout', '--detach', spec['commit'])
+            command = submodule_command(target, spec)
+            if command:
+                run(*command)
         actual = subprocess.check_output(['git', '-C', str(target), 'rev-parse', 'HEAD'], text=True).strip()
         dirty = subprocess.check_output(['git', '-C', str(target), 'status', '--porcelain', '--untracked-files=no'], text=True)
         if name == 'pythondata-cpu-vexriscv-smp' and dirty.rstrip('\r\n') == ' M ' + RELATIVE:
@@ -80,6 +102,13 @@ def main():
             dirty = ''
         if actual != spec['commit'] or dirty:
             raise RuntimeError(f'Existing dependency is not the clean pinned revision: {target}')
+        # An interrupted first run can leave a cached repository whose declared
+        # submodule is still an empty directory. Say so here rather than let the
+        # missing sources surface as a confusing compiler error much later.
+        for relative in spec.get('submodules', ()):
+            content = target / relative
+            if not content.is_dir() or not any(content.iterdir()):
+                raise RuntimeError(f'Cached dependency is missing its submodule; clean and rerun setup: {content}')
 
     # --target supplies importable modules; --prefix supplies meson/ninja
     # launchers as well. Both destinations are project-cache directories.

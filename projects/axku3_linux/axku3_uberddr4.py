@@ -2,7 +2,7 @@
 """Wire the AXKU3 SoC: VexRiscv -> LiteX Wishbone -> existing UberDDR4 RTL.
 
 Read _CRG for clocks/reset, _ClassicToPipelined for the bus handshake, and
-BaseSoC for the memory map and Verilog instance. build.ps1 selects Linux;
+BaseSoC for the memory map and Verilog instance. `uberddr4.sh build` selects Linux;
 the smaller non-Linux configuration remains useful for host-side bus tests.
 This file generates hardware; it is not software that runs on the RISC-V CPU.
 """
@@ -166,11 +166,18 @@ class BaseSoC(SoCCore):
             VexRiscvSMP.with_fpu = False
             VexRiscvSMP.with_rvc = False
 
+        # The identifier ROM is the one build label Linux can read back over the
+        # CSR bus, so record the configured rate there. Without it a running
+        # system has no way to report which DATA_RATE_CONFIGS entry it was
+        # built from: UberDDR4's CONFIG register carries byte lanes and BIST
+        # mode only, not the clock periods.
         SoCCore.__init__(
             self,
             platform,
             sys_clk_freq,
-            ident="LiteX VexRiscv + UberDDR4 on ALINX AXKU3",
+            ident=(f"LiteX VexRiscv + UberDDR4 on ALINX AXKU3 "
+                   f"DDR4-{data_rate} {sys_clk_freq // 1_000_000}MHz "
+                   f"tCK{ddr4_clk_period}ps"),
             cpu_type=cpu_type,
             cpu_variant=cpu_variant,
             integrated_rom_size=0x10000,

@@ -3,7 +3,7 @@
 
 Migen simulation checks bus handshakes and byte lanes; mocked serial replies
 check failure handling. These tests do not model physical DDR4 or boot Linux.
-Run through test.ps1 so the pinned LiteX/Migen packages are on PYTHONPATH.
+Run through `uberddr4.sh test` so the pinned LiteX/Migen packages are on PYTHONPATH.
 """
 
 import os
@@ -36,8 +36,9 @@ from axku3_uberddr4 import (
 )
 from linux_hardware_trials import PersistentTranscript, read_until, main as trials_main, value as transcript_value
 import fdt
-from prepare_linux_payload import (LOAD_ADDRESSES, adapt_board_dts,
-                                   reserve_rv32_last_page, validate_rv32_reservation)
+from prepare_linux_payload import (LOAD_ADDRESSES, adapt_board_dts, banner_files,
+                                   build_banner_overlay, reserve_rv32_last_page,
+                                   validate_rv32_reservation)
 from serial_trace import TracedLiteXTerm, SFLUploadError
 from linux_hardware_trials import ROOT_PROMPTS, write_console, test_userspace, capture_zero_failure
 
@@ -242,6 +243,15 @@ class AXKU3LinuxTargetTest(unittest.TestCase):
             validate_rv32_reservation(tree)
         with self.assertRaisesRegex(RuntimeError, 'reservation'):
             validate_rv32_reservation(fdt.parse_dts('/dts-v1/;\n/ {\n};\n'))
+
+    def test_overlay_carries_every_declared_banner_file(self):
+        overlay = build_banner_overlay()
+        for name, _, data in banner_files():
+            self.assertIn(name.encode('ascii') + b'\0', overlay)
+            if data:
+                self.assertIn(data, overlay)
+        self.assertTrue(overlay.endswith(b'\0'))
+        self.assertEqual(len(overlay) % 512, 0)
 
     def test_hardware_transcript_csr_parser(self):
         transcript = bytearray(b"noise\r\nUBER_STATUS=0x000010d0\r\n")
@@ -451,7 +461,7 @@ class AXKU3LinuxTargetTest(unittest.TestCase):
                     '--output-dir', str(root / 'results')]
             with patch('sys.argv', argv), patch('linux_hardware_trials.select_port') as select, \
                  patch('linux_hardware_trials.upload_and_test') as upload:
-                with self.assertRaisesRegex(RuntimeError, 'prepare_linux_payload.ps1'):
+                with self.assertRaisesRegex(RuntimeError, 'Missing RV32 last-page reservation'):
                     trials_main()
                 select.assert_not_called()
                 upload.assert_not_called()
@@ -482,6 +492,41 @@ class AXKU3LinuxTargetTest(unittest.TestCase):
             self.assertIn('PASS', (output / 'summary.tsv').read_text())
             self.assertEqual(json.loads((output / 'trial_02_failure.json').read_text())['trial'], 2)
             self.assertEqual(json.loads((output / 'manifest.json').read_text())['requested_trials'], 2)
+
+    def test_soak_records_a_failed_trial_and_keeps_going(self):
+        """A reliability soak has to measure the failure rate, not just its first case."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('design.bit', 'program.tcl', 'xsdb', 'opensbi.bin'):
+                (root / name).write_bytes(b'test fixture')
+            boot = root / 'boot.json'
+            boot.write_text(json.dumps({'rv32.dtb': '0x40ef0000', 'opensbi.bin': '0x40f00000'}))
+            (root / 'rv32.dtb').write_bytes(self.reserved_tree().to_dtb(version=17))
+            output = root / 'results'
+            argv = ['trials', '--trials', '3', '--continue-on-failure', '--data-rate', '2400',
+                    '--bitstream', str(root / 'design.bit'), '--boot-json', str(boot),
+                    '--xsdb', str(root / 'xsdb'), '--program-tcl', str(root / 'program.tcl'),
+                    '--output-dir', str(output)]
+            result = dict(bytes=100, status=0xd0, train_fail=0, correct=0,
+                          error=0, bist_status=0x40, config=0x40, version=1,
+                          init_progress=0x80, ram_sha256='a' * 64)
+            with patch('sys.argv', argv), patch('linux_hardware_trials.select_port', return_value='TEST'), \
+                 patch('linux_hardware_trials.upload_and_test',
+                       side_effect=[result, RuntimeError('flaky link'), result]), \
+                 patch('linux_hardware_trials.sys.stdout', new_callable=io.StringIO) as output_text:
+                # The campaign still fails overall; only the batch keeps running.
+                with self.assertRaisesRegex(SystemExit, 'Failed trials: 2'):
+                    trials_main()
+            rows = (output / 'summary.tsv').read_text().splitlines()
+            self.assertEqual(len(rows), 4)
+            self.assertEqual([row.split('\t')[-1] for row in rows[1:]], ['PASS', 'FAIL', 'PASS'])
+            self.assertEqual([row.split('\t')[0] for row in rows[1:]], ['1', '2', '3'])
+            self.assertEqual(json.loads((output / 'trial_02_failure.json').read_text())['error'],
+                             'flaky link')
+            self.assertTrue(json.loads((output / 'manifest.json').read_text())['continue_on_failure'])
+            printed = output_text.getvalue()
+            self.assertIn('HARDWARE_TRIALS_PASS=2', printed)
+            self.assertIn('HARDWARE_TRIALS_FAIL=1', printed)
 
 
 if __name__ == "__main__":

@@ -43,12 +43,15 @@ def read_required(path):
 
 def utilization(text, resource):
     match = re.search(
-        rf"^\|\s*{re.escape(resource)}\*?\s*\|\s*(\d+)\s*\|.*?\|\s*([0-9.]+)\s*\|$",
+        rf"^\|\s*{re.escape(resource)}\*?\s*\|\s*([0-9.]+)\s*\|.*?\|\s*([0-9.]+)\s*\|$",
         text,
         re.MULTILINE,
     )
     require(match is not None, f"Could not parse {resource} utilization")
-    return int(match.group(1)), float(match.group(2))
+    # A lone RAMB18E2 occupies half a Block RAM Tile, so that count is
+    # reported fractionally. Keep whole counts as integers for reporting.
+    count = float(match.group(1))
+    return (int(count) if count.is_integer() else count), float(match.group(2))
 
 
 def main():
@@ -102,7 +105,9 @@ def main():
                           ("BRAM", bram_percent), ("URAM", uram_percent),
                           ("DSP", dsp_percent)):
         require(percent < 80.0, f"{name} utilization is infeasible: {percent:.2f}%")
-    require((bram, uram, dsps) == (10, 1, 4),
+    # 10 RAMB36E2 plus the RAMB18E2 holding the identifier ROM, which the
+    # data-rate label pushed past 64 bytes.
+    require((bram, uram, dsps) == (10.5, 1, 4),
             f"Unexpected memory/DSP mapping: BRAM={bram}, URAM={uram}, DSP={dsps}")
 
     print("AXKU3 Linux + UberDDR4 synthesis feasibility OK")

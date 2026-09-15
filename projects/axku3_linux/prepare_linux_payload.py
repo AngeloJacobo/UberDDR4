@@ -178,7 +178,7 @@ def validate_rv32_reservation(tree):
     try:
         node = tree.get_node("/reserved-memory/rv32-last-page@7ffff000")
     except ValueError as error:
-        raise RuntimeError("Missing RV32 last-page reservation; run prepare_linux_payload.ps1") from error
+        raise RuntimeError("Missing RV32 last-page reservation; run './uberddr4.sh payload'") from error
     require(node is not None, "Missing RV32 last-page reservation; regenerate the payload")
     reg = node.get_property("reg")
     require(reg is not None and list(reg.data) == [RV32_RESERVED_PAGE, RV32_PAGE_SIZE],

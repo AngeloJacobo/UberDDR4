@@ -1,5 +1,139 @@
 # Hardware status
 
+## Single shell entry point and full rebuild
+
+The eleven per-step `.ps1` scripts were replaced by one POSIX shell script,
+`uberddr4.sh`, carrying every command and every check they had. The whole flow
+was then rerun from an empty tree to confirm the replacement: `clean --all`,
+`setup`, `test`, `build`, `payload`, `implement`, `boot` and a live console
+session.
+
+All 51 offline tests passed (31 target checks, 20 setup checks). Synthesis and
+implementation ran to completion, producing a bitstream with SHA-256
+`ec1e70dee49a55522527be9d697ec4c4895b9860c7e486a64a65f92dbae31c08`
+at WNS +0.146 ns, WHS +0.010 ns, WPWS +0.039 ns with zero routing errors. The
+payload regenerated to the same `rv32.dtb` SHA-256
+`7eecd118e731e5b2c3a22e85d849127e2fba6c1b556acca0fda22094f2a93589`
+recorded below.
+
+Block RAM use rose from 10 tiles to 10.5. Ten RAMB36E2 are unchanged; the extra
+half tile is one RAMB18E2 holding the identifier ROM, which the added data-rate
+label pushed past 64 bytes. The synthesis validator now parses fractional tile
+counts and expects that mapping.
+
+The programmed board passed one full trial: BIOS memory checks, payload CRC
+readbacks, Linux boot, root shell and the 16 MiB userspace RAM test. A live
+console session then read back `uname -a`, the banner, the identifier ROM
+(`LiteX VexRiscv + UberDDR4 on ALINX AXKU3 DDR4-2400 300MHz tCK833ps`), the
+UberDDR4 registers (VERSION `0x00000001`, CONFIG `0x00000040`, BIST_STATUS
+`0x00000040`), a zero bus-error count, `System RAM 40000000-7fffefff` with the
+last page still reserved, and two matching SHA-256 hashes of an 8 MiB random
+file. This is one trial on one board, not a repeat of the ten-trial campaign.
+
+Vivado's Windows launcher exits 1 with no message when `PROCESSOR_ARCHITECTURE`
+is unset, which a stripped environment can do; `uberddr4.sh` now supplies a
+default without overriding a real value.
+
+## Repeatable reliability soak
+
+`uberddr4.sh campaign` repeats the whole program/upload/boot/test batch and
+reports how many rounds and trials passed, so reliability is recorded as a rate
+rather than as a single passing boot. A failed trial is written to the record
+and the soak continues; the next trial reprograms the FPGA, which recovers the
+board from whatever state the failure left. The run still ends non-zero and
+names the failed rounds. `--stop-on-failure` halts at the first failure instead
+and leaves the board untouched for inspection.
+
+Campaign `campaign_2400_20260911_070445` ran two rounds of one trial on the
+board and both passed, on bitstream SHA-256
+`ec1e70dee49a55522527be9d697ec4c4895b9860c7e486a64a65f92dbae31c08`. Each round
+programmed the FPGA, passed the BIOS memory checks and payload CRC readbacks,
+booted Linux to a root shell and passed the 16 MiB userspace RAM test, with
+`0x00000040` CONFIG and BIST_STATUS, `0x00000001` VERSION and zero training
+failures. The two rounds took 5 min 51 s and 5 min 45 s. The tally was
+`CAMPAIGN_ROUNDS_PASS=2`, `CAMPAIGN_TRIALS_PASS=2`, zero failures.
+
+This exercises the repeat loop, the per-round evidence directories and the
+aggregate tally; it is not itself a long soak. Four offline tests drive the loop
+with a stubbed runner over a failing round, `--stop-on-failure` and an
+all-passing campaign, and one target test checks that a failed trial is recorded
+and the batch continues. The suite was then 56 offline tests: 32 target checks and
+24 setup checks, all passing.
+
+The generated Vivado launcher is `build_<name>.bat` on Windows and
+`build_<name>.sh` elsewhere; the script had reused the installed-launcher suffix
+for it, which resolved to an extensionless name on a Linux host. That is now a
+separate suffix. The Windows path is unchanged, and the Linux path remains
+unexercised.
+
+## One-command build sequence
+
+`uberddr4.sh all` runs setup, test, build, payload, synthesis and implementation
+in that order, each in its own process so a long Vivado step cannot leak its
+environment into the next. It validates every option before the first download,
+and generates the payload before synthesis so a bad configuration fails in
+seconds instead of after the long runs.
+
+Four offline tests drive it with a stubbed step runner and check the exact step
+order and arguments, `--skip-setup`, that a failing step stops the sequence, and
+that bad options are rejected before the first step. The whole sequence then ran
+end to end with `--skip-setup`: tests, SoC and BIOS, payload, synthesis and
+implementation, finishing `ALL_PASS` in 42 minutes at WNS +0.146 ns, WHS
++0.010 ns, WPWS +0.039 ns with bitstream SHA-256
+`092eb880a61581451fb521f4b2eecc6d90de386cea3c8e2bed1181d4c0b5477e`. The routed
+slack matches the earlier build of the same sources exactly; the bitstream hash
+differs, and no byte-level reproducibility across Vivado runs is claimed.
+
+## Console writes on Windows
+
+A build failed with `OSError: [WinError 1] Incorrect function` raised by
+LiteX's first `print` during SoC generation, after the SoC had been built
+correctly. Windows Python selects `_io._WindowsConsoleIO` when it finds a
+console on stdout and writes with `WriteConsoleW`, which returns that error
+when the handle it is given is not a console at the time of the call.
+
+The failure was specific to that stdout handle, not to the terminal: in the
+same process at the same moment, minutes of `logging` output had reached the
+same console on stderr, and shorter Python steps in the same shell had printed
+to stdout normally. It reproduced on a plain `build` command with no repeat
+runner involved, and never reproduced when stdout was a pipe or a file — four
+such runs, including the identical build step, printed the same line. Probes in
+the failing terminal confirmed `_WindowsConsoleIO` on a `/dev/cons1` console
+under VS Code, and ruled out elapsed time, a child process and
+`PYTHONIOENCODING` as triggers. What put that one handle into the failing state
+was not established.
+
+`init_environment` now exports `PYTHONLEGACYWINDOWSSTDIO` on Windows hosts, so
+every step uses the plain `WriteFile` path, which behaves the same on a
+console, a pipe and a file; the existing UTF-8 setting applies to it too. The
+reporter confirmed the build completes with that variable set. One offline test
+checks the setting is exported on Windows and absent elsewhere.
+
+## Console colors on Windows 11
+
+A console session on the booted board printed the shell prompt as
+`?[01;32mroot@buildroot?[00m:?[01;34m~?[00m#`: the escape bytes reached the
+terminal as text instead of selecting colors. miniterm enables the console's
+virtual-terminal processing only inside
+`if platform.release() == '10' and ...`; this host reports `11`, with the
+project's Python 3.12, so the flag was never set. This is independent of the
+`PYTHONLEGACYWINDOWSSTDIO` setting above, which miniterm cannot be affected by:
+it writes with `os.write` on the file descriptor and never uses Python's
+console object.
+
+The console program now sets `ENABLE_VIRTUAL_TERMINAL_PROCESSING` itself before
+starting miniterm and puts the previous mode back in a `finally`, on any exit
+path. Against a real console the call moved the mode from `0x3` to `0x7` and
+restored `0x3`; with output redirected to a file `GetConsoleMode` fails and the
+helper reports that it changed nothing. Three offline tests run the embedded
+program with the serial package stubbed, covering the byte pacing, the setup
+and restore around miniterm, and the absence of the single quote that the
+surrounding shell string cannot carry. The suite is now 64 offline tests: 32
+target checks and 32 setup checks, all passing. Whether the colors render is
+reported by the terminal in use and had not been rechecked on the board at the
+time of writing.
+
+
 ## Current release and zero-file correction
 
 The release source was committed as `08fe013` on 2026-09-08. The tested
@@ -80,7 +214,7 @@ login hook; DTB checks verified the full initramfs range and last-page reservati
 All 44 offline regression tests passed, including positive-acknowledgement,
 CRC-error, missing-reply, bounded-wait and pipelined-mode recovery checks.
 
-`console.ps1` now inserts a 5 ms pause after each transmitted byte, including
+The console now inserts a 5 ms pause after each transmitted byte, including
 pasted input, while retaining the 1 Mbaud link and unrestricted receive output.
 Host checks covered its CLI, byte preservation across multiple writes, pacing,
 empty writes and short-write errors without opening a serial port.
@@ -112,7 +246,7 @@ the BIOS 2 MiB and 64 MiB checks, all four complete-image CRC readbacks, Linux
 boot with the automatic banner, the exact 16 MiB zero-file hash and repeated
 random-file hashes. These results apply to the payload hashes in this section.
 
-A subsequent live Linux check used the exact `console.ps1` pacing code to
+A subsequent live Linux check used the exact console pacing code to
 transmit 3,252 command bytes, including a 2,048-byte known-content payload split
 across short commands. Its SHA-256 matched
 `eb076a2ec6ced9ee2e823e098446513cf5b2bb60fbcb04e6c85dc23dedaa414a`.
@@ -186,6 +320,19 @@ integration, not physical memory reliability.
   that observation. The separately preserved release failure is diagnosed above.
 - One earlier boot produced no BIOS output; a repeat worked. Its cause was
   not established. The final ten-trial campaign had no such failure.
+- No result here was produced on a Linux host. `setup` cannot build a RISC-V
+  toolchain there as written: the pinned archive is a Windows ZIP, the expected
+  compiler name ends in `.exe`, and the extractor is ZIP-only, rejects symlink
+  members and does not restore Unix permission bits. README lists the gaps.
+- The local `build/` tree of the checkout that produced the results above was
+  found missing later the same day. It held the downloaded dependencies and
+  tools, the generated SoC and BIOS, bitstream `ec1e70de…`, the prepared
+  payload and the campaign's evidence directories. Its removal was noticed
+  after the campaign was recorded and its cause was not established. The
+  campaign's own console transcript survives outside `build/`. The tree has
+  since been rebuilt from source, reaching the same routed slack but a
+  different bitstream hash, so the recorded `ec1e70de…` artifact itself can no
+  longer be rehashed.
 
 Do not call this production-qualified or use Linux boot as proof of peak DDR
 bandwidth. The pinned 2022 software bundle is an offline demonstration image,

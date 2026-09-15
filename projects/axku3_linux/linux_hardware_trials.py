@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-side program/boot/test runner, called by boot.ps1 (requires the board).
+"""Host-side program/boot/test runner, called by `uberddr4.sh boot` (needs the board).
 
 Each trial programs volatile FPGA configuration over JTAG, then owns the UART:
 BIOS RAM test -> image upload/readback CRC -> OpenSBI/Linux -> userspace checks.
@@ -377,6 +377,24 @@ Check zeros before overwriting that file, preserving the evidence on failure.
     }
 
 
+def append_summary(summary, trial, data_rate, result):
+    """One row per attempt, so a failed attempt keeps its place in the record."""
+    if result is None:
+        measurements = [""] * 10
+        verdict = "FAIL"
+    else:
+        measurements = [
+            str(result["bytes"]), f"0x{result['status']:08x}",
+            f"0x{result['train_fail']:08x}", str(result["correct"]),
+            str(result["error"]), f"0x{result['bist_status']:08x}",
+            f"0x{result['config']:08x}", f"0x{result['version']:08x}",
+            f"0x{result['init_progress']:08x}", result["ram_sha256"],
+        ]
+        verdict = "PASS"
+    with summary.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write("\t".join([str(trial), str(data_rate), *measurements, verdict]) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Repeat AXKU3 UberDDR4 Linux hardware boots")
     parser.add_argument("--port", default="auto")
@@ -385,6 +403,11 @@ def main():
     parser.add_argument("--software-megabytes", type=int, default=16)
     parser.add_argument("--sfl-frame-bytes", type=int, default=251)
     parser.add_argument("--sfl-outstanding", type=int, default=8)
+    parser.add_argument(
+        "--continue-on-failure", action="store_true",
+        help="Record a failed trial and keep going, then exit non-zero. "
+             "A reliability soak measures the failure rate; stopping at the "
+             "first failure only reports that one happened.")
     parser.add_argument("--data-rate", type=int,
                         choices=(1200, 1250, 1600, 1866, 2133, 2400), required=True)
     parser.add_argument("--bitstream", required=True)
@@ -430,6 +453,7 @@ def main():
         "serial_transport_sha256": sha256(Path(__file__).with_name('serial_trace.py')),
         "boot_json_sha256": sha256(boot_json),
         "requested_trials": args.trials,
+        "continue_on_failure": args.continue_on_failure,
         "software_megabytes": args.software_megabytes,
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -439,6 +463,7 @@ def main():
         "bist_status\tconfig\tversion\tinit_progress\tram_sha256\tresult\n")
 
     rows = []
+    failures = []
     for trial in range(1, args.trials + 1):
         print(f"\nTRIAL_{trial}_BEGIN")
         transcript_path = output_dir / f"trial_{trial:02d}_uart.bin"
@@ -453,21 +478,26 @@ def main():
         except Exception as exc:
             (output_dir / f"trial_{trial:02d}_failure.json").write_text(
                 json.dumps({"trial": trial, "error": str(exc)}, indent=2))
-            raise
+            if not args.continue_on_failure:
+                raise
+            # The next trial reprograms the board over JTAG, which recovers it
+            # from whatever state this failure left. The transcript and failure
+            # record stay on disk for diagnosis.
+            failures.append(trial)
+            print(f"TRIAL_{trial}_FAIL: {exc}")
+            append_summary(summary, trial, args.data_rate, None)
+            continue
         rows.append((trial, result))
         print(f"TRIAL_{trial}_PASS: Linux + {args.software_megabytes} MiB userspace RAM test")
-
-        with summary.open("a", encoding="utf-8", newline="\n") as stream:
-            stream.write(
-                f"{trial}\t{args.data_rate}\t{result['bytes']}\t0x{result['status']:08x}\t"
-                f"0x{result['train_fail']:08x}\t{result['correct']}\t{result['error']}\t"
-                f"0x{result['bist_status']:08x}\t0x{result['config']:08x}\t"
-                f"0x{result['version']:08x}\t0x{result['init_progress']:08x}\t"
-                f"{result['ram_sha256']}\tPASS\n")
-    print(f"HARDWARE_TRIALS_PASS={args.trials}")
+        append_summary(summary, trial, args.data_rate, result)
+    print(f"HARDWARE_TRIALS_PASS={len(rows)}")
+    print(f"HARDWARE_TRIALS_FAIL={len(failures)}")
     print(f"DDR_DATA_RATE={args.data_rate}")
     print(f"BIT_SHA256={bit_digest}")
     print(f"HARDWARE_TRIALS_SUMMARY={summary}")
+    if failures:
+        raise SystemExit(
+            "Failed trials: " + ", ".join(str(trial) for trial in failures))
 
 
 if __name__ == "__main__":

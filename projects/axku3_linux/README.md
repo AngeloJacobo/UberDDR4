@@ -27,15 +27,14 @@ and tests. You do not need to understand all of them to use the example.
 | --- | --- |
 | `axku3_uberddr4.py` | Clocks/reset, CPU, memory map and Wishbone connection to UberDDR4 |
 | `axku3_platform.py`, `constraints/*.xdc` | AXKU3 pins, I/O standards and board constraints |
-| `setup.ps1`, `build.ps1`, `resume_implementation.ps1` | User commands for setup, generation, synthesis and routing |
-| `prepare_linux_payload.ps1`, `boot.ps1`, `console.ps1` | Prepare images, load/test Linux, then type into its shell |
-| `environment.ps1`, `local.example.ps1`, `check_environment.ps1` | Local paths and prerequisite checks |
-| `clean.ps1` | Remove local generated files; preview with `-WhatIf` |
+| `uberddr4.sh` | The single entry point: setup, check, test, build, payload, implement, all, boot, campaign, console, clean |
+| `local.example.sh` | Optional local tool paths; copy to `local.sh` |
 | `dependencies.json`, `setup_dependencies.py`, `prepare_cpu.py` | Pinned sources/tools and isolated CPU source preparation |
 | `prepare_linux_payload.py`, `linux_hardware_trials.py`, `.tcl`, `serial_trace.py` | Internals of payload preparation and the JTAG/UART boot runner |
-| `validate_*.py`, `test.ps1`, `test_*.py` | Build acceptance checks and offline regression tests |
+| `validate_*.py`, `test_*.py` | Build acceptance checks and offline regression tests |
 
-The `.ps1` files are Windows entry points; the Python helpers do the main work.
+`uberddr4.sh` is the only entry point; the Python helpers do the main work. Run
+`./uberddr4.sh --help` for the full command and option list.
 `validate_generated.py` serves the retained non-Linux bring-up mode; the normal
 Linux path uses `validate_linux_generated.py`. Generated Verilog, binaries and
 logs stay in the Git-ignored `build/` subfolder, separate from the source files.
@@ -45,29 +44,63 @@ logs stay in the Git-ignored `build/` subfolder, separate from the source files.
 - ALINX AXKU3 (XCKU3P-FFVB676-2-I), external power, JTAG USB and CP210x UART USB.
 - Windows, Python **3.12** with pip, Git for Windows, and Vivado **2022.2** with
   XSim/XSDB and the board's approved USB drivers.
-- Run the commands below in PowerShell from `projects/axku3_linux`.
+- Run the commands below from `projects/axku3_linux` in a shell: Git Bash on
+  Windows, or any POSIX shell elsewhere.
 
-Use Windows PowerShell 5.1 or PowerShell 7, including in Windows Terminal or
-VS Code. Batch output is handled by the scripts; no manual piping is needed.
-If your terminal opens Command Prompt or Git Bash, enter `powershell` first,
-then use the same commands below.
+`uberddr4.sh` is a portable shell script and does not require PowerShell. On
+Windows use the Git Bash that ships with Git for Windows, including inside
+Windows Terminal or VS Code. It converts paths for native Python and Vivado
+itself; no manual conversion or piping is needed.
 
-Python must be available as `python.exe`; Vivado defaults to
-`C:\Xilinx\Vivado\2022.2`. To change paths, copy `local.example.ps1` to
-`local.ps1` and edit it. Local settings are ignored by Git.
+Windows Python writes to a console with `WriteConsoleW` rather than
+`WriteFile`, and in the VS Code terminal that call failed with `[WinError 1]
+Incorrect function` on a long-running step's first `print`, while its logging
+kept reaching stderr on the same console. The script therefore sets
+`PYTHONLEGACYWINDOWSSTDIO` for every step it runs, which uses the plain
+`WriteFile` path and behaves the same on a console, a pipe and a file. Output
+stays UTF-8. Nothing outside this project's own commands is affected.
+
+**The demonstrated and tested host is Windows.** `uberddr4.sh` itself is POSIX
+shell and its Windows-only pieces are all behind a host check, but `setup`
+cannot currently produce a working RISC-V toolchain on a Linux host:
+
+- `dependencies.json` pins the `win32-x64` GCC ZIP and its checksum, and
+  `setup_dependencies.py` hardcodes both that single entry and the extracted
+  `riscv-none-elf-gcc.exe` it checks for.
+- The extractor handles ZIP only, rejects archive members that are symlinks,
+  and does not restore Unix permission bits. The xpack Linux releases are
+  `.tar.gz` and contain symlinks, so a Linux toolchain needs tar support,
+  a symlink policy and a `chmod` pass, not just a new URL and checksum.
+
+A Linux host also needs `make` installed (Vivado ships GNU make for Windows
+only), Python exactly 3.12 as `python3` or a `local.sh` override, and the
+Xilinx cable udev rules plus `dialout` membership for `/dev/ttyUSB*`; the
+`--port` default there is `/dev/ttyUSB0`, not `COM6`. Everything else — Vivado
+tool names, the generated build script's suffix, the hardware server, path
+handling — is selected by host and needs no edit. None of this has been run on
+a Linux host; treat it as a list of known gaps, not a tested procedure.
+
+Python must be available as `python.exe` on Windows (`python3` elsewhere); Vivado
+defaults to `C:\Xilinx\Vivado\2022.2`. To change paths, copy `local.example.sh` to
+`local.sh` and edit it. Local settings are ignored by Git.
 The USB drivers let Windows recognize the JTAG programmer and CP210x UART
-adapter. They are Windows prerequisites, not downloaded by these scripts.
+adapter. They are Windows prerequisites, not downloaded by this script.
 
 Use a checkout outside OneDrive with no spaces in its full path. Git-ignore
-does not prevent OneDrive syncing. If necessary, set `CacheRoot` in `local.ps1`
+does not prevent OneDrive syncing. If necessary, set `CACHE_ROOT` in `local.sh`
 to a nonsynced path without spaces; it overrides the project-local default.
 
 ## Build
 
-Run `setup.ps1` once to download the dependency versions in `dependencies.json`.
-Everything it downloads stays under this project's Git-ignored `build/` folder;
-LiteX is not installed globally. Vivado, host Python, Git and USB drivers remain
-separately installed prerequisites.
+Run `./uberddr4.sh setup` once to download the dependency versions in
+`dependencies.json`. Everything it downloads stays under this project's
+Git-ignored `build/` folder; LiteX is not installed globally. Vivado, host
+Python, Git and USB drivers remain separately installed prerequisites.
+
+Each dependency is cloned at its pinned commit, and submodules are fetched only
+where `dependencies.json` lists them. The CPU packages ship the Verilog this
+project uses, so their Scala sources are skipped; cloning those would also pull
+a nested test-data repository whose path is too long for Git for Windows.
 
 ```text
 build/
@@ -77,14 +110,15 @@ build/
   output/        Generated sources, BIOS, bitstreams, boot payloads and test logs
 ```
 
-```powershell
-.\setup.ps1
-.\test.ps1
-.\build.ps1
-.\prepare_linux_payload.ps1
+```sh
+./uberddr4.sh setup
+./uberddr4.sh test
+./uberddr4.sh build
+./uberddr4.sh payload
 ```
 
-Run each command separately and stop on error. `build.ps1` without switches
+Run each command separately and stop on error, or use `./uberddr4.sh all`
+below to run the whole sequence in one invocation. `build` without switches
 generates the SoC and compiles its BIOS; it does not run synthesis. The Linux
 kernel and OpenSBI use pinned prebuilt images. Payload preparation verifies
 the pinned base initramfs, adds the Linux banner files, and generates a device
@@ -93,26 +127,51 @@ needed.
 
 After those checks pass, synthesize, then place/route and write the bitstream:
 
-```powershell
-.\build.ps1 -SynthesizeOnly
-.\resume_implementation.ps1
+```sh
+./uberddr4.sh build --synthesize-only
+./uberddr4.sh implement
 ```
 
-These are the long steps. The scripts check synthesis and routed timing/DRC
+These are the long steps. The script checks synthesis and routed timing/DRC
 before hardware use. Do not rebuild just to reconnect or reboot.
+
+### Everything in one command
+
+`all` runs the six steps above in order — setup, test, build, payload,
+synthesize, implement — and stops at the first failure:
+
+```sh
+./uberddr4.sh all
+./uberddr4.sh all --data-rate 2400 --skip-setup
+```
+
+It starts each step in a separate process, exactly as running the commands one
+after another would, so nothing a long Vivado step exports leaks into the next.
+All of its options are validated before the first download, so a typo meant for
+the last step is reported immediately rather than an hour in.
+`--data-rate`, `--uart-name`, `--uart-baudrate` and `--build-variant` are passed
+to the steps that take them; `--skip-setup` reuses dependencies already in
+`build/`. `--build-root`, `--linux-deps-root` and `--cache-root` are passed to
+every step.
+
+The payload is generated before synthesis, so a bad configuration surfaces in
+seconds rather than after the long runs. Expect a few hours on the test laptop,
+almost all of it Vivado. Each step prints `ALL_STEP:` with the command it is
+about to run; success ends with `ALL_PASS`. `all` does not touch the board —
+run `boot` afterwards.
 
 ## Boot and use Linux
 
 Turn on the board and connect both USB cables. Close any program using the
 UART port. Replace COM6 with the CP210x port shown in Device Manager:
 
-```powershell
-.\boot.ps1 -Port COM6
-.\console.ps1 -Port COM6
+```sh
+./uberddr4.sh boot --port COM6
+./uberddr4.sh console --port COM6
 ```
 
 If you prepared the payload before the RV32 last-page fix or the built-in
-banner update, first run `.\prepare_linux_payload.ps1`. This refreshes the
+banner update, first run `./uberddr4.sh payload`. This refreshes the
 initramfs and device tree without synthesis or routing. Boot rejects a device
 tree missing the last-page reservation before programming; an older payload
 with that reservation can still boot but will lack `uber-banner`.
@@ -144,7 +203,7 @@ uber-banner
 The boot checks already log in as root, so the automatic banner may appear
 earlier in the boot transcript. `uber-banner` displays it again in your console.
 
-Type normally or paste shell commands. `console.ps1` spaces transmitted bytes
+Type normally or paste shell commands. The console spaces transmitted bytes
 by 5 ms (up to 200 characters/second) because this kernel's UART driver polls a
 small receive FIFO. Output remains at full speed. Reopen the console after
 updating the script to enable pacing; an already open console keeps its old
@@ -157,11 +216,18 @@ close/reopen the updated console, and paste the command again. Keep individual
 commands well below 1 KiB: this image's shell line editor truncates overlong
 lines even with pacing. Paste a batch of shorter commands for larger inputs.
 
+The console asks Windows to interpret the color escapes Linux sends, so the
+prompt appears as `root@buildroot:~#` in color. pyserial requests that only
+when the reported Windows release is exactly `10`, which on Windows 11 left the
+prompt reading `?[01;32mroot@buildroot?[00m:?[01;34m~?[00m#`. The console
+restores the previous console mode when it closes and changes nothing on other
+hosts, where the terminal already handles the escapes.
+
 ## Demonstrate LiteX and UberDDR4 from Linux
 
 The current bitstream already has a LiteX identifier ROM and UberDDR4's debug
 registers. No FPGA rebuild is needed for the following presentation. Run these in
-the board's root shell through the paced `console.ps1` described above. The
+the board's root shell through the paced console described above. The
 hardware commands only read registers.
 
 First show Linux's CPU and physical RAM map:
@@ -193,8 +259,9 @@ done
 printf '%s\n' "$ident"
 ```
 
-The identifier includes `LiteX VexRiscv + UberDDR4 on ALINX AXKU3` (and may
-include a build timestamp). The addresses are specific to this example;
+The identifier reads back as `LiteX VexRiscv + UberDDR4 on ALINX AXKU3
+DDR4-2400 300MHz tCK833ps` for the default build; the trailing fields follow
+whichever `--data-rate` was built. The addresses are specific to this example;
 `csr.json` records them for each generated build.
 
 Next read the actual UberDDR4 register interface:
@@ -252,16 +319,17 @@ It is included in the initramfs, so every boot from the prepared payload restore
 it. It does not depend on creating a file in `/tmp`. The original LiteX BIOS
 banner still appears earlier during boot.
 
-To update an existing payload, run this in PowerShell from the project directory:
+To update an existing payload, run this from the project directory:
 
-```powershell
-.\prepare_linux_payload.ps1
+```sh
+./uberddr4.sh payload
 ```
 
-Then close the console with **Ctrl+]** and use `boot.ps1 -Port COM6` for the next
-boot, followed by `console.ps1 -Port COM6`. No Vivado rebuild is needed. Preparing
-the payload alone does not change an already running Linux session. Use the same
-`-DataRate` and `-BuildVariant` options as your build if they differ from defaults.
+Then close the console with **Ctrl+]** and use `./uberddr4.sh boot --port COM6` for
+the next boot, followed by `./uberddr4.sh console --port COM6`. No Vivado rebuild is
+needed. Preparing the payload alone does not change an already running Linux
+session. Use the same `--data-rate` and `--build-variant` options as your build if
+they differ from defaults.
 
 The generator verifies the original downloaded images and adds a deterministic
 CPIO overlay; the generated manifest records the input hashes, overlay hash and
@@ -274,17 +342,56 @@ live evidence. The LiteX logo and tagline come from LiteX's BIOS.
 
 Linux and its files live in RAM. Reset/power loss does not reload them, and
 Linux `reboot` is not supported by this minimal reset implementation. Close
-the console and rerun `boot.ps1`; it reuses the bitstream. For ten independent
-program/boot/test cycles:
+the console and rerun `./uberddr4.sh boot`; it reuses the bitstream. For ten
+independent program/boot/test cycles:
 
-```powershell
-.\boot.ps1 -Port COM6 -Trials 10
+```sh
+./uberddr4.sh boot --port COM6 --trials 10
 ```
 
-Generated files and prepared boot payloads are in `build\output`; downloaded
-Linux inputs are in `build\linux`. Each boot saves its transcript and summary
-under `build\output\hardware`. A `CacheRoot` override relocates all four folders.
-The scripts do not program boot flash. JTAG alone cannot provide this image's
+### Reliability soak
+
+One passing boot shows the flow works once; reliability is a rate. The
+`campaign` command repeats the whole batch and reports how many rounds and
+trials passed:
+
+```sh
+./uberddr4.sh campaign --port COM6 --repeat 5 --trials 10
+```
+
+That is five rounds of ten program/upload/boot/test cycles, 50 in total.
+Each round reprograms the FPGA and gets its own evidence directory
+`build/output/hardware/linux_uberddr4_<rate>_<stamp>_roundNN`, with the same
+per-trial transcripts, manifest and `summary.tsv` a plain `boot` produces. The
+campaign's own `campaign_<rate>_<stamp>/campaign.tsv` records each round's
+start time, end time, evidence directory and verdict.
+
+A failed trial is recorded and the soak continues, because stopping at the
+first failure only reports that one happened; the next trial reprograms the
+board, which recovers it from whatever state the failure left. The run still
+ends non-zero, naming the failed rounds, and prints the tally:
+
+```text
+CAMPAIGN_ROUNDS_PASS=4
+CAMPAIGN_ROUNDS_FAIL=1
+CAMPAIGN_TRIALS_PASS=48
+CAMPAIGN_TRIALS_FAIL=2
+```
+
+`CAMPAIGN_PASS` is printed only when every round passed. Pass
+`--stop-on-failure` to halt at the first failed trial instead and leave the
+board in that state for inspection. Failed trials keep their UART transcript
+and a `trial_NN_failure.json` alongside the passing ones either way.
+
+Budget roughly six minutes per trial, so `--repeat 5 --trials 10` is a
+multi-hour run. Keep both USB cables connected and no other program on the
+serial port for its duration; the campaign does not reconnect a port that
+disappears. Its options otherwise match `boot`.
+
+Generated files and prepared boot payloads are in `build/output`; downloaded
+Linux inputs are in `build/linux`. Each boot saves its transcript and summary
+under `build/output/hardware`. A `CACHE_ROOT` override relocates all four folders.
+The script does not program boot flash. JTAG alone cannot provide this image's
 Linux console.
 
 ## Cleanup
@@ -292,16 +399,18 @@ Linux console.
 Close active builds/terminals and save any bitstreams or hardware logs you want.
 From this project directory:
 
-```powershell
-.\clean.ps1 -WhatIf  # Preview; delete nothing
-.\clean.ps1          # Delete build/output; keep dependencies and tools
-.\clean.ps1 -All     # Delete all of build; setup.ps1 is needed again
+```sh
+./uberddr4.sh clean --dry-run  # Preview; delete nothing
+./uberddr4.sh clean            # Delete build/output; keep dependencies and tools
+./uberddr4.sh clean --all      # Delete all of build; setup is needed again
 ```
 
 Deletion asks for confirmation and is permanent, not a move to the Recycle Bin.
-`-All -WhatIf` previews a full cleanup. Only this project's local `build/` is
-eligible; external cache/path overrides are not followed, and linked directories
-are refused. Source files and `local.ps1` are kept.
+Pass `--yes` to skip the prompt in a script; without a terminal and without
+`--yes`, cleanup refuses rather than assuming yes. `--all --dry-run` previews a
+full cleanup. Only this project's local `build/` is eligible; `local.sh` is never
+loaded by cleanup, external cache/path overrides are not followed, and linked
+directories are refused. Source files and `local.sh` are kept.
 
 ## Sources
 
