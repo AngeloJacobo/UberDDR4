@@ -92,7 +92,9 @@ trap 'cleanup 130' INT TERM HUP
 # ═══════════════════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════
-VIVADO="${XILINX_VIVADO:-/cad/adi/apps/xilinx/vivado/2023.1/Vivado/2023.1}"
+# Fallback is the stock Vivado install location; set XILINX_VIVADO for any
+# other prefix. A missing directory is reported by the simulation stage.
+VIVADO="${XILINX_VIVADO:-/opt/Xilinx/Vivado/2023.1}"
 UNISIMS="$VIVADO/data/verilog/src/unisims"
 
 RTL_CORE=(rtl/ddr4_controller.v rtl/ddr4_phy.v rtl/ddr4_prober.v rtl/ddr4_top.v)
@@ -142,9 +144,22 @@ elapsed() {
     fi
 }
 
-pass() { printf "  ${GRN}${OK}${RST} %-52s ${GRN}PASS${RST}  ${DIM}%s${RST}\n" "$1" "$2"; ((PASS_N++)); ((SP++)); }
-fail() { printf "  ${RED}${XF}${RST} %-52s ${RED}FAIL${RST}  ${DIM}%s${RST}\n" "$1" "$2"; ((FAIL_N++)); ((SF++)); }
-skip() { printf "  ${YLW}${SK}${RST} %-52s ${YLW}SKIP${RST}\n" "$1";                      ((SKIP_N++)); ((SS++)); }
+row_pass() { printf "  ${GRN}${OK}${RST} %-52s ${GRN}PASS${RST}  ${DIM}%s${RST}\n" "$1" "$2"; }
+row_fail() { printf "  ${RED}${XF}${RST} %-52s ${RED}FAIL${RST}  ${DIM}%s${RST}\n" "$1" "$2"; }
+row_skip() { printf "  ${YLW}${SK}${RST} %-52s ${YLW}SKIP${RST}\n" "$1"; }
+
+pass() { row_pass "$1" "$2"; ((PASS_N++)); ((SP++)); }
+fail() { row_fail "$1" "$2"; ((FAIL_N++)); ((SF++)); }
+skip() { row_skip "$1";      ((SKIP_N++)); ((SS++)); }
+
+# A stage that runs a suite of its own prints one row but stands for many
+# tests. It adds their verdicts here so the totals count tests everywhere,
+# rather than counting a whole regression as the single item its row looks like.
+add_results() {
+    ((PASS_N += $1)); ((SP += $1))
+    ((FAIL_N += $2)); ((SF += $2))
+    ((SKIP_N += $3)); ((SS += $3))
+}
 
 show_errors() {
     local f="$1" n="${2:-6}"
@@ -464,6 +479,26 @@ run_formal() {
 # ═══════════════════════════════════════════════════════════════════════════
 # Stage 4: Simulation
 # ═══════════════════════════════════════════════════════════════════════════
+
+# regression_test.sh renames each finished log to PASS_<test>.log or
+# FAIL_<test>.log, so its log directory holds the per-test verdicts that its
+# own stdout shows.  Reading it is how this script learns them: the regression
+# runs as a directly tracked child writing to the terminal, not through a pipe
+# this script could parse.  A log older than the marker file is left over from
+# an earlier run—the suite refused to start, or aborted before reaching that
+# test—and counts as not run.
+REGR_PASS=0 REGR_FAIL=0 REGR_SKIP=0
+count_regression_results() {
+    local marker="$1" dir="$SCRIPT_DIR/testbench/regression_logs" name
+    REGR_PASS=0; REGR_FAIL=0; REGR_SKIP=0
+    for name in "${SIM_TESTS[@]}"; do
+        if   [[ "$dir/PASS_${name}.log" -nt "$marker" ]]; then ((REGR_PASS++))
+        elif [[ "$dir/FAIL_${name}.log" -nt "$marker" ]]; then ((REGR_FAIL++))
+        else                                                   ((REGR_SKIP++))
+        fi
+    done
+}
+
 run_sim() {
     ((STAGE++))
     stage_reset
@@ -479,6 +514,9 @@ run_sim() {
     if $SIM_REGR; then
         header "$STAGE" "$TOTAL" "Simulation Regression (${#SIM_TESTS[@]} tests)"
         local st0 st1 regression_rc=0
+        local marker="$SCRIPT_DIR/$LOGDIR/.regression_started"
+        mkdir -p "$SCRIPT_DIR/$LOGDIR"
+        : > "$marker"
         st0=$(date +%s)
 
         # regression_test.sh owns the simulator lifecycle and renders its own
@@ -489,10 +527,23 @@ run_sim() {
         wait "$CHILD_PID" || regression_rc=$?
         CHILD_PID=""
         st1=$(date +%s)
-        if (( regression_rc == 0 )); then
-            pass "Simulation regression" "$(elapsed $((st1-st0)))"
+
+        count_regression_results "$marker"
+        rm -f "$marker"
+        local n=${#SIM_TESTS[@]}
+        if (( regression_rc == 0 && REGR_FAIL == 0 && REGR_SKIP == 0 )); then
+            row_pass "Simulation regression ($REGR_PASS/$n tests)" "$(elapsed $((st1-st0)))"
+            add_results "$REGR_PASS" 0 0
         else
-            fail "Simulation regression" "$(elapsed $((st1-st0)))"
+            row_fail "Simulation regression ($REGR_PASS pass, $REGR_FAIL fail, $REGR_SKIP not run)" \
+                     "$(elapsed $((st1-st0)))"
+            # An abort or a refused start leaves no failed test of its own, so
+            # count one: a non-zero exit must not summarize as success.
+            if (( REGR_FAIL == 0 )); then
+                add_results "$REGR_PASS" 1 "$REGR_SKIP"
+            else
+                add_results "$REGR_PASS" "$REGR_FAIL" "$REGR_SKIP"
+            fi
         fi
         printf "  ${DIM}  Logs: testbench/regression_logs/${RST}\n"
     else
