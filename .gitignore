@@ -31,6 +31,9 @@ testbench/micron/*
 *.ip_user_files/
 *.sim/
 
+# Example demo builds (example_demo/<board>/Makefile writes everything here)
+example_demo/*/build/
+
 # Formal verification (SymbiYosys work directories)
 formal/ddr4_singleconfig/
 formal/ddr4_singleconfig_*/

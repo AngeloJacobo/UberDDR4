@@ -7,13 +7,49 @@ interface. The committed wrapper targets DDR4-2400 with a 300 MHz controller.
 It has no application master: the external Wishbone and debug inputs are tied
 off and the internal BIST generates traffic.
 
-This is a source example with a manually generated Clocking Wizard IP. It is
-not a checked-in Vivado project or a command that reconstructs the exact
-historical qualification images. See [HARDWARE_QUALIFICATION.md](../../HARDWARE_QUALIFICATION.md)
-for their hashes, measured results and evidence limitations. The Linux SoC has
-its own independently maintained [build flow](../../projects/axku3_linux/README.md).
+This is a source example, not a checked-in Vivado project. Neither the Makefile
+below nor the manual steps reconstruct the exact historical qualification
+images. See [HARDWARE_QUALIFICATION.md](../../HARDWARE_QUALIFICATION.md) for
+their hashes, measured results and evidence limitations. The Linux SoC has its
+own independently maintained [build flow](../../projects/axku3_linux/README.md).
+
+## Build from the command line
+
+`make` in this directory runs the whole flow in batch mode and writes
+`build/axku3_uberddr4.bit`:
+
+```
+make                      # synthesis, implementation and bitstream
+make synth                # stop after synthesis and its reports
+make program              # program the board over JTAG with the built bitstream
+make clean                # delete build/
+```
+
+`build.tcl` creates the project, generates the `clk_wiz_0` IP with the
+configuration the next section describes by hand, then synthesizes, implements
+and checks routed timing. Negative setup, hold or pulse-width slack stops the
+build before a bitstream is written; `make ALLOW_FAILING_TIMING=1` writes one
+anyway, for debugging only. The XDC builds ILA cores, so `write_debug_probes`
+saves `build/axku3_uberddr4.ltx` beside the bitstream and `make program` loads
+it as the probe file. Every output, including `build/vivado.log`, stays in
+`build/`, which Git ignores.
+
+Vivado must be on PATH, or name it with `make VIVADO=/path/to/vivado`. Windows
+has no make of its own; Vivado ships GNU Make in `gnuwin\bin`, and that build
+runs recipes through `cmd.exe` whichever shell starts it, so the recipes stay
+within what `cmd.exe` and a POSIX shell both accept. A make that does use a
+POSIX shell on Windows will not find `vivado.bat` by name alone and needs
+`make VIVADO=vivado.bat`.
+
+The reports the next section tells you to inspect are written to `build/` by
+both paths, and are as worth reading after a batch build as after a GUI one:
+`post_route_timing.rpt`, `post_route_drc.rpt`, `post_route_cdc.rpt`,
+`post_route_utilization.rpt` and `post_route_clock_utilization.rpt`.
 
 ## Create the Vivado project
+
+These are the equivalent manual steps, for working in the GUI. `build.tcl`
+performs the same ones.
 
 1. Create an RTL project for part `xcku3p-ffvb676-2-i`. The dated hardware
    qualification used Vivado 2022.2; record the version you use.
