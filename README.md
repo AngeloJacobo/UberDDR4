@@ -100,4 +100,4 @@ DFI 3.1 and UG571 editions used to review this documentation.
 This project is funded through [NGI0 Entrust](https://nlnet.nl/entrust), a fund
 established by [NLnet](https://nlnet.nl) with financial support from the European
 Commission's [Next Generation Internet](https://ngi.eu) program. See the
-[NLnet project page](https://nlnet.nl/project/UberDDR).
+[NLnet project page](https://nlnet.nl/project/UberDDR4).
