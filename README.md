@@ -14,13 +14,12 @@ Wishbone word and a physical 1-lane x32 memory uses a 256-bit word.
 
 | What you want to do | Read |
 | --- | --- |
-| Run the supplied RISC-V Linux system on AXKU3 | [Linux example](projects/axku3_linux/README.md) |
-| Bring up AXKU3 with BIST and LEDs, without a CPU | [AXKU3 hardware example](example_demo/axku3/README.md) |
+| Run the example UberDDR4 + RISC-V + Linux system on AXKU3 FPGA board| [Linux example](projects/axku3_linux/README.md) |
+| Bring up AXKU3 FPGA board with UberDDR4 | [AXKU3 hardware example](example_demo/axku3/README.md) |
 | Connect your own Wishbone master or adapt a board | [Integration guide](docs/INTEGRATION.md) |
 | Run simulation, lint or formal checks | [Verification guide](docs/VERIFICATION.md) |
 | Understand scheduling, DFI and PHY training | [Architecture](docs/ARCHITECTURE.md) |
 | Read status registers or diagnose a failure | [Debugging and BIST](docs/DEBUGGING.md) |
-| Check what has actually been demonstrated | [Native-PHY hardware results](HARDWARE_QUALIFICATION.md), [Linux results](projects/axku3_linux/RESULTS.md) |
 
 ## Capabilities and limits
 
