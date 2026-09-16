@@ -1,4 +1,4 @@
-# Hardware status
+# Hardware status (audit report by Codex)
 
 ## Single shell entry point and full rebuild
 

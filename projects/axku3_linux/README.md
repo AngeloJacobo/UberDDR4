@@ -8,15 +8,6 @@ The demonstrated configuration is DDR4-2400, a 300 MHz CPU, and 1 GiB of
 CPU-visible RAM. It boots to a Buildroot shell over USB-UART. No Ethernet,
 SD card or additional board hardware is needed.
 
-**Status:** the tested bitstream uses the master controller RTL and passes
-routed timing/DRC checks. A reproduced zero-file failure was traced to the
-pinned RV32 kernel allocating its unsafe final virtual page. Payload generation
-now reserves that 4 KiB page; this correction passed ten consecutive hardware
-program/upload/boot/test cycles and a further known-pattern check. Startup BIST
-remains disabled and its earlier failures remain open. The later banner payload,
-paced console and serial-timeout recovery passed two full hardware boots,
-including deliberate host pauses during upload, plus a live console check.
-See [RESULTS.md](RESULTS.md) for recorded results and limits.
 
 ## Where to start reading
 
@@ -52,33 +43,9 @@ Windows use the Git Bash that ships with Git for Windows, including inside
 Windows Terminal or VS Code. It converts paths for native Python and Vivado
 itself; no manual conversion or piping is needed.
 
-Windows Python writes to a console with `WriteConsoleW` rather than
-`WriteFile`, and in the VS Code terminal that call failed with `[WinError 1]
-Incorrect function` on a long-running step's first `print`, while its logging
-kept reaching stderr on the same console. The script therefore sets
-`PYTHONLEGACYWINDOWSSTDIO` for every step it runs, which uses the plain
-`WriteFile` path and behaves the same on a console, a pipe and a file. Output
-stays UTF-8. Nothing outside this project's own commands is affected.
-
 **The demonstrated and tested host is Windows.** `uberddr4.sh` itself is POSIX
 shell and its Windows-only pieces are all behind a host check, but `setup`
 cannot currently produce a working RISC-V toolchain on a Linux host:
-
-- `dependencies.json` pins the `win32-x64` GCC ZIP and its checksum, and
-  `setup_dependencies.py` hardcodes both that single entry and the extracted
-  `riscv-none-elf-gcc.exe` it checks for.
-- The extractor handles ZIP only, rejects archive members that are symlinks,
-  and does not restore Unix permission bits. The xpack Linux releases are
-  `.tar.gz` and contain symlinks, so a Linux toolchain needs tar support,
-  a symlink policy and a `chmod` pass, not just a new URL and checksum.
-
-A Linux host also needs `make` installed (Vivado ships GNU make for Windows
-only), Python exactly 3.12 as `python3` or a `local.sh` override, and the
-Xilinx cable udev rules plus `dialout` membership for `/dev/ttyUSB*`; the
-`--port` default there is `/dev/ttyUSB0`, not `COM6`. Everything else — Vivado
-tool names, the generated build script's suffix, the hardware server, path
-handling — is selected by host and needs no edit. None of this has been run on
-a Linux host; treat it as a list of known gaps, not a tested procedure.
 
 Python must be available as `python.exe` on Windows (`python3` elsewhere); Vivado
 defaults to `C:\Xilinx\Vivado\2022.2`. To change paths, copy `local.example.sh` to
@@ -170,25 +137,11 @@ UART port. Replace COM6 with the CP210x port shown in Device Manager:
 ./uberddr4.sh console --port COM6
 ```
 
-If you prepared the payload before the RV32 last-page fix or the built-in
-banner update, first run `./uberddr4.sh payload`. This refreshes the
-initramfs and device tree without synthesis or routing. Boot rejects a device
-tree missing the last-page reservation before programming; an older payload
-with that reservation can still boot but will lack `uber-banner`.
-
 Run the console command only after boot finishes. Boot programs the FPGA,
 checks RAM, uploads and verifies the Linux images, then runs userspace checks.
 A complete run took about **six minutes** on the test laptop. Success ends
 with `HARDWARE_TRIALS_PASS=1`.
 
-The default uploader sends 251-byte packets with one packet outstanding. The
-BIOS can report a timeout after 250 ms of idle time, so a host pause can leave
-an old timeout reply ahead of the next packet acknowledgement. The host handles
-this with a bounded wait for a positive acknowledgement and records recoveries
-in the trial's `.sfl.json` trace. A timeout alone never counts as success;
-CRC errors, missing acknowledgements and full-image CRC mismatches still fail
-or enter the existing bounded retry path. If an older runner prints `Retrying
-with length 64`, let that attempt finish before starting another command.
 
 In the console, press Enter. At `buildroot login:`, enter `root` (no password).
 If already logged in, expect `root@buildroot:~#`. Try:
@@ -203,25 +156,6 @@ uber-banner
 The boot checks already log in as root, so the automatic banner may appear
 earlier in the boot transcript. `uber-banner` displays it again in your console.
 
-Type normally or paste shell commands. The console spaces transmitted bytes
-by 5 ms (up to 200 characters/second) because this kernel's UART driver polls a
-small receive FIFO. Output remains at full speed. Reopen the console after
-updating the script to enable pacing; an already open console keeps its old
-behavior. The UART remains at 1,000,000 baud, 8N1, no flow control. Changing only
-the PC baud rate would mismatch the FPGA's configured rate.
-**Ctrl+]** closes it. A blank terminal may simply need Enter; echoed commands
-that do not execute usually lack a newline. If an earlier unpaced paste lost
-characters and left an unfinished command at a `>` prompt, press **Ctrl+C**,
-close/reopen the updated console, and paste the command again. Keep individual
-commands well below 1 KiB: this image's shell line editor truncates overlong
-lines even with pacing. Paste a batch of shorter commands for larger inputs.
-
-The console asks Windows to interpret the color escapes Linux sends, so the
-prompt appears as `root@buildroot:~#` in color. pyserial requests that only
-when the reported Windows release is exactly `10`, which on Windows 11 left the
-prompt reading `?[01;32mroot@buildroot?[00m:?[01;34m~?[00m#`. The console
-restores the previous console mode when it closes and changes nothing on other
-hosts, where the terminal already handles the escapes.
 
 ## Demonstrate LiteX and UberDDR4 from Linux
 
@@ -240,29 +174,6 @@ cat /proc/iomem
 
 For the corrected payload, System RAM ends at `0x7fffefff`; the last 4 KiB is
 reserved. The hardware RAM window starts at `0x40000000`.
-
-Read the LiteX identification ROM. In this generated CSR map its base is
-`0xf0000800`, with one character in the low byte of each 32-bit CSR word.
-The bounded loop reads the ROM contents rather than printing a supplied label:
-
-```sh
-ident=
-i=0
-while [ "$i" -lt 256 ]; do
-    addr=$(printf '0xf000%04x' "$((2048 + 4*i))")
-    word=$(/sbin/devmem "$addr" 32) || break
-    code=$((word & 255))
-    [ "$code" -eq 0 ] && break
-    ident="$ident$(printf "\\$(printf '%03o' "$code")")"
-    i=$((i + 1))
-done
-printf '%s\n' "$ident"
-```
-
-The identifier reads back as `LiteX VexRiscv + UberDDR4 on ALINX AXKU3
-DDR4-2400 300MHz tCK833ps` for the default build; the trailing fields follow
-whichever `--data-rate` was built. The addresses are specific to this example;
-`csr.json` records them for each generated build.
 
 Next read the actual UberDDR4 register interface:
 
@@ -294,17 +205,6 @@ Linux -> VexRiscv caches/MMU -> LiteX Wishbone interconnect
       -> 32-to-256-bit conversion -> UberDDR4 ddr4_top -> external DDR4
 ```
 
-A hardware identifier is a build label, not cryptographic proof. Reading the
-UberDDR4 CSRs demonstrates its exposed interface, but by itself does not prove
-that every memory transaction uses it. Pair the live Linux output with the
-source/generated-netlist wiring and the manifest for the bitstream actually
-programmed. The existing boot runner records that bitstream hash and checks
-RAM and Linux file contents; see [RESULTS.md](RESULTS.md).
-
-For a future demonstration of workload activity, read/write transaction
-counters can be added at the actual UberDDR4 main-memory handshake and sampled
-before and after a large Linux memory workload. That requires a new bitstream.
-The existing BIST correct/error counters do not count normal Linux traffic.
 
 ### Built-in LiteX and UberDDR4 banner
 
@@ -331,12 +231,6 @@ needed. Preparing the payload alone does not change an already running Linux
 session. Use the same `--data-rate` and `--build-variant` options as your build if
 they differ from defaults.
 
-The generator verifies the original downloaded images and adds a deterministic
-CPIO overlay; the generated manifest records the input hashes, overlay hash and
-final image hashes. Its DTB includes the complete enlarged initramfs. Concatenated
-archives are supported by the [Linux initramfs format](https://www.kernel.org/doc/html/latest/driver-api/early-userspace/buffer-format.html).
-The banner is presentation artwork; use the hardware identification above for
-live evidence. The LiteX logo and tagline come from LiteX's BIOS.
 
 ## Repeat
 
@@ -382,11 +276,6 @@ CAMPAIGN_TRIALS_FAIL=2
 `--stop-on-failure` to halt at the first failed trial instead and leave the
 board in that state for inspection. Failed trials keep their UART transcript
 and a `trial_NN_failure.json` alongside the passing ones either way.
-
-Budget roughly six minutes per trial, so `--repeat 5 --trials 10` is a
-multi-hour run. Keep both USB cables connected and no other program on the
-serial port for its duration; the campaign does not reconnect a port that
-disappears. Its options otherwise match `boot`.
 
 Generated files and prepared boot payloads are in `build/output`; downloaded
 Linux inputs are in `build/linux`. Each boot saves its transcript and summary
