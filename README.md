@@ -1,14 +1,14 @@
 # UberDDR4
 
-UberDDR4 is an open-source DDR4 SDRAM controller for FPGA designs. It connects a
+UberDDR4 is an open-source DDR4 SDRAM controller + PHY for FPGAs. It connects a
 Wishbone B4 pipelined master to DDR4 memory and handles initialization, command
 timing, bank scheduling, refresh and PHY calibration. It is the successor to
 [UberDDR3](https://github.com/AngeloJacobo/UberDDR3).
 
-The controller runs at one quarter of the DDR4 clock frequency: at DDR4-2400,
-the memory clock is 1.2 GHz and the controller clock is 300 MHz. Each Wishbone
-transfer carries one complete BL8 burst. A physical x16 interface uses a 128-bit
-Wishbone word; a physical x32 interface uses a 256-bit word.
+The controller runs at **1:4 ratio**: at DDR4-2400,
+the memory clock is 1.2 GHz and the controller clock is 300 MHz (thus 1:4 ratio). Each Wishbone
+transfer carries one complete **BL8 burst**: a one-lane x16 memory has a 128-bit
+Wishbone word and a physical 1-lane x32 memory uses a 256-bit word.
 
 ## Start here
 
@@ -24,73 +24,51 @@ Wishbone word; a physical x32 interface uses a 256-bit word.
 
 ## Capabilities and limits
 
-- Quarter-rate controller with two request stages, bank/bank-group timing
-  counters, and speculative precharge/activate lookahead.
+- 1:4 controller with two request stages for speculative PRE/ACT lookahead and actual RD/WR operation
 - Sequential or bank-group-interleaved word addressing. Interleaving adjacent
-  bursts can reduce same-bank-group timing penalties; performance still depends
-  on the workload, open rows, refresh and turnarounds.
-- DDR4 x4, x8 and x16 device configuration in the controller; the number of
-  physical byte lanes is a separate parameter. x4 devices do not support the
-  byte-masked write path. Parameterization is not qualification of every board
-  topology or combination of geometry and clock rate.
-- Two Xilinx PHY implementations, selected by `ddr4_top.PHY_IMPL`.
-- Optional destructive BIST and a separate 32-bit debug Wishbone port.
-- A retained AXI4-to-Wishbone wrapper based on ZipCPU's bridge. Its current
-  [integration limitations](docs/INTEGRATION.md#axi-wrapper-limitations) include
-  missing native-PHY configuration forwarding and debug-port connections.
-
+  bursts can reduce same-bank-group timing penalties
+- DDR4 x4, x8 and x16 device configuration in the controller. The number of
+  physical byte lanes can be configured depending on your system. x4 devices do not yet support the
+  byte-masked write. 
+- Two Xilinx PHY implementations: component mode and native moved
+- Optional BIST and a separate 32-bit debug Wishbone port.
+- A AXI4-to-Wishbone wrapper based on [ZipCPU's bridge](https://github.com/ZipCPU/wb2axip/tree/master/rtl).
+  
 | PHY | Select | Clocking and intended use |
 | --- | --- | --- |
-| Component | `PHY_IMPL=0` (default) | OSERDESE3/ISERDESE3 and IDELAYE3/ODELAYE3; external CK-rate clock (4x controller) and 300 MHz delay reference. Used by the default simulation flow. |
-| Native | `PHY_IMPL=1` | BITSLICE primitives, local PLL high-speed clocks and a separate RIU clock. Used by the supplied AXKU3 hardware and Linux examples. |
+| Component | `PHY_IMPL=0` (default) | Uses OSERDESE3/ISERDESE3/IDELAYE3/ODELAYE3 intended for DDR4-1250. Requires an external CK-rate clock (4x controller) and 300 MHz delay reference. |
+| Native | `PHY_IMPL=1` | Uses BITSLICE primitives for DDR4-1250 to DDR4-2400. Requires only the 300MHz reference clock |
 
-The historical AXKU3 native-PHY campaign recorded ten fresh programming/BIST
-trials at each of DDR4-1600, 1866, 2133 and 2400, plus exploratory DDR4-1250.
-DDR4-2666 failed the device minimum-period/pulse-width gate and was not programmed.
-See the [exact artifacts, acceptance criteria and limits](HARDWARE_QUALIFICATION.md).
-These results do not qualify other devices, boards, configurations or operating
-conditions. The controller uses a fixed nominal 7.8 us refresh interval; it does
-not automatically select a higher-temperature refresh rate.
+Component mode PHY can only run at DDR4-1250. This is just exploratory and is already below the allowed minimum DDR4 speed bin (DDR4-1333). 
+The goal is to build a Xilinx PHY which uses common IO blocks (IOSERDES and IODELAY) for initial testing of UberDDR3. 
+Running higher than DDR4-1250 would fail timing for these IO blocks. 
 
-The [Linux example](projects/axku3_linux/README.md) uses a 300 MHz VexRiscv CPU,
-LiteX and 1 GiB of CPU-visible RAM. Its pinned RV32 kernel needs the documented
-last-page device-tree reservation. Startup BIST is disabled in that integration;
-[RESULTS.md](projects/axku3_linux/RESULTS.md) distinguishes current and historical
-hardware evidence and unresolved issues.
+The native PHY is the one built for high DDR4 speed bins. The [Linux project](projects/axku3_linux/README.md), for example, uses the native PHY to run UberDDR4 at DDR4-2400.
 
 ## Integrate the core
 
 Use [`rtl/ddr4_top.v`](rtl/ddr4_top.v) for Wishbone integration. Its defaults are
-`DEVICE_WIDTH=8`, `BYTE_LANES=2`, `ROW_BITS=16`, `COL_BITS=10`, `DENSITY=8`,
-`ADDR_MAPPING=1`, **`BIST_MODE=1`**, `DEBUG_CSR_ENABLE=1` and `PHY_IMPL=0`.
-The latency overrides are named **`CL` and `CWL`**; zero selects automatic values.
+`DEVICE_WIDTH=8` (for x8), `BYTE_LANES=2`, `ROW_BITS=16`, `COL_BITS=10`, `DENSITY=8`,
+`ADDR_MAPPING=1` (BG-interleaved), `BIST_MODE=1` (BIST passes through whole address space once), `DEBUG_CSR_ENABLE=1` (enabled CSR debugging via the Wishbone debug interface) and `PHY_IMPL=0` (component mode).
+The latency overrides are `CL` and `CWL`, set this to zero to autoselect legal value based on speed bin and clock frequency.
 
-BIST starts after calibration when enabled and overwrites its test range. Disable
-it explicitly when a destructive startup test is unsuitable, and quiesce all
-masters before a runtime retrigger. A final PASS can follow automatic recovery;
-read the [status and recovery rules](docs/DEBUGGING.md) before interpreting it.
+BIST starts after calibration (gate/eye training and write leveling). Refer to [status and recovery rules](docs/DEBUGGING.md) to debug any issues due to calibration/BIST failure.
 
 The [integration guide](docs/INTEGRATION.md) gives the complete public parameter,
-clock/reset, address, data and pin contracts. The separate debug port does not
-add an address bit to the Wishbone DRAM interface.
+clock/reset, address, data and pin contracts.
 
 ## Verify a checkout
 
-The root verification commands use Bash. Install the tools described in the
+The root verification commands use Bash on Windows. Install the tools described in the
 [verification guide](docs/VERIFICATION.md), then run from the repository root:
 
 ```bash
 source /path/to/Vivado/2023.1/settings64.sh
 bash testbench/setup_micron_model.sh
 bash run_compile.sh --sim baseline
-PHY_IMPL=native bash run_compile.sh --sim baseline
 ```
 
-The Micron model is taken from your Vivado installation and is not bundled.
-The testbench contains 26 lettered traffic phases, with separate BIST, CSR and
-failure paths. The regression matrix contains 26 configurations. Formal jobs
-check the controller under the harness assumptions; they are not a proof of the
-complete PHY, AXI wrapper or physical memory interface.
+The Micron model is taken from your Vivado installation and is not bundled on this repository.
 
 ## Repository map
 
@@ -108,8 +86,6 @@ complete PHY, AXI wrapper or physical memory interface.
 | `projects/axku3_linux/` | LiteX/VexRiscv Linux integration, host tools and evidence |
 | `docs/` | Integration, architecture, verification, debug and reference guides |
 
-The [documentation audit record](docs/DOCUMENTATION_AUDIT.md) lists the reviewed
-files, corrected claims, verification and remaining implementation limits.
 
 ## License and references
 
