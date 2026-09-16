@@ -75,13 +75,6 @@ performs the same ones.
    Check the native dedicated-clock placement. Save the matching `.bit` before
    programming the board.
 
-The same-MMCM, same-phase controller/RIU relationship is required by the native
-memory delay programming described in UG571 Table 2-54. Independent Clocking
-Wizards are not an equivalent clock source. The native PHY creates local
-PLLE4/CLKOUTPHY resources for two I/O clock regions; the serial 2.4 GHz clock
-stays on dedicated routes. ACMD occupies Bank 66 and data Bank 67. Preserve the
-pin maps, PLL maps, XDC and dedicated routing as one topology.
-
 ## Parameters and expected observations
 
 The wrapper selects `PHY_IMPL=1`, `DEVICE_WIDTH=16`, `BYTE_LANES=4`, row width
@@ -96,27 +89,15 @@ It enables full-range BIST (`BIST_MODE=2`), disables byte-mask stress
 (`DEBUG_CSR_ENABLE=0`). The nominal clean full-range result is
 **0x0c000000 = 201,326,592 matching reads**, zero errors.
 
-LED0 reports `init_done`; all four LEDs report `init_failed` with failure taking
-priority. Status clears on reset, including internal recovery. The active-low
-fan control is held enabled. The pushbutton and Clocking Wizard lock control
-the wrapper's reset register. Startup calibration includes DDR4 initialization,
+LED0 reports `init_failed`; all remaining three LEDs report `init_done`. 
+The active-low fan control is held enabled. . Startup calibration includes DDR4 initialization,
 native delay readiness, write leveling, final read training and then BIST.
-Wait for actual completion; no fixed wall-clock completion time is guaranteed.
 
 This wrapper carries no on-chip observability: it builds no debug cores and
 `DEBUG_CSR_ENABLE=0` leaves the CSR port unanswered, so the LEDs are the only
 runtime status the board reports. The earlier debug cores in this example were
 removed because they could not meet timing at 300 MHz.
 
-A pass/fail LED is weaker evidence than the historical qualification's final
-criteria, which read training state and failure flags, read-eye widths, per-lane
-trained mCL, BIST comparison counts, RIU status and the bounded-recovery count.
-Recovering any of those means adding observability back and rebuilding: set
-`DEBUG_CSR_ENABLE=1` and drive the debug Wishbone port, or add your own debug
-cores. Either costs timing margin at this clock, so close timing again before
-trusting a run. Capture what you add before resetting a failed board; status
-clears on reset, including internal recovery. BIST and its diagnostics overwrite
-memory.
 
 ## Board-level simulation
 
@@ -127,18 +108,3 @@ Xilinx primitive libraries/global module and the Micron model packages in their
 required order. Use the 8-Gbit x16 model configuration and the intended speed
 selection; see the source and the [generic model setup](../../docs/VERIFICATION.md).
 
-The harness supplies the 200 MHz differential board clock, forces MICRON_SIM
-for shortened simulation initialization/BIST and has a 2 ms simulated-time
-watchdog. Optional diagnostic force macros bypass or alter observations and
-are for isolating a failure, not qualification. The generic root XSim script
-selects `ddr4_sim_top`; it does not automatically build this board-specific
-Clocking Wizard harness.
-
-## Porting or changing the rate
-
-Change the actual generated clocks, RTL timing parameters, memory settings and
-constraints consistently, then repeat implementation and hardware acceptance.
-Do not infer support from parameter arithmetic alone. The dated AXKU3 campaign
-qualified DDR4-1600/1866/2133/2400 and an exploratory 1250 MT/s setting. DDR4-2666
-failed the device pulse-width/minimum-period check despite positive setup/hold
-slack and was not programmed. These are board/device-specific results.
