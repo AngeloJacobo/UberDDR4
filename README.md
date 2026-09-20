@@ -1,4 +1,5 @@
 # UberDDR4
+<img width="4074" height="1784" alt="image" src="https://github.com/user-attachments/assets/2d1730ec-6cde-4817-816b-1b0a4e612953" />
 
 UberDDR4 is an open-source DDR4 SDRAM controller + PHY for FPGAs. The Controller-PHY interface is compliant to DFI v3.1 spec. It connects a
 Wishbone B4 pipelined master to DDR4 memory and handles initialization, command
