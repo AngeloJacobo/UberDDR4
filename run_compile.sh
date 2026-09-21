@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run_compile.sh — UberDDR4 Build & Verification Suite
+# run_compile.sh - UberDDR4 Build & Verification Suite
 #
 # Stages:
 #   lint      Verilator lint (controller, prober, phy, top)
@@ -67,7 +67,7 @@ cleanup() {
     (( CLEANUP_RUNNING )) && return
     CLEANUP_RUNNING=1
     trap '' INT TERM HUP
-    printf "\n\033[31mInterrupted — stopping child process...\033[0m\n"
+    printf "\n\033[31mInterrupted - stopping child process...\033[0m\n"
     if [[ -n "${CHILD_PID:-}" ]]; then
         if $CHILD_HAS_OWN_PG; then
             kill -TERM -- -"$CHILD_PID" 2>/dev/null || true
@@ -89,9 +89,9 @@ cleanup() {
 }
 trap 'cleanup 130' INT TERM HUP
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Configuration
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Fallback is the stock Vivado install location; set XILINX_VIVADO for any
 # other prefix. A missing directory is reported by the simulation stage.
 VIVADO="${XILINX_VIVADO:-/opt/Xilinx/Vivado/2023.1}"
@@ -113,9 +113,9 @@ SIM_TESTS=(
     density_4g row_bits_14 row_bits_17 train_fail csr_reset dm_stress
 )
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Colors & symbols (disabled when not a terminal)
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 if [[ -t 1 ]]; then
     RST='\033[0m'  BLD='\033[1m'  DIM='\033[2m'
     RED='\033[1;31m' GRN='\033[1;32m' YLW='\033[1;33m'
@@ -123,19 +123,19 @@ if [[ -t 1 ]]; then
 else
     RST='' BLD='' DIM='' RED='' GRN='' YLW='' BLU='' CYN='' WHT=''
 fi
-OK="✓"  XF="✗"  SK="○"
+OK="+"  XF="x"  SK="o"
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # State
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 PASS_N=0  FAIL_N=0  SKIP_N=0
 SP=0 SF=0 SS=0
 declare -a SUMMARY=()
 T0=$(date +%s)
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Helpers
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 elapsed() {
     local s=$1
     if   (( s >= 3600 )); then printf "%dh%02dm%02ds" $((s/3600)) $((s%3600/60)) $((s%60))
@@ -189,21 +189,21 @@ banner() {
     branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "n/a")
     ts=$(date "+%Y-%m-%d %H:%M")
     echo
-    printf "${CYN}╔"; printf '═%.0s' $(seq 1 $w); printf "╗${RST}\n"
-    printf "${CYN}║${BLD}${WHT}  %-$((w-2))s  ${CYN}║${RST}\n" "UberDDR4 Build & Verification Suite"
-    printf "${CYN}║${DIM}  %-$((w-2))s  ${CYN}║${RST}\n" "$ts  ·  $branch @ $commit"
-    printf "${CYN}╚"; printf '═%.0s' $(seq 1 $w); printf "╝${RST}\n"
+    printf "${CYN}+"; printf '=%.0s' $(seq 1 $w); printf "+${RST}\n"
+    printf "${CYN}|${BLD}${WHT}  %-$((w-2))s  ${CYN}|${RST}\n" "UberDDR4 Build & Verification Suite"
+    printf "${CYN}|${DIM}  %-$((w-2))s  ${CYN}|${RST}\n" "$ts  .  $branch @ $commit"
+    printf "${CYN}+"; printf '=%.0s' $(seq 1 $w); printf "+${RST}\n"
     echo
 }
 
 header() {
-    printf "\n${BLU}┌──${BLD} Stage %s/%s: %s${RST}\n" "$1" "$2" "$3"
-    printf "${BLU}│${RST}\n"
+    printf "\n${BLU}+--${BLD} Stage %s/%s: %s${RST}\n" "$1" "$2" "$3"
+    printf "${BLU}|${RST}\n"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Parse arguments
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 DO_LINT=false  DO_COMPILE=false  DO_FORMAL=false  DO_SIM=false
 FORMAL_REGR=false  SIM_REGR=false  SIM_TEST="baseline"
 EXPLICIT=false
@@ -244,9 +244,9 @@ $DO_FORMAL  && ((TOTAL++))
 $DO_SIM     && ((TOTAL++))
 STAGE=0
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Tool check
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 check_tools() {
     local ok=true
     local -a required_tools=()
@@ -272,18 +272,18 @@ check_tools() {
     fi
     echo
     local plan=""
-    $DO_LINT    && plan+="lint → "
-    $DO_COMPILE && plan+="compile → "
-    $DO_FORMAL  && { $FORMAL_REGR && plan+="formal-regr → " || plan+="formal → "; }
+    $DO_LINT    && plan+="lint -> "
+    $DO_COMPILE && plan+="compile -> "
+    $DO_FORMAL  && { $FORMAL_REGR && plan+="formal-regr -> " || plan+="formal -> "; }
     $DO_SIM     && { $SIM_REGR && plan+="sim-regr (${#SIM_TESTS[@]} tests)" || plan+="sim ($SIM_TEST)"; }
-    plan="${plan% → }"
+    plan="${plan% -> }"
     printf "  ${BLD}Stages:${RST} %s\n\n" "$plan"
     $ok || { printf "${RED}  Missing required tools. Aborting.${RST}\n"; exit 1; }
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Stage 1: Verilator Lint
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 generate_stubs() {
     mkdir -p "$LOGDIR"
     local stubs="$LOGDIR/.xilinx_stubs.v"
@@ -374,12 +374,33 @@ run_lint() {
             show_errors "$log"
         fi
     done
+
+    # Non-ASCII bytes are what silently become mojibake when an editor or a
+    # script guesses the wrong encoding, and the damage is easy to miss in
+    # review because it usually lands in comments or printed strings. Keeping
+    # every tracked source plain ASCII means there is nothing to misread.
+    # Tabs and newlines are allowed; -I skips binary files.
+    local at0 at1 offenders
+    at0=$(date +%s)
+    offenders=$(LC_ALL=C grep -lI $'[^\t -~]' $(git ls-files 2>/dev/null) 2>/dev/null || true)
+    at1=$(date +%s)
+    if [[ -z "$offenders" ]]; then
+        pass "ASCII-only sources" "$(elapsed $((at1-at0)))"
+    else
+        fail "ASCII-only sources" "$(elapsed $((at1-at0)))"
+        local f2
+        for f2 in $offenders; do
+            printf "    ${DIM}%s${RST}\n" "$f2"
+            LC_ALL=C grep -n $'[^\t -~]' "$f2" | head -3 | sed 's/^/      /'
+        done
+    fi
+
     stage_record "Lint"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Stage 2: Compile Checks
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 run_compile() {
     ((STAGE++))
     stage_reset
@@ -389,7 +410,7 @@ run_compile() {
     local stubs="$LOGDIR/.xilinx_stubs.v"
     local log t0 t1
 
-    # ── Iverilog ──
+    # -- Iverilog --
     log="$LOGDIR/compile_iverilog.log"
     t0=$(date +%s)
     if iverilog -g2012 -Wall -t null \
@@ -403,7 +424,7 @@ run_compile() {
         show_errors "$log"
     fi
 
-    # ── Yosys ──
+    # -- Yosys --
     log="$LOGDIR/compile_yosys.log"
     t0=$(date +%s)
     local yosys_script="read_verilog -sv $stubs"
@@ -421,19 +442,19 @@ run_compile() {
     stage_record "Compile"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Stage 3: Formal Verification
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 run_formal() {
     ((STAGE++))
     stage_reset
     local sby_file label
     if $FORMAL_REGR; then
         sby_file="formal/ddr4_multiconfig.sby"
-        label="Formal Verification (regression — 28 tasks)"
+        label="Formal Verification (regression - 28 tasks)"
     else
         sby_file="formal/ddr4_singleconfig.sby"
-        label="Formal Verification (single — 4 tasks)"
+        label="Formal Verification (single - 4 tasks)"
     fi
     header "$STAGE" "$TOTAL" "$label"
 
@@ -476,17 +497,17 @@ run_formal() {
     stage_record "Formal"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Stage 4: Simulation
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 
 # regression_test.sh renames each finished log to PASS_<test>.log or
 # FAIL_<test>.log, so its log directory holds the per-test verdicts that its
 # own stdout shows.  Reading it is how this script learns them: the regression
 # runs as a directly tracked child writing to the terminal, not through a pipe
 # this script could parse.  A log older than the marker file is left over from
-# an earlier run—the suite refused to start, or aborted before reaching that
-# test—and counts as not run.
+# an earlier run-the suite refused to start, or aborted before reaching that
+# test-and counts as not run.
 REGR_PASS=0 REGR_FAIL=0 REGR_SKIP=0
 count_regression_results() {
     local marker="$1" dir="$SCRIPT_DIR/testbench/regression_logs" name
@@ -520,7 +541,7 @@ run_sim() {
         st0=$(date +%s)
 
         # regression_test.sh owns the simulator lifecycle and renders its own
-        # progress.  Keep it as one directly tracked child—no coprocess or tee.
+        # progress.  Keep it as one directly tracked child-no coprocess or tee.
         bash "$SCRIPT_DIR/testbench/regression_test.sh" &
         CHILD_PID=$!
         CHILD_HAS_OWN_PG=false
@@ -556,7 +577,7 @@ run_sim() {
             fi
         done
         if (( idx < 0 )); then
-            fail "$SIM_TEST (unknown test — see --help)" ""
+            fail "$SIM_TEST (unknown test - see --help)" ""
             stage_record "Sim"
             return
         fi
@@ -588,9 +609,9 @@ run_sim() {
     stage_record "Sim"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Summary
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 print_summary() {
     local t1 total_time total overall w=66
     t1=$(date +%s)
@@ -598,15 +619,15 @@ print_summary() {
     total=$((PASS_N + FAIL_N + SKIP_N))
 
     echo
-    printf "${WHT}"; printf '═%.0s' $(seq 1 $w); printf "${RST}\n"
+    printf "${WHT}"; printf '=%.0s' $(seq 1 $w); printf "${RST}\n"
     printf "${BLD}${WHT}  RESULTS SUMMARY${RST}\n"
-    printf "${WHT}"; printf '═%.0s' $(seq 1 $w); printf "${RST}\n"
+    printf "${WHT}"; printf '=%.0s' $(seq 1 $w); printf "${RST}\n"
 
     for line in "${SUMMARY[@]}"; do
         printf "%b\n" "$line"
     done
 
-    printf "${DIM}"; printf '─%.0s' $(seq 1 $w); printf "${RST}\n"
+    printf "${DIM}"; printf -- '-%.0s' $(seq 1 $w); printf "${RST}\n"
 
     if (( FAIL_N > 0 )); then overall="${RED}FAIL${RST}"
     else                       overall="${GRN}PASS${RST}"
@@ -614,14 +635,14 @@ print_summary() {
     printf "  ${BLD}%-14s %2d pass  %2d fail  %2d skip       %b${RST}  ${DIM}%s${RST}\n" \
            "TOTAL" "$PASS_N" "$FAIL_N" "$SKIP_N" "$overall" "$(elapsed $total_time)"
 
-    printf "${WHT}"; printf '═%.0s' $(seq 1 $w); printf "${RST}\n"
+    printf "${WHT}"; printf '=%.0s' $(seq 1 $w); printf "${RST}\n"
     printf "  ${DIM}Logs: %s/${RST}\n" "$LOGDIR"
     echo
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Main
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 banner
 check_tools
 

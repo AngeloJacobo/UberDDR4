@@ -106,8 +106,8 @@ before hardware use. Do not rebuild just to reconnect or reboot.
 
 ### Everything in one command
 
-`all` runs the six steps above in order — setup, test, build, payload,
-synthesize, implement — and stops at the first failure:
+`all` runs the six steps above in order - setup, test, build, payload,
+synthesize, implement - and stops at the first failure:
 
 ```sh
 ./uberddr4.sh all
@@ -126,7 +126,7 @@ every step.
 The payload is generated before synthesis, so a bad configuration surfaces in
 seconds rather than after the long runs. Expect a few hours on the test laptop,
 almost all of it Vivado. Each step prints `ALL_STEP:` with the command it is
-about to run; success ends with `ALL_PASS`. `all` does not touch the board —
+about to run; success ends with `ALL_PASS`. `all` does not touch the board -
 run `boot` afterwards.
 
 ## Boot and use Linux

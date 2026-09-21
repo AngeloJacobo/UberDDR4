@@ -72,7 +72,7 @@ module ddr4_prober #(
     (* mark_debug = "true" *) output wire                     o_bist_busy,        // High while BIST FSM is actively issuing/checking memory transactions
     (* mark_debug = "true" *) output reg                      o_bist_failed_reset_req,   // Auto-reset request: asserted after BIST fail when CSR auto_reset_en is set
     (* mark_debug = "true" *) output reg                      o_soft_reset_req,   // CSR-triggered one-shot: resets controller + PHY to re-run full calibration
-    // Wishbone B4 Master — BIST drives this to issue R/W to the DDR4 controller
+    // Wishbone B4 Master - BIST drives this to issue R/W to the DDR4 controller
     output reg                      o_wb_cyc,           // Bus cycle active (held high for entire BIST transaction burst)
     output reg                      o_wb_stb,           // Strobe: valid request on addr/data/we this cycle
     output reg                      o_wb_we,            // Write enable: 1=write, 0=read
@@ -82,7 +82,7 @@ module ddr4_prober #(
     input  wire                     i_wb_stall,         // Backpressure from controller: request not accepted this cycle
     input  wire                     i_wb_ack,           // Acknowledge: returned read data or controller write completion; not DRAM readback
     input  wire [WB_DATA_BITS-1:0]  i_wb_data,          // Read data returned by controller
-    // Wishbone B4 — Debug CSR port (pipelined, zero-wait-state, independent of DRAM path)
+    // Wishbone B4 - Debug CSR port (pipelined, zero-wait-state, independent of DRAM path)
     input  wire                     i_wb_dbg_cyc,       // CSR bus cycle
     input  wire                     i_wb_dbg_stb,       // CSR strobe
     input  wire                     i_wb_dbg_we,        // CSR write enable
@@ -99,7 +99,7 @@ module ddr4_prober #(
     (* mark_debug = "true" *) input  wire                     i_stage1_pending,   // A new WB request is latched, waiting for stage 2
     (* mark_debug = "true" *) input  wire                     i_stage2_pending,   // A decoded request is being scheduled (issuing PRE/ACT/RD/WR)
     (* mark_debug = "true" *) input  wire                     i_stage2_we,        // Stage 2 request type: 1=write, 0=read
-    (* mark_debug = "true" *) input  wire                     i_refresh_idle,     // Refresh timer in idle countdown — scheduler free to issue user commands
+    (* mark_debug = "true" *) input  wire                     i_refresh_idle,     // Refresh timer in idle countdown - scheduler free to issue user commands
     (* mark_debug = "true" *) input  wire [NUM_BANKS-1:0]     i_bank_status,      // Per-bank status: 1=row open (active), 0=precharged (idle)
     // Status from PHY (flat packed, exposed via CSR for training debug)
     (* mark_debug = "true" *) input  wire [3:0]               i_phy_state,        // PHY training FSM state (0=IDLE, 1=GATE_DONE, 7=EYE_DONE, 11=WL_DONE; PHY-specific others)
@@ -130,7 +130,9 @@ module ddr4_prober #(
     (* mark_debug = "true" *) output reg  [8:0]               o_phy_tx_diag_tap,
     (* mark_debug = "true" *) input  wire                     i_phy_tx_diag_ack,
     (* mark_debug = "true" *) input  wire                     i_phy_tx_diag_error,
+    /* verilator lint_off UNUSEDSIGNAL */
     (* mark_debug = "true" *) input  wire [8:0]               i_phy_tx_diag_current_tap,
+    /* verilator lint_on UNUSEDSIGNAL */
     (* mark_debug = "true" *) input  wire [8:0]               i_phy_tx_diag_previous_tap
 );
 
@@ -143,11 +145,14 @@ module ddr4_prober #(
     // and preserve the CSR interface unchanged. Each generated lane appears
     // in ILA as gen_phy_lane_debug[n].<signal>.
     // -----------------------------------------------------------------
+    /* verilator lint_off UNUSEDSIGNAL */
     (* mark_debug = "true" *) wire [BYTE_LANES-1:0] phy_train_fail_eye = i_phy_train_fail[2*BYTE_LANES-1:BYTE_LANES];
     (* mark_debug = "true" *) wire [BYTE_LANES-1:0] phy_train_fail_wl = i_phy_train_fail[3*BYTE_LANES-1:2*BYTE_LANES];
+    /* verilator lint_on UNUSEDSIGNAL */
 
     generate
         genvar dbg_lane;
+        /* verilator lint_off UNUSEDSIGNAL */
         for (dbg_lane = 0; dbg_lane < BYTE_LANES; dbg_lane = dbg_lane + 1) begin : gen_phy_lane_debug
             (* mark_debug = "true" *) wire [8:0] phy_idelay_center_lane = i_phy_idelay_center[dbg_lane*9 +: 9];
             (* mark_debug = "true" *) wire [8:0] phy_wl_dqs_tap_lane    = i_phy_wl_tap[dbg_lane*9 +: 9];
@@ -157,6 +162,7 @@ module ddr4_prober #(
             (* mark_debug = "true" *) wire [8:0] phy_eye_start_lane     = i_phy_best_start[dbg_lane*9 +: 9];
             (* mark_debug = "true" *) wire [3:0] phy_bitslip_lane       = i_phy_bitslip[dbg_lane*4 +: 4];
             (* mark_debug = "true" *) wire       phy_rd_lat_extra_lane  = i_phy_rd_lat_extra[dbg_lane];
+        /* verilator lint_on UNUSEDSIGNAL */
         end
     endgenerate
 
@@ -180,8 +186,8 @@ module ddr4_prober #(
     //   0 = disabled (BIST does not run)
     //   1 = partitioned: phase input counters cover contiguous, non-overlapping
     //       slices; stress_addr() remaps them, so physical regions can overlap
-    //       (burst: 0→BURST_END, random: BURST_END+1→RANDOM_END,
-    //        alt: RANDOM_END+1→ALT_END)
+    //       (burst: 0->BURST_END, random: BURST_END+1->RANDOM_END,
+    //        alt: RANDOM_END+1->ALT_END)
     //   2 = full-range: every phase independently covers the entire
     //       address space starting from 0
     //
@@ -207,8 +213,8 @@ module ddr4_prober #(
 
     localparam BIST_ADDR_BITS = MICRON_SIM ? 10 : WB_ADDR_BITS;
     // Phase end addresses:
-    //   Mode 1: partitioned — burst gets 1/4, random gets 1/2, alt gets 1/4
-    //   Mode 2: full-range  — all three END values equal the max address
+    //   Mode 1: partitioned - burst gets 1/4, random gets 1/2, alt gets 1/4
+    //   Mode 2: full-range  - all three END values equal the max address
     localparam [BIST_ADDR_BITS-1:0] BURST_END  = {{2{BIST_MODE[1]}}, {(BIST_ADDR_BITS-2){1'b1}}};
     localparam [BIST_ADDR_BITS-1:0] RANDOM_END = {1'b1, BIST_MODE[1], {(BIST_ADDR_BITS-2){1'b1}}};
     localparam [BIST_ADDR_BITS-1:0] ALT_END    = {BIST_ADDR_BITS{1'b1}};
@@ -352,10 +358,12 @@ module ddr4_prober #(
         // is within the first two 32-bit UI words, so retain a compact view of
         // that exact first-failure mask alongside the complete CSR/debug copy.
         // This alias is diagnostic-only and has no functional fanout.
+        /* verilator lint_off UNUSEDSIGNAL */
         (* mark_debug = "true" *) wire [63:0]
             dbg_diag_first_bad_xor_low64 = diag_first_bad_xor[63:0];
         (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
             diag_retry_last_xor;
+        /* verilator lint_on UNUSEDSIGNAL */
         (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
             diag_retry_xor_or;
         (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
@@ -368,8 +376,10 @@ module ddr4_prober #(
         (* mark_debug = "true" *) reg [5:0] diag_post_reads_returned;
         (* mark_debug = "true" *) reg [5:0] diag_post_match_count;
         (* mark_debug = "true" *) reg [5:0] diag_post_mismatch_count;
+        /* verilator lint_off UNUSEDSIGNAL */
         (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
             diag_post_last_xor;
+        /* verilator lint_on UNUSEDSIGNAL */
         (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
             diag_post_xor_or;
         (* mark_debug = "true" *) reg [WB_DATA_BITS-1:0]
@@ -409,7 +419,9 @@ module ddr4_prober #(
         reg [6:0] diag_stream_target_index;
         (* mark_debug = "true" *) reg [6:0]
             diag_stream_writes_accepted;
+        /* verilator lint_off UNUSEDSIGNAL */
         (* mark_debug = "true" *) reg diag_stream_target_seen;
+        /* verilator lint_on UNUSEDSIGNAL */
         (* mark_debug = "true" *) reg [5:0] diag_stream_reads_issued;
         (* mark_debug = "true" *) reg [5:0] diag_stream_reads_returned;
         (* mark_debug = "true" *) reg [5:0] diag_stream_match_count;
@@ -421,15 +433,19 @@ module ddr4_prober #(
         // 0,8,...,504,511.  The native PHY performs every intermediate <=8
         // tap VAR_LOAD step and returns the pre-sweep BISC-maintained value so
         // it can be restored after measurement.
+        /* verilator lint_off UNUSEDSIGNAL */
         (* mark_debug = "true" *) reg [7:0] diag_tx_eye_bad_data_bit;
+        /* verilator lint_on UNUSEDSIGNAL */
         (* mark_debug = "true" *) reg [7:0] diag_tx_eye_dq;
         (* mark_debug = "true" *) reg [6:0] diag_tx_eye_sample;
         (* mark_debug = "true" *) reg [64:0] diag_tx_eye_pass_map;
         (* mark_debug = "true" *) reg [6:0] diag_tx_eye_pass_count;
         (* mark_debug = "true" *) reg [8:0] diag_tx_eye_baseline_tap;
         (* mark_debug = "true" *) reg diag_tx_eye_baseline_valid;
+        /* verilator lint_off UNUSEDSIGNAL */
         (* mark_debug = "true" *) reg [8:0] diag_tx_eye_first_pass;
         (* mark_debug = "true" *) reg [8:0] diag_tx_eye_last_pass;
+        /* verilator lint_on UNUSEDSIGNAL */
         (* mark_debug = "true" *) reg diag_tx_eye_pass_found;
         (* mark_debug = "true" *) reg diag_tx_eye_bad_seen;
         (* mark_debug = "true" *) reg [BIST_TX_EYE_COUNT_BITS-1:0]
@@ -440,8 +456,10 @@ module ddr4_prober #(
             diag_tx_eye_reads_returned;
         reg [WB_ADDR_BITS-1:0] diag_tx_eye_base_wb_addr;
         (* mark_debug = "true" *) reg diag_tx_eye_restore_pending;
+        /* verilator lint_off UNUSEDSIGNAL */
         (* mark_debug = "true" *) reg diag_tx_eye_update_error;
         (* mark_debug = "true" *) reg diag_tx_eye_done;
+        /* verilator lint_on UNUSEDSIGNAL */
         // Scan the 64 uniformly spaced samples twice to find a passing
         // interval that wraps through tap 511/0.  The resulting correction
         // is retained per physical DQ and validated by restarting the entire
@@ -554,11 +572,13 @@ module ddr4_prober #(
                 for (ui_index = 0;
                      ui_index < (WB_DATA_BITS / PHYSICAL_DQ_BITS);
                      ui_index = ui_index + 1) begin
+                    /* verilator lint_off WIDTHEXPAND */
                     if (actual_data[ui_index*PHYSICAL_DQ_BITS +
                                     physical_dq] !=
                         expected_word[ui_index*PHYSICAL_DQ_BITS +
                                       physical_dq])
                         physical_dq_read_mismatch = 1'b1;
+                    /* verilator lint_on WIDTHEXPAND */
                 end
             end
         endfunction
@@ -567,8 +587,10 @@ module ddr4_prober #(
             input [6:0] best_end;
             input [6:0] best_run;
             input [8:0] fallback_tap;
+            /* verilator lint_off UNUSEDSIGNAL */
             reg [6:0] start_sample;
             reg [6:0] run_minus_one;
+            /* verilator lint_on UNUSEDSIGNAL */
             reg [8:0] start_tap;
             reg [8:0] span_taps;
             begin
@@ -597,14 +619,22 @@ module ddr4_prober #(
                 // physical DQ across every full-BIST retry:
                 // center, +1, -1, +2, -2, ... , +256.  This is exhaustive,
                 // bounded, and independent of device/board tap calibration.
+                //
+                // The 9-bit result deliberately truncates the 10-bit sum and
+                // difference below: that wrap is the modulo-512 arithmetic the
+                // circular order is built on, so ranks 0..511 visit each tap
+                // once. Widening either expression breaks the enumeration,
+                // which is why the WIDTHTRUNC pragma below is deliberate.
                 if (retry_rank == 0)
                     tx_eye_candidate_from_seed = seed_tap;
+                /* verilator lint_off WIDTHTRUNC */
                 else if (retry_rank[0])
                     tx_eye_candidate_from_seed = seed_tap +
                         ((retry_rank + 1'b1) >> 1);
                 else
                     tx_eye_candidate_from_seed = seed_tap -
                         (retry_rank >> 1);
+                /* verilator lint_on WIDTHTRUNC */
             end
         endfunction
 
@@ -911,10 +941,12 @@ module ddr4_prober #(
                             diag_tx_eye_reads_returned + 1'b1;
                         if (physical_dq_read_mismatch(
                                 i_wb_data,
+                                /* verilator lint_off WIDTHEXPAND */
                                 tx_eye_pattern(
                                     diag_tx_eye_base_wb_addr[
                                         BIST_ADDR_BITS-1:0] +
                                     diag_tx_eye_reads_returned,
+                                /* verilator lint_on WIDTHEXPAND */
                                     diag_tx_eye_reads_returned),
                                 diag_tx_eye_dq))
                             diag_tx_eye_bad_seen <= 1'b1;
@@ -1004,12 +1036,15 @@ module ddr4_prober #(
                         // center-out tap; it still has to survive the complete
                         // BIST before init_done is allowed. An as-yet untuned
                         // DQ follows the full classification/measurement path.
+                        /* verilator lint_off WIDTHTRUNC */
                         if (diag_tx_eye_tuned_mask[diag_tx_eye_dq]) begin
+                        /* verilator lint_on WIDTHTRUNC */
                             diag_running <= 1'b1;
                             diag_tx_eye_done <= 1'b0;
                             diag_tx_eye_update_error <= 1'b0;
                             diag_tx_eye_restore_pending <= 1'b0;
                             o_phy_tx_diag_dq <= diag_tx_eye_dq;
+                            /* verilator lint_off WIDTHTRUNC */
                             if (diag_tx_eye_retry_rank[diag_tx_eye_dq] <
                                 10'd511) begin
                                 diag_tx_eye_retry_rank[diag_tx_eye_dq] <=
@@ -1030,6 +1065,7 @@ module ddr4_prober #(
                                             diag_tx_eye_dq],
                                         diag_tx_eye_retry_rank[
                                             diag_tx_eye_dq] + 1'b1);
+                            /* verilator lint_on WIDTHTRUNC */
                                 o_phy_tx_diag_req <= 1'b1;
                                 diag_phase <= DIAG_TX_EYE_APPLY_REQUEST;
                             end else begin
@@ -1038,15 +1074,19 @@ module ddr4_prober #(
                                 // genuinely exhaustive failure.
                                 diag_tx_eye_retry_rank_current <= 10'd512;
                                 diag_tx_eye_restore_pending <= 1'b1;
+                                /* verilator lint_off WIDTHTRUNC */
                                 o_phy_tx_diag_tap <=
                                     diag_tx_eye_original_tap[
                                         diag_tx_eye_dq];
+                                /* verilator lint_on WIDTHTRUNC */
                                 o_phy_tx_diag_req <= 1'b1;
                                 diag_phase <= DIAG_TX_EYE_REQUEST;
                             end
                         end else begin
+                            /* verilator lint_off WIDTHTRUNC */
                             diag_tx_eye_retry_rank_current <=
                                 diag_tx_eye_retry_rank[diag_tx_eye_dq];
+                            /* verilator lint_on WIDTHTRUNC */
                             diag_running <= 1'b1;
                             diag_phase <= DIAG_REREAD_ORIGINAL;
                             diag_rewrite_accepted <= 1'b0;
@@ -1109,12 +1149,14 @@ module ddr4_prober #(
                             if (o_wb_stb && !i_wb_stall) begin
                                 diag_reads_issued <=
                                     diag_reads_issued + 1'b1;
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (diag_reads_issued == BIST_DIAG_READS-1)
                                     o_wb_stb <= 1'b0;
                             end
                             if ((diag_reads_issued == BIST_DIAG_READS) &&
                                 (diag_reads_returned == BIST_DIAG_READS) &&
                                 (outstanding == 0)) begin
+                                /* verilator lint_on WIDTHEXPAND */
                                 o_wb_stb <= 1'b1;
                                 if (diag_control_valid) begin
                                     diag_phase <= DIAG_REREAD_CONTROL;
@@ -1138,6 +1180,7 @@ module ddr4_prober #(
                             if (o_wb_stb && !i_wb_stall) begin
                                 diag_control_reads_issued <=
                                     diag_control_reads_issued + 1'b1;
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (diag_control_reads_issued ==
                                     BIST_DIAG_READS-1)
                                     o_wb_stb <= 1'b0;
@@ -1147,6 +1190,7 @@ module ddr4_prober #(
                                 (diag_control_reads_returned ==
                                  BIST_DIAG_READS) &&
                                 (outstanding == 0)) begin
+                                /* verilator lint_on WIDTHEXPAND */
                                 diag_phase <= DIAG_REWRITE;
                                 diag_rewrite_accepted <= 1'b0;
                                 o_wb_stb <= 1'b1;
@@ -1191,6 +1235,7 @@ module ddr4_prober #(
                             if (o_wb_stb && !i_wb_stall) begin
                                 diag_post_reads_issued <=
                                     diag_post_reads_issued + 1'b1;
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (diag_post_reads_issued ==
                                     BIST_DIAG_READS-1)
                                     o_wb_stb <= 1'b0;
@@ -1198,6 +1243,7 @@ module ddr4_prober #(
                             if ((diag_post_reads_issued == BIST_DIAG_READS) &&
                                 (diag_post_reads_returned == BIST_DIAG_READS) &&
                                 (outstanding == 0)) begin
+                                /* verilator lint_on WIDTHEXPAND */
                                 // Keep ownership and follow the proven
                                 // isolated transaction with a continuous write
                                 // stream.  Starting with STB Low gives the
@@ -1229,26 +1275,32 @@ module ddr4_prober #(
                                     diag_stream_target_index)
                                     diag_stream_target_seen <= 1'b1;
 
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (diag_stream_writes_accepted ==
                                     BIST_DIAG_STREAM_WRITES-1) begin
                                     o_wb_stb <= 1'b0;
                                 end else begin
                                     o_wb_addr <= diag_stream_base_wb_addr +
                                         diag_stream_writes_accepted + 1'b1;
+                                /* verilator lint_on WIDTHEXPAND */
                                     if ((diag_stream_writes_accepted + 1'b1) ==
                                         diag_stream_target_index)
                                         o_wb_data <= diag_expected_data;
-                                    else if ((diag_stream_writes_accepted +
-                                              1'b1) & 1'b1)
+                                    // Alternate all-zero and all-one words by
+                                    // index parity. The next index is odd
+                                    // exactly when this one is even.
+                                    else if (!diag_stream_writes_accepted[0])
                                         o_wb_data <= {WB_DATA_BITS{1'b0}};
                                     else
                                         o_wb_data <= {WB_DATA_BITS{1'b1}};
                                 end
                             end
 
+                            /* verilator lint_off WIDTHEXPAND */
                             if ((diag_stream_writes_accepted ==
                                  BIST_DIAG_STREAM_WRITES) &&
                                 (outstanding == 0) && !o_wb_stb) begin
+                            /* verilator lint_on WIDTHEXPAND */
                                 diag_phase <= DIAG_REREAD_STREAM;
                                 diag_stream_reads_issued <= 6'd0;
                                 diag_stream_reads_returned <= 6'd0;
@@ -1269,6 +1321,7 @@ module ddr4_prober #(
                             if (o_wb_stb && !i_wb_stall) begin
                                 diag_stream_reads_issued <=
                                     diag_stream_reads_issued + 1'b1;
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (diag_stream_reads_issued ==
                                     BIST_DIAG_READS-1)
                                     o_wb_stb <= 1'b0;
@@ -1278,6 +1331,7 @@ module ddr4_prober #(
                                 (diag_stream_reads_returned ==
                                  BIST_DIAG_READS) &&
                                 (outstanding == 0)) begin
+                                /* verilator lint_on WIDTHEXPAND */
                                 o_wb_stb <= 1'b0;
                                 if (i_phy_tx_diag_supported) begin
                                     // Begin at absolute tap zero.  The PHY
@@ -1343,11 +1397,13 @@ module ddr4_prober #(
                                         diag_tx_eye_baseline_tap <=
                                             i_phy_tx_diag_previous_tap;
                                         diag_tx_eye_baseline_valid <= 1'b1;
+                                        /* verilator lint_off WIDTHTRUNC */
                                         if (!diag_tx_eye_tuned_mask[
                                                 diag_tx_eye_dq])
                                             diag_tx_eye_original_tap[
                                                 diag_tx_eye_dq] <=
                                                 i_phy_tx_diag_previous_tap;
+                                        /* verilator lint_on WIDTHTRUNC */
                                     end
                                     diag_tx_eye_writes_accepted <=
                                         {BIST_TX_EYE_COUNT_BITS{1'b0}};
@@ -1379,27 +1435,33 @@ module ddr4_prober #(
                                 diag_tx_eye_writes_accepted <=
                                     diag_tx_eye_writes_accepted + 1'b1;
 
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (diag_tx_eye_writes_accepted ==
                                     BIST_TX_EYE_WORDS-1) begin
                                     o_wb_stb <= 1'b0;
                                 end else begin
                                     o_wb_addr <= diag_tx_eye_base_wb_addr +
                                         diag_tx_eye_writes_accepted + 1'b1;
+                                /* verilator lint_on WIDTHEXPAND */
                                     // Preserve both calibration pattern
                                     // classes at separate addresses so every
                                     // returned word remains independently
                                     // checkable.
+                                    /* verilator lint_off WIDTHEXPAND */
                                     o_wb_data <= tx_eye_pattern(
                                         diag_tx_eye_base_wb_addr[
                                             BIST_ADDR_BITS-1:0] +
                                         diag_tx_eye_writes_accepted + 1'b1,
+                                    /* verilator lint_on WIDTHEXPAND */
                                         diag_tx_eye_writes_accepted + 1'b1);
                                 end
                             end
 
+                            /* verilator lint_off WIDTHEXPAND */
                             if ((diag_tx_eye_writes_accepted ==
                                  BIST_TX_EYE_WORDS) &&
                                 (outstanding == 0) && !o_wb_stb) begin
+                            /* verilator lint_on WIDTHEXPAND */
                                 diag_tx_eye_reads_issued <=
                                     {BIST_TX_EYE_COUNT_BITS{1'b0}};
                                 diag_tx_eye_reads_returned <=
@@ -1417,6 +1479,7 @@ module ddr4_prober #(
                             if (o_wb_stb && !i_wb_stall) begin
                                 diag_tx_eye_reads_issued <=
                                     diag_tx_eye_reads_issued + 1'b1;
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (diag_tx_eye_reads_issued ==
                                     BIST_TX_EYE_WORDS-1)
                                     o_wb_stb <= 1'b0;
@@ -1430,6 +1493,7 @@ module ddr4_prober #(
                                 (diag_tx_eye_reads_returned ==
                                  BIST_TX_EYE_WORDS) &&
                                 (outstanding == 0)) begin
+                                /* verilator lint_on WIDTHEXPAND */
                                 diag_tx_eye_pass_map[diag_tx_eye_sample] <=
                                     !diag_tx_eye_bad_seen;
                                 if (!diag_tx_eye_bad_seen) begin
@@ -1478,8 +1542,10 @@ module ddr4_prober #(
                             if (diag_tx_eye_scan_index == 8'd128) begin
                                 diag_phase <= DIAG_TX_EYE_FINALIZE;
                             end else begin
+                                /* verilator lint_off WIDTHEXPAND */
                                 if (diag_tx_eye_pass_map[
                                         diag_tx_eye_scan_index[5:0]]) begin
+                                /* verilator lint_on WIDTHEXPAND */
                                     if (diag_tx_eye_scan_run < 7'd64)
                                         diag_tx_eye_scan_run <=
                                             diag_tx_eye_scan_run + 1'b1;
@@ -1509,18 +1575,22 @@ module ddr4_prober #(
                                 // BISC value before reporting a genuine,
                                 // bounded uncorrectable failure.
                                 diag_tx_eye_restore_pending <= 1'b1;
+                                /* verilator lint_off WIDTHTRUNC */
                                 o_phy_tx_diag_tap <=
                                     diag_tx_eye_original_tap[
                                         diag_tx_eye_dq];
+                                /* verilator lint_on WIDTHTRUNC */
                                 o_phy_tx_diag_req <= 1'b1;
                                 diag_phase <= DIAG_TX_EYE_REQUEST;
                             end else begin
+                                /* verilator lint_off WIDTHTRUNC */
                                 if (!diag_tx_eye_tuned_mask[
                                         diag_tx_eye_dq]) begin
                                     diag_tx_eye_seed_tap[
                                         diag_tx_eye_dq] <=
                                         tx_eye_seed_from_run(
                                             diag_tx_eye_best_end,
+                                /* verilator lint_on WIDTHTRUNC */
                                             diag_tx_eye_best_run,
                                             diag_tx_eye_baseline_tap);
                                     diag_tx_eye_center_tap <=
@@ -1531,10 +1601,12 @@ module ddr4_prober #(
                                                 diag_tx_eye_baseline_tap),
                                             diag_tx_eye_retry_rank_current);
                                 end else begin
+                                    /* verilator lint_off WIDTHTRUNC */
                                     diag_tx_eye_center_tap <=
                                         tx_eye_candidate_from_seed(
                                             diag_tx_eye_seed_tap[
                                                 diag_tx_eye_dq],
+                                    /* verilator lint_on WIDTHTRUNC */
                                             diag_tx_eye_retry_rank_current);
                                 end
                                 // The sweep ended at tap 511. Cross the
@@ -1567,8 +1639,10 @@ module ddr4_prober #(
                                     // its independent eye measurement; a
                                     // failure on this DQ rejects this tap and
                                     // advances its bounded candidate rank.
+                                    /* verilator lint_off WIDTHTRUNC */
                                     diag_tx_eye_tuned_mask[
                                         diag_tx_eye_dq] <= 1'b1;
+                                    /* verilator lint_on WIDTHTRUNC */
                                     diag_tx_eye_done <= 1'b1;
                                     diag_running <= 1'b0;
                                     diag_pending <= 1'b0;
@@ -1713,7 +1787,7 @@ module ddr4_prober #(
                                 // -- Per-byte-lane data-mask stress test --
                                 // Each address is written WB_SEL_BITS times (once per byte
                                 // lane). Only one byte lane is enabled per write (one-hot
-                                // o_wb_sel). Unselected bytes carry 0xAA on the bus — if
+                                // o_wb_sel). Unselected bytes carry 0xAA on the bus - if
                                 // the data mask fails, 0xAA will corrupt the location and
                                 // be caught during read-back.
                                 //
@@ -1724,7 +1798,7 @@ module ddr4_prober #(
                                 // Real pattern byte at active lane, 0xAA everywhere else
                                 o_wb_data <= dm_pattern(write_addr, write_byte_counter + 1'b1);
 
-                                // All byte lanes done for this address — advance to next
+                                // All byte lanes done for this address - advance to next
                                 if (write_byte_counter == {$clog2(WB_SEL_BITS){1'b1}}) begin
                                     write_addr <= write_addr + 1'b1;
                                     o_wb_addr  <= write_addr + 1'b1;
@@ -1894,7 +1968,7 @@ module ddr4_prober #(
                         end
                     end
 
-                    // Terminal state — stays here until retriggered.
+                    // Terminal state - stays here until retriggered.
                     BIST_DONE: begin
                         if (bist_start_any) begin
                             bist_state <= BIST_IDLE;

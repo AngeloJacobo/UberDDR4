@@ -161,7 +161,7 @@ module ddr4_phy #(
 
     // -----------------------------------------------------------------
     // ODELAYE3/IDELAYE3 delay configuration (all in TIME mode, ps units)
-    // DQS ODELAYE3 adds DDR4_CLK_PERIOD/4 ps = 90° phase shift so DQS
+    // DQS ODELAYE3 adds DDR4_CLK_PERIOD/4 ps = 90 deg phase shift so DQS
     // edges are centered in the DQ data eye at the DRAM receiver.
     // IODELAY BISC (Built-In Self-Calibration) converts the ps value to taps
     // automatically at power-up (UG571, DELAY_FORMAT=TIME section).
@@ -215,11 +215,11 @@ module ddr4_phy #(
     // -----------------------------------------------------------------
     // DFI Data Layout
     //
-    // The DFI interface carries 4 phases × 2 edges (rise+fall) of data
+    // The DFI interface carries 4 phases x 2 edges (rise+fall) of data
     // per controller clock. Each edge transfers TOTAL_DQ bits in parallel
     // -----------------------------------------------------------------
     localparam TOTAL_DQ      = DQ_BITS * BYTE_LANES;  // DQ bits per clock edge (= half of DFI_DATA_WIDTH)
-    localparam DM_PER_PHASE  = 2 * BYTE_LANES;       // DM bits per DFI phase: 1 per lane × 2 edges
+    localparam DM_PER_PHASE  = 2 * BYTE_LANES;       // DM bits per DFI phase: 1 per lane x 2 edges
     localparam DM_ENABLED    = (DEVICE_WIDTH != 4);   // x4 has no DM pin (JESD79-4D Table 28)
 
     // -----------------------------------------------------------------
@@ -471,7 +471,7 @@ module ddr4_phy #(
     endgenerate
 
     // Control pins: CS_n, ACT_n, CKE, ODT, RESET_n
-    // Each is a single-bit signal with 4 DFI phases → one OSERDES each.
+    // Each is a single-bit signal with 4 DFI phases -> one OSERDES each.
     generate
         genvar cpin;
         for (cpin = 0; cpin < 5; cpin = cpin + 1) begin : gen_ctrl
@@ -515,11 +515,11 @@ module ddr4_phy #(
     //
     // PURPOSE: DQ/DQS are bidirectional pins. They must be high-Z when
     // not writing, otherwise the PHY and DRAM would fight on reads.
-    // OSERDESE3 T pin controls this: T=1 → high-Z (off), T=0 → driven.
+    // OSERDESE3 T pin controls this: T=1 -> high-Z (off), T=0 -> driven.
     //
     // HOW IT WORKS:
     //
-    // 1) wrdata_en_any = OR of all 4 DFI phase enables → collapses to
+    // 1) wrdata_en_any = OR of all 4 DFI phase enables -> collapses to
     //    a single "is there a write THIS controller clock?" flag.
     //    (One controller clock already covers all 4 DDR phases.)
     //
@@ -534,7 +534,7 @@ module ddr4_phy #(
     // 3) output_enable = wrdata_en_any | shift[0] | shift[1] | shift[2]
     //    Both DQ and DQS use the same enable window.
     //
-    // 4) Inversion: ~enable → tristate, because T=1 means OFF in OSERDESE3.
+    // 4) Inversion: ~enable -> tristate, because T=1 means OFF in OSERDESE3.
     // -----------------------------------------------------------------
     wire wrdata_en_any = |i_dfi_wrdata_en;
 
@@ -552,15 +552,15 @@ module ddr4_phy #(
     // -----------------------------------------------------------------
     // DQS Pattern Generation
     //
-    // The OSERDESE3 for DQS gets an 8-bit pattern (4 phases × rise/fall):
-    //   Normal write: 01_01_01_01 → continuous toggle, edges centered on DQ
-    //   Idle:         00_00_00_00 → DQS held low (pin is tri-stated anyway)
+    // The OSERDESE3 for DQS gets an 8-bit pattern (4 phases x rise/fall):
+    //   Normal write: 01_01_01_01 -> continuous toggle, edges centered on DQ
+    //   Idle:         00_00_00_00 -> DQS held low (pin is tri-stated anyway)
     //
     // Write Leveling (WL): DRAM calibration mode where the controller
     // sends a single DQS rising edge and reads back DQ to find the
-    // optimal clock-to-DQS alignment (JEDEC DDR4 §4.7.2).
-    //   WL strobe:    00_00_00_01 → one rising edge only
-    //   WL idle:      00_00_00_00 → hold low between strobes
+    // optimal clock-to-DQS alignment (JEDEC DDR4 sec 4.7.2).
+    //   WL strobe:    00_00_00_01 -> one rising edge only
+    //   WL idle:      00_00_00_00 -> hold low between strobes
     // -----------------------------------------------------------------
     wire wl_active;
 
@@ -577,7 +577,7 @@ module ddr4_phy #(
         end else if (wrdata_en_shift[0]) begin
             // Write postamble: after last data beat (DQS_t LOW), drive
             // one UI HIGH per JEDEC tWPST >= 0.33 tCK (we provide 0.5 tCK).
-            // D[0] is first transmitted → first UI on wire is HIGH.
+            // D[0] is first transmitted -> first UI on wire is HIGH.
             dqs_pattern = 8'b00_00_00_01;
         end else begin
             dqs_pattern = 8'b00_00_00_00; // idle: pin is tri-stated
@@ -585,7 +585,7 @@ module ddr4_phy #(
     end
 
     // WL tri-state: DQS held driven (T=0) for the entire WL phase per
-    // JESD79-4D §4.7.2 — controller drives DQS LOW between strobes.
+    // JESD79-4D sec 4.7.2 - controller drives DQS LOW between strobes.
     wire dqs_tristate_wl = wl_active ? 1'b0 : ~output_enable;
 
 
@@ -715,7 +715,7 @@ module ddr4_phy #(
     // -----------------------------------------------------------------
     // DQS Strobe Path (per byte lane)
     // Write: OSERDESE3(dqs_pattern) -> ODELAYE3 -> IOBUFDS -> DQS+/-
-    //        ODELAYE3 adds ~90° (DDR4_CLK_PERIOD/4 ps) so DQS edges
+    //        ODELAYE3 adds ~90 deg (DDR4_CLK_PERIOD/4 ps) so DQS edges
     //        are center-aligned with DQ data at the DRAM receiver.
     // -----------------------------------------------------------------
     generate
@@ -756,7 +756,7 @@ module ddr4_phy #(
             // DQS_BIAS="TRUE" (UG571 p.63): weak keeper holds the floating
             // differential pair to a known state between bursts. Without it,
             // noise on undriven DQS causes false edges at ISERDESE3.
-            // Does NOT affect normal operation — active drivers easily
+            // Does NOT affect normal operation - active drivers easily
             // overdrive the weak pull. Supported for DIFF_POD (DDR4).
             IOBUFDS #(
                 .DQS_BIAS("TRUE")
@@ -850,9 +850,9 @@ module ddr4_phy #(
 
     // Eye training registers (phase-aware range tracking)
     //
-    // Algorithm: sweep IDELAYE3 taps 0→508 (step=4). At each tap, search
+    // Algorithm: sweep IDELAYE3 taps 0->508 (step=4). At each tap, search
     // the 16-bit iserdes_window for MPR_PATTERN at offsets 0-8. A contiguous
-    // run of taps with the SAME offset is a "stable range" — the eye is open.
+    // run of taps with the SAME offset is a "stable range" - the eye is open.
     // When the offset changes or pattern disappears, the range closes. The
     // widest range found across the full sweep is selected; its center tap
     // is loaded into IDELAYE3 and its offset becomes the bitslip value.
@@ -896,7 +896,7 @@ module ddr4_phy #(
     reg [8:0] dqs_initial_tap [BYTE_LANES-1:0];
     reg [7:0] vtc_settle_counter;
 
-    // Training failure latch registers (sticky — cleared on training start,
+    // Training failure latch registers (sticky - cleared on training start,
     // set on failure, visible on prober or in waveforms for post-mortem debug)
     reg [BYTE_LANES-1:0] gate_train_fail;
     reg [BYTE_LANES-1:0] eye_train_fail;
@@ -920,7 +920,7 @@ module ddr4_phy #(
     // Bitslip Alignment (barrel-shift across two ISERDESE3 captures)
     // -----------------------------------------------------------------
     // Problem: ISERDESE3 captures 8 serial bits per CLKDIV cycle, but
-    // the byte boundary is unknown — the first captured bit may not be
+    // the byte boundary is unknown - the first captured bit may not be
     // the first transmitted bit. We need to "slip" (rotate) the 8-bit
     // window to align it with the DRAM's burst boundary.
     //
@@ -936,8 +936,8 @@ module ddr4_phy #(
     // (0..8, determined during eye training). This is equivalent to a
     // barrel shifter / bitslip by N positions:
     //
-    //   bitslip=0 → window[7:0]   (all from previous capture)
-    //   bitslip=3 → window[10:3]  (5 from previous, 3 from current)
+    //   bitslip=0 -> window[7:0]   (all from previous capture)
+    //   bitslip=3 -> window[10:3]  (5 from previous, 3 from current)
     //   bitslip=7 -> window[14:7] (1 from previous, 7 from current)
     //   bitslip=8 -> window[15:8] (all from current capture)
     //
@@ -1148,22 +1148,22 @@ module ddr4_phy #(
             // Three-phase training sequence controlled by the memory
             // controller via DFI training interface signals:
             //
-            // Phase 1 — GATE TRAINING (rdlvl_gate_en):
+            // Phase 1 - GATE TRAINING (rdlvl_gate_en):
             //   No-op. Eye training subsumes gate training by searching
             //   all 9 offsets at every tap. Responds immediately.
             //
-            // Phase 2 — EYE TRAINING (rdlvl_en):
-            //   Phase-aware: sweeps IDELAYE3 taps 0→508, at each tap
+            // Phase 2 - EYE TRAINING (rdlvl_en):
+            //   Phase-aware: sweeps IDELAYE3 taps 0->508, at each tap
             //   searches iserdes_window for MPR_PATTERN at offsets 0-8.
             //   Tracks the widest contiguous range of taps with same
             //   offset. Centers IDELAY at best range midpoint and sets
             //   bitslip to the offset found there.
             //
-            // Phase 3 — WRITE LEVELING (wrlvl_en):
-            //   Per JESD79-4D §4.7: sweeps DQS ODELAYE3 until the DRAM
-            //   reports a 0→1 transition on DQ (indicating DQS rising edge
+            // Phase 3 - WRITE LEVELING (wrlvl_en):
+            //   Per JESD79-4D sec 4.7: sweeps DQS ODELAYE3 until the DRAM
+            //   reports a 0->1 transition on DQ (indicating DQS rising edge
             //   is now aligned with CK rising edge). DQ ODELAY tracks DQS
-            //   to maintain the 90° write data-to-strobe offset.
+            //   to maintain the 90 deg write data-to-strobe offset.
             //
             // After each phase completes, the FSM asserts the corresponding
             // DFI resp signal and returns to IDLE. The controller sequences
@@ -1205,10 +1205,10 @@ module ddr4_phy #(
                             wl_train_fail <= {BYTE_LANES{1'b0}};
                             odelay_dqs_cntvalue <= odelay_dqs_cntvalueout[0];
                             odelay_dq_cntvalue  <= 9'd0;
-                            // DQS ODELAY was initialized to tCK/4 (90° DQS-to-DQ
+                            // DQS ODELAY was initialized to tCK/4 (90 deg DQS-to-DQ
                             // centering). IODELAY BISC converts that ps value to taps.
                             // Read back actual tap via CNTVALUEOUT so WL sweeps
-                            // from the calibrated 90° baseline, finding the
+                            // from the calibrated 90 deg baseline, finding the
                             // additional delay for DQS-to-CK alignment at DRAM.
                             for (dfi_pack_idx = 0; dfi_pack_idx < BYTE_LANES; dfi_pack_idx = dfi_pack_idx + 1) begin
                                 dqs_initial_tap[dfi_pack_idx] <= odelay_dqs_cntvalueout[dfi_pack_idx];
@@ -1238,7 +1238,7 @@ module ddr4_phy #(
                     // -- Eye training: phase-aware IDELAYE3 sweep ------
                     // Settle IDELAYE3 at current tap, then register the
                     // combinational pattern search output (pipeline stage 1).
-                    // Timer sequence: 4(idle) → 3(LOAD pulse) → 2,1(settle) → 0(sample).
+                    // Timer sequence: 4(idle) -> 3(LOAD pulse) -> 2,1(settle) -> 0(sample).
                     // At timer=0 we wait for rddata_en which indicates DRAM is
                     // actively driving MPR data in response to a controller READ.
                     PHY_EYE_SWEEP: begin
@@ -1254,7 +1254,7 @@ module ddr4_phy #(
                                 pattern_late_q <= 1'b0;
                                 phy_state <= PHY_EYE_TRACK;
                             end else begin
-                                // Not found — IDELAY may have pushed data to next CLKDIV cycle.
+                                // Not found - IDELAY may have pushed data to next CLKDIV cycle.
                                 // Wait 1 more cycle and re-check (PHY_EYE_LATE).
                                 phy_state <= PHY_EYE_LATE;
                             end
@@ -1267,9 +1267,9 @@ module ddr4_phy #(
                     //
                     // Range identity = (offset, late). A range closes when either changes.
                     // Three cases per tap:
-                    //   1. Pattern found, same (offset,late) as current range → extend
-                    //   2. Pattern found, different (offset,late) → close current, open new
-                    //   3. Pattern not found → close current range (edge/metastable zone)
+                    //   1. Pattern found, same (offset,late) as current range -> extend
+                    //   2. Pattern found, different (offset,late) -> close current, open new
+                    //   3. Pattern not found -> close current range (edge/metastable zone)
                     //
                     // On close: if current range is wider than best, promote it.
                     // After full sweep, the widest stable region is in best_*.
@@ -1283,12 +1283,12 @@ module ddr4_phy #(
                                 cur_late <= pattern_late_q;
                                 in_range <= 1'b1;
                             end else if (pattern_offset_q == cur_offset && pattern_late_q == cur_late) begin
-                                // Same offset AND same latency — extend current range
+                                // Same offset AND same latency - extend current range
                                 cur_width <= cur_width + {5'd0, TAP_SWEEP_STEP};
                             end else begin
-                                // Offset or latency changed — close current range, open new.
+                                // Offset or latency changed - close current range, open new.
                                 // This happens when IDELAYE3 pushes DQ past a clock edge
-                                // or past a full CLKDIV boundary (on-time → late transition).
+                                // or past a full CLKDIV boundary (on-time -> late transition).
                                 if (!best_valid || cur_width > best_width) begin
                                     best_start <= cur_start;
                                     best_width <= cur_width;
@@ -1302,7 +1302,7 @@ module ddr4_phy #(
                                 cur_late <= pattern_late_q;
                             end
                         end else begin
-                            // No pattern found (metastable/edge zone) — close range
+                            // No pattern found (metastable/edge zone) - close range
                             if (in_range) begin
                                 if (!best_valid || cur_width > best_width) begin
                                     best_start <= cur_start;
@@ -1328,7 +1328,7 @@ module ddr4_phy #(
                     // Decision: close any still-open range (if sweep ended mid-range),
                     // then select the widest range and compute center tap.
                     // Takes 2 cycles if a range was open (close on cycle 1, decide on cycle 2).
-                    // Sets bitslip_count_q to best_offset — this is the byte boundary
+                    // Sets bitslip_count_q to best_offset - this is the byte boundary
                     // position at the chosen IDELAYE3 tap (overrides any prior value).
                     PHY_EYE_DECIDE: begin
                         if (in_range) begin
@@ -1342,7 +1342,7 @@ module ddr4_phy #(
                             end
                             in_range <= 1'b0;
                         end else if (!best_valid) begin
-                            // No valid range found at any tap — lane is broken
+                            // No valid range found at any tap - lane is broken
                             eye_train_fail[train_lane] <= 1'b1;
                             `ifndef YOSYS
                                 $display("[%0t] PHY eye: lane %0d no valid range found", $realtime, train_lane);
@@ -1366,10 +1366,10 @@ module ddr4_phy #(
                             end
                         end else begin
                             // Load center of widest range into IDELAYE3.
-                            // Set bitslip to the offset where MPR was found in that range —
+                            // Set bitslip to the offset where MPR was found in that range -
                             // this is the correct byte boundary for all subsequent reads.
                             // rd_lat_extra: if best range was "late", normal reads arrive
-                            // 1 CLKDIV cycle after rddata_en — capture path uses rddata_en_d1.
+                            // 1 CLKDIV cycle after rddata_en - capture path uses rddata_en_d1.
                             idelay_cntvalue <= best_start + (best_width >> 1);
                             eye_center_tap[train_lane] <= best_start + (best_width >> 1);
                             bitslip_count_q[train_lane] <= best_offset;
@@ -1656,10 +1656,10 @@ module ddr4_phy #(
                         if (train_lane < BYTE_LANES - 1) begin
                         /* verilator lint_on WIDTHEXPAND */
                             train_lane <= train_lane + 1'b1;
-                            wl_tap[train_lane + 1'b1]    <= dqs_initial_tap[train_lane + 1'b1]; // resume from 90° baseline (tCK/4 tap set by IODELAY BISC)
-                            wl_dq_tap[train_lane + 1'b1] <= 9'd0;              // DQ has no initial offset — tracks DQS delta after WL
+                            wl_tap[train_lane + 1'b1]    <= dqs_initial_tap[train_lane + 1'b1]; // resume from 90 deg baseline (tCK/4 tap set by IODELAY BISC)
+                            wl_dq_tap[train_lane + 1'b1] <= 9'd0;              // DQ has no initial offset - tracks DQS delta after WL
                             wl_seen_zero[train_lane + 1'b1] <= 1'b0;
-                            odelay_dqs_cntvalue <= dqs_initial_tap[train_lane + 1'b1]; // load DQS ODELAY to same 90° baseline
+                            odelay_dqs_cntvalue <= dqs_initial_tap[train_lane + 1'b1]; // load DQS ODELAY to same 90 deg baseline
                             odelay_dq_cntvalue  <= 9'd0;                       // DQ ODELAY starts at 0, incremented in lockstep with DQS
                             phy_timer <= 4'd4;
                             phy_state <= PHY_WL_SAMPLE;

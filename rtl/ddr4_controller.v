@@ -121,7 +121,13 @@ module ddr4_controller #(
               CALIB_RETRY_MAX = 3     // retries per training phase before failure
 ) (
     input wire i_controller_clk, // Controller clock with CONTROLLER_CLK_PERIOD
+    // Reset the two-flop ASYNC_REG synchronizer below asynchronously so it
+    // holds a known state without a clock; every other block resets
+    // synchronously. The synchronizer only gates the init sequence, so
+    // releasing a cycle early cannot corrupt controller state.
+    /* verilator lint_off SYNCASYNCNET */
     input wire i_rst_n, // Active-low reset
+    /* verilator lint_on SYNCASYNCNET */
 
     // Wishbone B4 Pipelined Interface
     input wire                       i_wb_cyc,   // Bus cycle active (held for entire burst)
@@ -216,11 +222,11 @@ module ddr4_controller #(
     // The init sequence is driven by a small ROM (steps 0-35). Each ROM
     // entry is a 32-bit instruction word. The upper 5 bits are a control
     // field decoded as:
-    //   [31] RST_DONE  — when set, asserts reset_done (init complete)
-    //   [30] USE_TIMER — entry has a delay (lower 20 bits = cycle count)
-    //   [29] A10       — drives address bit A10 (used for PRE ALL, ZQCL)
-    //   [28] CKE       — drives CKE to DRAM
-    //   [27] RESET_N   — drives RESET_n to DRAM
+    //   [31] RST_DONE  - when set, asserts reset_done (init complete)
+    //   [30] USE_TIMER - entry has a delay (lower 20 bits = cycle count)
+    //   [29] A10       - drives address bit A10 (used for PRE ALL, ZQCL)
+    //   [28] CKE       - drives CKE to DRAM
+    //   [27] RESET_N   - drives RESET_n to DRAM
     // The presets below are the only combinations the ROM uses:
     localparam[4:0] CTL_CKE0_RST0 = 5'b01000, //power-on: CKE=0, RESET_n=0
                     CTL_CKE0_RST1 = 5'b01001, //pre-CKE: CKE=0, RESET_n=1
@@ -229,14 +235,14 @@ module ddr4_controller #(
                     CTL_DONE      = 5'b11011; //RST_DONE: init complete
 
     // ROM instruction bit fields (32 bits):
-    //   [31]    RST_DONE   — assert reset_done (init complete flag)
-    //   [30]    USE_TIMER  — lower 20 bits are a delay count
-    //   [29]    A10        — address bit 10 (PRE ALL / ZQCL select)
-    //   [28]    CKE        — clock enable to DRAM
-    //   [27]    RESET_N    — reset_n to DRAM
-    //   [26:23] CMD[3:0]   — command opcode {act_n, ras_n, cas_n, we_n}
-    //   [22:20] MRS_SELECT — bank group + bank addr for MRS commands
-    //   [19:0]  TIMER/ADDR — delay cycle count, or MRS address bits
+    //   [31]    RST_DONE   - assert reset_done (init complete flag)
+    //   [30]    USE_TIMER  - lower 20 bits are a delay count
+    //   [29]    A10        - address bit 10 (PRE ALL / ZQCL select)
+    //   [28]    CKE        - clock enable to DRAM
+    //   [27]    RESET_N    - reset_n to DRAM
+    //   [26:23] CMD[3:0]   - command opcode {act_n, ras_n, cas_n, we_n}
+    //   [22:20] MRS_SELECT - bank group + bank addr for MRS commands
+    //   [19:0]  TIMER/ADDR - delay cycle count, or MRS address bits
     localparam ROM_RST_DONE  = 31,
                ROM_USE_TIMER = 30,
                ROM_A10       = 29,
@@ -407,7 +413,7 @@ module ddr4_controller #(
                           (DENSITY == 8)  ? 350_000 : //8Gb
                           (DENSITY == 4)  ? 260_000 : //4Gb
                                             160_000;  //2Gb
-    // tREFI : Average periodic refresh interval (normal temp <=85°C)
+    // tREFI : Average periodic refresh interval (normal temp <=85 degC)
     // Fixed normal-temperature 1x refresh. No automatic 85 C threshold switch
     // to the shorter high-temperature interval; see docs/INTEGRATION.md.
     localparam tREFI_ps = 7_800_000; // 7.8us (Table 43)
@@ -422,7 +428,9 @@ module ddr4_controller #(
     localparam INITIAL_CKE_LOW_ps     = MICRON_SIM ? 200_000 : 500_000_000; // >=500us after RESET_n deassert (200ns min for PHY reset)
     // tXPR : Exit reset to first command (Tables 172-173)
     localparam tXPR_ps = max_fn(5 * DDR4_CLK_PERIOD, tRFC_ps + 10_000); // max(5nCK, tRFC+10ns)
+    /* verilator lint_off WIDTHEXPAND */
     localparam tXPR_WAIT_nCTRL = ps_to_cycles(tXPR_ps) + TPHY_INIT_LAT;
+    /* verilator lint_on WIDTHEXPAND */
 
     // =========================================
     // Command Slot Assignment (DFI 3.1)
@@ -436,7 +444,7 @@ module ddr4_controller #(
     // get_slot() computes slots from CL/CWL mod 4 for RD/WR,
     // then places ACT and PRE in the remaining free slots.
     // When RD and WR land on the same slot (e.g. DDR4-1866),
-    // they share it — the controller never issues both at once.
+    // they share it - the controller never issues both at once.
     // =========================================
     localparam [1:0] READ_SLOT      = get_slot(CMD_RD);
     localparam [1:0] WRITE_SLOT     = get_slot(CMD_WR);
@@ -498,10 +506,10 @@ module ddr4_controller #(
     // tFAW in controller cycles
     localparam TFAW_CYCLES = nCK_to_cycles(ps_to_nCK(tFAW_ps)); // tFAW (see JESD79-4D Figure 72)
 
-    // Far lookahead depth for bank anticipation (JESD79-4D §4.19)
+    // Far lookahead depth for bank anticipation (JESD79-4D sec 4.19)
     // Looks tRP + tRCD + NUM_BG addresses ahead so that PRE+ACT complete
     // before the request arrives. With BG-interleaved mapping, the same
-    // bank group reappears every NUM_BG addresses — PRE fires on first
+    // bank group reappears every NUM_BG addresses - PRE fires on first
     // encounter, ACT on the next encounter after tRP elapses, giving
     // tRCD cycles of headroom before the request reaches Stage 2.
     localparam FAR_LOOKAHEAD_DEPTH = PRECHARGE_TO_ACTIVATE_DELAY
@@ -517,7 +525,7 @@ module ddr4_controller #(
     localparam MAX_WTR_DELAY       = WRITE_TO_READ_DELAY_SAME_BG;
     localparam MAX_RRD_DELAY       = ACTIVATE_TO_ACTIVATE_DELAY_SAME_BG;
 
-    // Calibration gap timer width — must fit the largest value loaded
+    // Calibration gap timer width - must fit the largest value loaded
     localparam CALIB_GAP_MAX = max_fn(max_fn(T_RDLVL_EN, T_RDLVL_RR),
                                       max_fn(T_WRLVL_EN, T_WRLVL_WW));
 
@@ -553,8 +561,10 @@ module ddr4_controller #(
     localparam integer WRITE_DATA_DELAY_UNCOMP =
         find_delay(CWL_nCK, WRITE_SLOT, WRITE_SLOT);
     localparam integer WRITE_DATA_DELAY =
+        /* verilator lint_off WIDTHEXPAND */
         (TPHY_WRLAT < WRITE_DATA_DELAY_UNCOMP)
             ? (WRITE_DATA_DELAY_UNCOMP - TPHY_WRLAT) : 1;
+        /* verilator lint_on WIDTHEXPAND */
 
     // ROM delay counter width -- enough for longest init timer
     localparam DELAY_COUNTER_WIDTH = 20;
@@ -832,28 +842,28 @@ module ddr4_controller #(
     // Pipeline Diagram
     //
     //     WB input          Stage 1            Stage 2           Scheduler                      DFI output
-    //    ──────────     ───────────────     ───────────────     ─────────────               ─────────────────
+    //    ----------     ---------------     ---------------     -------------               -----------------
     //
     // WRITE:
     //
-    //    STB+WE ──────► stage1_pending ───► stage2_pending ───► sched_write
-    //                                                               │
-    //                               ack_pipe_q[write_ack_idx_q]◄────┤ 
-    //                                      │                        │
-    //     o_wb_ack ◄───── ack_pipe_q[0] ◄──┤ (shift right)          │   
-    //                                                               │
-    //                                                               └─► wrdata_en_pipe_q ──► o_dfi_wrdata_en
+    //    STB+WE ------> stage1_pending ---> stage2_pending ---> sched_write
+    //                                                               |
+    //                               ack_pipe_q[write_ack_idx_q]<----+ 
+    //                                      |                        |
+    //     o_wb_ack <----- ack_pipe_q[0] <--+ (shift right)          |   
+    //                                                               |
+    //                                                               +-> wrdata_en_pipe_q --> o_dfi_wrdata_en
     //                                                                 (+WRITE_DATA_DELAY)
     //
     // READ:
     //
-    //    STB+!WE ─────► stage1_pending ───► stage2_pending ───► sched_read
-    //                                                               │
-    //                              ack_pipe_q[ACK_PIPE_WIDTH-1]◄────┤ 
-    //                                      │                        │
-    //     o_wb_ack ◄───── ack_pipe_q[0] ◄──┤ (shift right)          │   
-    //                                                               │
-    //                                                               └──► rddata_en_pipe_q ──► o_dfi_rddata_en
+    //    STB+!WE -----> stage1_pending ---> stage2_pending ---> sched_read
+    //                                                               |
+    //                              ack_pipe_q[ACK_PIPE_WIDTH-1]<----+ 
+    //                                      |                        |
+    //     o_wb_ack <----- ack_pipe_q[0] <--+ (shift right)          |   
+    //                                                               |
+    //                                                               +--> rddata_en_pipe_q --> o_dfi_rddata_en
     //                                                                (+RDDATA_EN_PIPE_WIDTH)
     //
     // ACK ordering: both reads and writes share ack_pipe_q. Reads always
@@ -957,7 +967,7 @@ module ddr4_controller #(
 
     // The refresh loop (ROM addrs 33-35) fires PRE ALL, REF, then loads
     // the tREFI delay and jumps back to addr 33. While that tREFI timer
-    // counts down, the ROM sits at addr 33 doing nothing — that is the
+    // counts down, the ROM sits at addr 33 doing nothing - that is the
     // "refresh_idle" window where the scheduler is free to issue user
     // commands. Once the timer expires, refresh fires again.
     //   refresh_idle   = sitting at REF_START, timer still counting (safe)
@@ -1037,21 +1047,21 @@ module ddr4_controller #(
     wire[16:0] stage1_next_row_padded = {{(17-ROW_BITS){1'b0}}, stage1_next_row};
 
     // =====================================================================
-    // Bank Anticipation — Enable / Guard Wires
+    // Bank Anticipation - Enable / Guard Wires
     //
     // Anticipation speculatively issues PRE/ACT for stage1_next_bank
     // (the bank FAR_LOOKAHEAD_DEPTH addresses ahead of the current WB
-    // request). The depth is tRP + tRCD + NUM_BG (JESD79-4D §4.19),
+    // request). The depth is tRP + tRCD + NUM_BG (JESD79-4D sec 4.19),
     // so that even a bank needing PRE+ACT has time to complete both
     // before the request reaches Stage 2. With BG-interleaved mapping
-    // the same bank group reappears every NUM_BG addresses — PRE fires
+    // the same bank group reappears every NUM_BG addresses - PRE fires
     // on the first encounter, ACT fires on the next encounter after
     // tRP elapses, and tRCD completes before the request arrives.
     //
     // Architecture: ENABLE (from _q only) + KILL (1 gate after Stage 2)
     //
     //   ENABLE resolves purely from registered state, in parallel with
-    //   Stage 2's combinational logic — no timing dependency on Stage 2.
+    //   Stage 2's combinational logic - no timing dependency on Stage 2.
     //   The <= 1 check means "counter will be zero after the combinational
     //   decrement this cycle," equivalent to DDR3's _d == 0 check but
     //   without waiting for Stage 2's mux tree.
@@ -1160,7 +1170,7 @@ module ddr4_controller #(
             //   (a) delay_before_activate_counter <= 1 : tRP from a prior
             //       PRECHARGE to THIS bank has elapsed.
             //   (b) rrd_counter[bg] <= 1 : tRRD (ACT-to-ACT within this
-            //       bank group) has elapsed — JEDEC requires a minimum
+            //       bank group) has elapsed - JEDEC requires a minimum
             //       interval between consecutive ACTIVATEs.
             //   (c) !tfaw_blocked : no more than 4 ACTIVATEs have occurred
             //       in the last tFAW window.
@@ -1170,12 +1180,12 @@ module ddr4_controller #(
                      && !tfaw_blocked) begin
                 sched_activate = 1'b1;
                 // tRAS: minimum time bank must stay active before it can
-                // be PRECHARGEd again (JESD79-4D §4.29).
+                // be PRECHARGEd again (JESD79-4D sec 4.29).
                 delay_before_precharge_counter_d[stage2_bank] = ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
                 // tRCD: minimum ACT-to-RD/WR delay.
                 // "Only raise" = use MAX(current, new): if a higher delay
                 // is already pending don't overwrite it with a
-                // shorter value.  The `<` comparison achieves this —
+                // shorter value.  The `<` comparison achieves this -
                 // we only load the new value when it is LARGER than what
                 // is already in the counter.
                 if (delay_before_write_counter_d[stage2_bank] < ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0]) begin
@@ -1186,14 +1196,14 @@ module ddr4_controller #(
                 end
                 bank_status_d[stage2_bank] = 1'b1;
                 bank_active_row_d[stage2_bank] = stage2_row;
-                // tRRD — Row-to-Row Delay: minimum time between two
+                // tRRD - Row-to-Row Delay: minimum time between two
                 // ACTIVATEs.  DDR4 has TWO tRRD values:
-                //   tRRD_L (Long)  — ACT-to-ACT within the SAME bank group
-                //   tRRD_S (Short) — ACT-to-ACT to a DIFFERENT bank group
+                //   tRRD_L (Long)  - ACT-to-ACT within the SAME bank group
+                //   tRRD_S (Short) - ACT-to-ACT to a DIFFERENT bank group
                 // Loop over all bank groups (`ci` is the loop iterator).
                 // For the bank group that just fired ACT: unconditionally
                 // load tRRD_L (same-BG, always the longer value).
-                // For every OTHER bank group: only-raise to tRRD_S — load
+                // For every OTHER bank group: only-raise to tRRD_S - load
                 // tRRD_S only if larger than the current counter, so a
                 // previously loaded tRRD_L is never shortened.
                 /* verilator lint_off UNSIGNED */
@@ -1212,7 +1222,7 @@ module ddr4_controller #(
                 // per-bank delay_before_activate_counter is per-BANK (16
                 // counters). It is checked in the ACT guard (case 2 above)
                 // and provides per-bank granularity that tRRD alone cannot:
-                // e.g. tRP (PRE→ACT) is loaded here too, verify each bank's 
+                // e.g. tRP (PRE->ACT) is loaded here too, verify each bank's 
                 // counter individually.  Loading tRRD_S into every other bank's
                 // activate counter is belt-and-suspenders: it guarantees
                 // tRRD_S compliance even if the BG-level rrd_counter were
@@ -1223,7 +1233,7 @@ module ddr4_controller #(
                         delay_before_activate_counter_d[ci] = ACTIVATE_TO_ACTIVATE_DELAY_DIFF_BG[$clog2(MAX_ACTIVATE_DELAY):0];
                 end
                 /* verilator lint_on UNSIGNED */
-                // tFAW — Four-Activate Window: record this ACT's timestamp
+                // tFAW - Four-Activate Window: record this ACT's timestamp
                 // in the circular buffer so the sliding-window check can
                 // block a 5th ACT within the tFAW interval.
                 activate_timestamp_d[activate_index_q] = TFAW_CYCLES[$clog2(TFAW_CYCLES):0];
@@ -1231,14 +1241,14 @@ module ddr4_controller #(
 
             // ---- Case 3: row hit -> issue WRITE or READ ----
             // Bank is active and already has the correct row open.
-            // No PRE/ACT needed — go straight to the data command.
+            // No PRE/ACT needed - go straight to the data command.
             else if (bank_status_q[stage2_bank]
                      && (bank_active_row_q[stage2_bank] == stage2_row)) begin
 
                 // WRITE path.
                 // Guards: (a) tRCD elapsed (delay_before_write_counter),
                 //         (b) tCCD elapsed (ccd_counter per bank group).
-                // ODT (On-Die Termination) is enabled for writes — the
+                // ODT (On-Die Termination) is enabled for writes - the
                 // DRAM switches its termination resistors to transmit mode.
                 if (stage2_we && (!pipe_stall || !ack_pipe_q[write_ack_idx_q])
                     && (delay_before_write_counter_q[stage2_bank] <= 1)
@@ -1274,10 +1284,10 @@ module ddr4_controller #(
                 // READ path.
                 // Guards: (a) tRCD elapsed (delay_before_read_counter),
                 //         (b) tCCD elapsed (ccd_counter per bank group),
-                //         (c) tWTR elapsed (wtr_counter) — must wait for
+                //         (c) tWTR elapsed (wtr_counter) - must wait for
                 //             any prior WRITE's data to clear the bus
                 //             before driving a READ.
-                // ODT stays off for reads — DRAM is in receive mode.
+                // ODT stays off for reads - DRAM is in receive mode.
                 else if (!stage2_we && (!pipe_stall || !ack_pipe_q[ACK_PIPE_WIDTH-1])
                          && (delay_before_read_counter_q[stage2_bank] <= 1)
                          && (ccd_counter_q[stage2_bg] <= 1)
@@ -1289,7 +1299,7 @@ module ddr4_controller #(
                     if (delay_before_precharge_counter_d[stage2_bank] < READ_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0]) begin
                         delay_before_precharge_counter_d[stage2_bank] = READ_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
                     end
-                    // RD→WR turnaround: applies to ALL banks globally.
+                    // RD->WR turnaround: applies to ALL banks globally.
                     // After a READ, the DQ bus carries read data for
                     // RL + BL/2 clocks.  A WRITE cannot drive the bus
                     // until that window plus ODT settling time has passed.
@@ -1315,7 +1325,7 @@ module ddr4_controller #(
         end
 
         // ---- Anticipatory PRECHARGE (fires on PRECHARGE_SLOT) ----
-        // stage1_next_bank is active on wrong row → close it now.
+        // stage1_next_bank is active on wrong row -> close it now.
         // After tRP elapses, anticipatory ACT can open the correct row.
         // Guards: bank_collision (don't touch Stage 2's bank),
         //         !sched_precharge (slot 0 conflict with Stage 2 PRE).
@@ -1328,23 +1338,23 @@ module ddr4_controller #(
         end
 
         // ---- Anticipatory ACTIVATE (fires on ACTIVATE_SLOT) ----
-        // stage1_next_bank is idle → open it on stage1_next_row.
+        // stage1_next_bank is idle -> open it on stage1_next_row.
         // Counter loads mirror Stage 2's Case 2 exactly (tRAS, tRCD,
         // tRRD per-BG, per-bank activate delay, tFAW timestamp).
         // Guards: bank_collision, !sched_activate (slot 1 conflict),
-        //         !sched_anticipate_pre (PRE has priority — can't open
+        //         !sched_anticipate_pre (PRE has priority - can't open
         //         a bank we just closed), ant_act_kill (Stage 2 just
-        //         PREd this bank → tRP was loaded, so ACT is invalid).
+        //         PREd this bank -> tRP was loaded, so ACT is invalid).
         if (ant_act_enable && !ant_bank_collision
             && !sched_activate && !sched_anticipate_pre && !ant_act_kill) begin
             sched_anticipate_act = 1'b1;
             // tRAS: minimum time this bank must stay active before PRE
             delay_before_precharge_counter_d[stage1_next_bank] = ACTIVATE_TO_PRECHARGE_DELAY[$clog2(MAX_PRECHARGE_DELAY):0];
-            // tRCD (write): only-raise — don't shorten existing delay
+            // tRCD (write): only-raise - don't shorten existing delay
             if (delay_before_write_counter_d[stage1_next_bank] < ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0]) begin
                 delay_before_write_counter_d[stage1_next_bank] = ACTIVATE_TO_WRITE_DELAY[$clog2(MAX_WRITE_DELAY):0];
             end
-            // tRCD (read): only-raise — don't shorten existing delay
+            // tRCD (read): only-raise - don't shorten existing delay
             if (delay_before_read_counter_d[stage1_next_bank] < ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0]) begin
                 delay_before_read_counter_d[stage1_next_bank] = ACTIVATE_TO_READ_DELAY[$clog2(MAX_READ_DELAY):0];
             end
@@ -1544,7 +1554,7 @@ module ddr4_controller #(
                 end
 
                 // Latch CKE/RESET_N for the duration of this ROM phase.
-                // Needed because cmd_d defaults to NOP each cycle — without
+                // Needed because cmd_d defaults to NOP each cycle - without
                 // holding, CKE/RESET_N would revert to default 0 between firings.
                 // MRS instructions always have CKE=1, RESET_N=1.
                 if (rom_cmd_is_mrs) begin
@@ -1564,7 +1574,7 @@ module ddr4_controller #(
                 end
 
                 // Sticky RST_DONE: must be registered because rom_instruction
-                // changes every advance — the bit is only valid for 1 cycle.
+                // changes every advance - the bit is only valid for 1 cycle.
                 if (rom_instruction[ROM_RST_DONE]) begin
                     reset_done <= 1'b1;
                 end
@@ -1593,7 +1603,7 @@ module ddr4_controller #(
                     cmd_odt, 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
                     stage2_bg_padded,      // [20:19] bank group from stage2
                     stage2_ba,             // [18:17] bank address from stage2
-                    7'b0, 1'b0, 9'b0      // [16:0]  A10=0 → single-bank (not PRE ALL)
+                    7'b0, 1'b0, 9'b0      // [16:0]  A10=0 -> single-bank (not PRE ALL)
                 };
             end
             if (sched_activate) begin
@@ -1601,9 +1611,9 @@ module ddr4_controller #(
                 cmd_d[ACTIVATE_SLOT] <= {
                     1'b0,                  // [28]    cs_n = 0 (chip selected)
                     1'b0,                  // [27]    act_n = 0 (ACTIVATE command)
-                    stage2_row_padded[16], // [26]    RAS_N pin → row A16 (DDR4 ACT encoding)
-                    stage2_row_padded[15], // [25]    CAS_N pin → row A15 (DDR4 ACT encoding)
-                    stage2_row_padded[14], // [24]    WE_N pin  → row A14 (DDR4 ACT encoding)
+                    stage2_row_padded[16], // [26]    RAS_N pin -> row A16 (DDR4 ACT encoding)
+                    stage2_row_padded[15], // [25]    CAS_N pin -> row A15 (DDR4 ACT encoding)
+                    stage2_row_padded[14], // [24]    WE_N pin  -> row A14 (DDR4 ACT encoding)
                     cmd_odt, 1'b1, 1'b1,  // [23:21] odt, cke=1, reset_n=1
                     stage2_bg_padded,      // [20:19] bank group from stage2
                     stage2_ba,             // [18:17] bank address from stage2
@@ -1643,24 +1653,24 @@ module ddr4_controller #(
                 };
             end
             if (sched_anticipate_pre) begin
-                // Anticipatory PRECHARGE (stage1 lookahead — next request's bank)
+                // Anticipatory PRECHARGE (stage1 lookahead - next request's bank)
                 cmd_d[PRECHARGE_SLOT] <= {
                     1'b0,                  // [28]    cs_n = 0 (chip selected)
                     CMD_PRE,               // [27:24] {act_n=1, ras_n=0, cas_n=1, we_n=0}
                     cmd_odt, 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
                     stage1_next_bg_padded, // [20:19] bank group from stage1 lookahead
                     stage1_next_bank[BA_BITS-1:0], // [18:17] bank addr from stage1
-                    7'b0, 1'b0, 9'b0      // [16:0]  A10=0 → single-bank (not PRE ALL)
+                    7'b0, 1'b0, 9'b0      // [16:0]  A10=0 -> single-bank (not PRE ALL)
                 };
             end
             if (sched_anticipate_act) begin
-                // Anticipatory ACTIVATE (stage1 lookahead — next request's row)
+                // Anticipatory ACTIVATE (stage1 lookahead - next request's row)
                 cmd_d[ACTIVATE_SLOT] <= {
                     1'b0,                       // [28]    cs_n = 0 (chip selected)
                     1'b0,                       // [27]    act_n = 0 (ACTIVATE command)
-                    stage1_next_row_padded[16], // [26]    RAS_N pin → row A16
-                    stage1_next_row_padded[15], // [25]    CAS_N pin → row A15
-                    stage1_next_row_padded[14], // [24]    WE_N pin  → row A14
+                    stage1_next_row_padded[16], // [26]    RAS_N pin -> row A16
+                    stage1_next_row_padded[15], // [25]    CAS_N pin -> row A15
+                    stage1_next_row_padded[14], // [24]    WE_N pin  -> row A14
                     cmd_odt, 1'b1, 1'b1,       // [23:21] odt, cke=1, reset_n=1
                     stage1_next_bg_padded,      // [20:19] bank group from stage1
                     stage1_next_bank[BA_BITS-1:0], // [18:17] bank addr from stage1
@@ -1680,7 +1690,7 @@ module ddr4_controller #(
             //   Cycle 0 (WR fires):  [3]=1  [2]=0  [1]=0  [0]=0
             //   Cycle 1 (shift):     [3]=0  [2]=1  [1]=0  [0]=0
             //   Cycle 2 (shift):     [3]=0  [2]=0  [1]=1  [0]=0
-            //   Cycle 3 (output!):   [3]=0  [2]=0  [1]=0  [0]=1 → DFI
+            //   Cycle 3 (output!):   [3]=0  [2]=0  [1]=0  [0]=1 -> DFI
             //
             // The data pipeline works identically but carries the
             // 128-bit write data instead of a 1-bit flag.
@@ -1690,8 +1700,8 @@ module ddr4_controller #(
             //   write_B enters at [3]. Both coexist in the same pipe.
             //   "else" would stop write_A from shifting when B loads.
             //
-            // Area cost: WRITE_DATA_DELAY ≈ 3 for DDR4-2400, so the
-            // data pipe is just 4 × 128 bits = 512 flops (negligible).
+            // Area cost: WRITE_DATA_DELAY ~ 3 for DDR4-2400, so the
+            // data pipe is just 4 x 128 bits = 512 flops (negligible).
             // ===========================================================
 
             // --- Write enable: tells PHY when to drive DQ/DQS ---
@@ -1729,7 +1739,7 @@ module ddr4_controller #(
                 wb_data_q <= i_dfi_rddata;
             end
 
-            // WB ACK ordering pipe — shared shift register.
+            // WB ACK ordering pipe - shared shift register.
             //
             // Both writes and reads share a single ACK_PIPE_WIDTH-bit shift
             // register (ack_pipe_q). A '1' at position [0] means "ACK this
@@ -1744,7 +1754,7 @@ module ddr4_controller #(
             //
             // The pipe shifts right every cycle (when not stalled), moving
             // entries toward [0]. pipe_stall freezes the shift when a read
-            // reaches [0] but PHY data hasn't arrived yet — this prevents
+            // reaches [0] but PHY data hasn't arrived yet - this prevents
             // o_wb_ack from firing before o_wb_data is valid.
             //
             // write_ack_idx_q tracks the insertion point for writes. It
@@ -1768,7 +1778,7 @@ module ddr4_controller #(
                 write_ack_idx_q <= write_ack_idx_q;
             end
 
-            // Insert read ACK at far end — it will take ACK_PIPE_WIDTH
+            // Insert read ACK at far end - it will take ACK_PIPE_WIDTH
             // shifts to reach [0], matching PHY read latency.
             // Reset write pointer to far-1: any subsequent write must ACK
             // AFTER this read (WB B4 in-order guarantee).
@@ -1816,7 +1826,7 @@ module ddr4_controller #(
             //      rdlvl_en, or wrlvl_en) to tell the PHY "start
             //      adjusting your delays."
             //   4. It pumps READ commands (or wrlvl strobes) every
-            //      T_RDLVL_RR (or T_WRLVL_WW) cycles — the PHY
+            //      T_RDLVL_RR (or T_WRLVL_WW) cycles - the PHY
             //      observes the returning data to tune its delays.
             //   5. When the PHY finishes (all bits of rdlvl_resp or
             //      wrlvl_resp go high), training is done.
@@ -1831,14 +1841,14 @@ module ddr4_controller #(
             //                   (compensates PCB flight-time skew).
             //
             // TIMERS:
-            //   calib_timer    — overall timeout (loaded with T_RDLVL_MAX
+            //   calib_timer    - overall timeout (loaded with T_RDLVL_MAX
             //                    or T_WRLVL_MAX). If it hits zero before
             //                    PHY responds, the FSM retries or errors.
-            //   calib_gap_timer — minimum gap between commands. Loaded with:
-            //                      T_RDLVL_EN  (enable → first cmd)
-            //                      T_RDLVL_RR  (READ → READ spacing)
-            //                      T_WRLVL_EN  (enable → first strobe)
-            //                      T_WRLVL_WW  (strobe → strobe spacing)
+            //   calib_gap_timer - minimum gap between commands. Loaded with:
+            //                      T_RDLVL_EN  (enable -> first cmd)
+            //                      T_RDLVL_RR  (READ -> READ spacing)
+            //                      T_WRLVL_EN  (enable -> first strobe)
+            //                      T_WRLVL_WW  (strobe -> strobe spacing)
             // ===========================================================
             begin
                 // calib_timer continues to decrement to 0
@@ -1849,7 +1859,7 @@ module ddr4_controller #(
                 if (calib_gap_timer != 0) begin
                     calib_gap_timer <= calib_gap_timer - 1'b1;
                 end
-                // Self-clearing pulse — set by FSM, fires READ one cycle later
+                // Self-clearing pulse - set by FSM, fires READ one cycle later
                 calib_read_req <= 1'b0;
 
                 case (calib_state)
@@ -1881,11 +1891,13 @@ module ddr4_controller #(
                         o_dfi_rdlvl_gate_en <= 1'b1;
                         if (calib_gap_timer == 0) begin
                             calib_state <= CALIB_GATE_READ;
+                            /* verilator lint_off WIDTHTRUNC */
                             calib_timer <= T_RDLVL_MAX - 1'b1;
+                            /* verilator lint_on WIDTHTRUNC */
                         end
                     end
 
-                    // Issue first training READ. No ACTIVATE needed —
+                    // Issue first training READ. No ACTIVATE needed -
                     // JESD79-4D 4.10.1: only MRS/RD/WR/DES/REF allowed in
                     // MPR mode. MPR data comes from internal registers,
                     // not the array, so no row needs to be open.
@@ -1936,7 +1948,9 @@ module ddr4_controller #(
                         o_dfi_rdlvl_en <= 1'b1;
                         if (calib_gap_timer == 0) begin
                             calib_state <= CALIB_EYE_READ;
+                            /* verilator lint_off WIDTHTRUNC */
                             calib_timer <= T_RDLVL_MAX - 1'b1;
+                            /* verilator lint_on WIDTHTRUNC */
                         end
                     end
 
@@ -1948,7 +1962,7 @@ module ddr4_controller #(
                     end
 
                     // Pump READs until PHY centres its sampling clock
-                    // (rdlvl_resp=all 1s) or timeout → retry/error.
+                    // (rdlvl_resp=all 1s) or timeout -> retry/error.
                     CALIB_EYE_WAIT: begin
                         if (calib_timer == 0) begin // T_RDLVL_MAX expired
                             // Retry budget remains; repeat read-eye training
@@ -1986,22 +2000,24 @@ module ddr4_controller #(
                             calib_gap_timer <= T_WRLVL_EN;
                             calib_retry_count <= 2'b00;
                         end else begin
-                            // ROM still advancing (22→27).
+                            // ROM still advancing (22->27).
                             pause_counter <= 1'b0;
                         end
                     end
 
-                    // Assert wrlvl_en — DRAM is already in WL mode
+                    // Assert wrlvl_en - DRAM is already in WL mode
                     // (the selected WL window programmed MR1 A7=1). Wait for PHY.
                     CALIB_WL_EN: begin
                         o_dfi_wrlvl_en <= 1'b1;
                         if (calib_gap_timer == 0) begin
                             calib_state <= CALIB_WL_STROBE;
+                            /* verilator lint_off WIDTHTRUNC */
                             calib_timer <= T_WRLVL_MAX - 1'b1;
+                            /* verilator lint_on WIDTHTRUNC */
                         end
                     end
 
-                    // Pulse wrlvl_strobe once — PHY drives DQS, DRAM
+                    // Pulse wrlvl_strobe once - PHY drives DQS, DRAM
                     // samples CK and returns 0 or 1 on DQ to indicate
                     // whether DQS edge is before or after CK edge.
                     CALIB_WL_STROBE: begin
@@ -2011,8 +2027,8 @@ module ddr4_controller #(
                     end
 
                     // De-assert strobe, keep pulsing every T_WRLVL_WW
-                    // until PHY finds the 0→1 transition (wrlvl_resp=
-                    // all-1) or timeout → retry/error.
+                    // until PHY finds the 0->1 transition (wrlvl_resp=
+                    // all-1) or timeout -> retry/error.
                     CALIB_WL_WAIT: begin
                         o_dfi_wrlvl_strobe <= 1'b0;
                         if (calib_timer == 0) begin // T_WRLVL_MAX expired
@@ -2057,12 +2073,12 @@ module ddr4_controller #(
                         end
                     end
 
-                    // All training complete — controller is ready for wishbone traffic.
+                    // All training complete - controller is ready for wishbone traffic.
                     CALIB_DONE: begin
                         o_calib_complete <= 1'b1;
                     end
 
-                    // Training failed after all retries — fatal, needs reset.
+                    // Training failed after all retries - fatal, needs reset.
                     CALIB_ERROR: begin
                         o_calib_error <= 1'b1;
                     end
@@ -2072,7 +2088,7 @@ module ddr4_controller #(
                     end
                 endcase
 
-                // Training READ handler — fires one cycle after FSM
+                // Training READ handler - fires one cycle after FSM
                 // sets calib_read_req. Single point of cmd_d construction
                 // for all read-training states (gate + eye).
                 if (calib_read_req) begin
@@ -2196,14 +2212,14 @@ module ddr4_controller #(
     // entries to perform JEDEC DDR4 initialization, calibration
     // trigger points, and the periodic refresh loop.
     // Bit fields per entry:
-    //   [31]    RST_DONE         — assert reset_done (init complete flag)
-    //   [30]    USE_TIMER        — lower 20 bits are a delay count
-    //   [29]    A10              — address bit 10 (PRE ALL / ZQCL select)
-    //   [28]    CKE              — clock enable to DRAM
-    //   [27]    RESET_N          — reset_n to DRAM
-    //   [26:23] CMD[3:0]         — command opcode {act_n, ras_n, cas_n, we_n}
-    //   [22:20] MRS_SELECT[2:0]  — bank group + bank addr for MRS commands
-    //   [19:0]  TIMER/ADDR[19:0] — delay cycle count, or MRS address bits
+    //   [31]    RST_DONE         - assert reset_done (init complete flag)
+    //   [30]    USE_TIMER        - lower 20 bits are a delay count
+    //   [29]    A10              - address bit 10 (PRE ALL / ZQCL select)
+    //   [28]    CKE              - clock enable to DRAM
+    //   [27]    RESET_N          - reset_n to DRAM
+    //   [26:23] CMD[3:0]         - command opcode {act_n, ras_n, cas_n, we_n}
+    //   [22:20] MRS_SELECT[2:0]  - bank group + bank addr for MRS commands
+    //   [19:0]  TIMER/ADDR[19:0] - delay cycle count, or MRS address bits
     /* verilator lint_off WIDTHTRUNC */
     function [31:0] read_rom_instruction(input [5:0] addr);
         case (addr)

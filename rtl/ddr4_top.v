@@ -117,6 +117,9 @@ module ddr4_top #(
     // One ACMD byte is {physical_nibble[4:0], position[2:0]}; one DQ nibble
     // is {upper_nibble, position[2:0]}.  All ones selects the canonical
     // simulation layout.  Hardware wrappers must use their XDC pin topology.
+    // Only referenced inside gen_native_phy, so the default PHY_IMPL=0
+    // elaboration reports them unused; the -GPHY_IMPL=1 lint pass covers them.
+    /* verilator lint_off UNUSEDPARAM */
               PHY_ACMD_NIBBLE_COUNT = 0,
     parameter [255:0] PHY_ACMD_PIN_MAP = {256{1'b1}},
     parameter [4*DQ_BITS*BYTE_LANES-1:0] PHY_DQ_PIN_MAP =
@@ -125,6 +128,7 @@ module ddr4_top #(
     parameter [95:0] PHY_ACMD_PLL_MAP = 96'd0,
     parameter [3*BYTE_LANES-1:0] PHY_BYTE_PLL_MAP =
               {3*BYTE_LANES{1'b0}},
+    /* verilator lint_on UNUSEDPARAM */
     // Derived (for port widths)
     parameter SERDES_RATIO = 4,
               NUM_BG = (1 << BG_BITS),
@@ -140,7 +144,7 @@ module ddr4_top #(
     // i_ddr4_clk is unused. Native controller/RIU must share an MMCM and phase.
     input wire i_controller_clk, i_ddr4_clk, i_ref_clk,
     input wire i_rst_n,
-    // Wishbone B4 — DRAM data path (pipelined)
+    // Wishbone B4 - DRAM data path (pipelined)
     input wire i_wb_cyc, i_wb_stb, i_wb_we,
     // One address selects a full BL8 burst; there is no CSR-select address bit.
     input wire [WB_ADDR_BITS-1:0] i_wb_addr,
@@ -148,7 +152,7 @@ module ddr4_top #(
     input wire [WB_SEL_BITS-1:0] i_wb_sel,
     output wire o_wb_stall, o_wb_ack,
     output wire [WB_DATA_BITS-1:0] o_wb_data,
-    // Wishbone B4 — Debug CSR port (pipelined, independent of DRAM path).
+    // Wishbone B4 - Debug CSR port (pipelined, independent of DRAM path).
     // Available during calibration when enabled. Tie unused inputs to zero.
     input wire i_wb_dbg_cyc, i_wb_dbg_stb, i_wb_dbg_we,
     input wire [3:0] i_wb_dbg_addr,
@@ -236,9 +240,12 @@ module ddr4_top #(
     wire [9*BYTE_LANES-1:0] phy_dqs_initial_tap;
     wire [BYTE_LANES-1:0]   phy_rd_lat_extra;
     wire                     phy_en_vtc;
+    // Driven only by the native PHY's TX-diagnostic path.
+    /* verilator lint_off UNUSEDSIGNAL */
     wire                     phy_tx_diag_req;
     wire [7:0]               phy_tx_diag_dq;
     wire [8:0]               phy_tx_diag_tap;
+    /* verilator lint_on UNUSEDSIGNAL */
     wire                     phy_tx_diag_ack;
     wire                     phy_tx_diag_error;
     wire [8:0]               phy_tx_diag_current_tap;

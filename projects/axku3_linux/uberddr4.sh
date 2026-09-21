@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# uberddr4.sh — AXKU3 Linux + UberDDR4 workflow, one entry point for every step.
+# uberddr4.sh - AXKU3 Linux + UberDDR4 workflow, one entry point for every step.
 #
 # Commands:
 #   setup       Download pinned sources/tools into build/, then check the host
@@ -55,9 +55,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Host platform
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Only this block may inspect the operating system. Everything below uses the
 # variables and helpers it defines, so adding a host means editing one place.
 case "$(uname -s)" in
@@ -96,9 +96,9 @@ native_path_list() {
     printf '%s' "${joined%$PATHSEP}"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Settings
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 if [[ $HOST_OS == windows ]]; then
     PYTHON='python.exe'
     VIVADO_ROOT='C:\Xilinx\Vivado\2022.2'
@@ -116,9 +116,9 @@ TOOLS_ROOT=''
 LINUX_DEPS_ROOT=''
 BUILD_ROOT=''
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Argument validation helpers
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 require_value() {
     # $1 flag name, $2 supplied value count remaining
     [[ ${2:-0} -gt 0 ]] || die "$1 requires a value"
@@ -152,9 +152,9 @@ DATA_RATES=(1200 1250 1600 1866 2133 2400)
 # ones to every step it starts.
 SHARED_OVERRIDES=()
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Derived environment
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Resolves cache locations, locates Python, and builds the search paths that
 # make this project's pinned packages win over any global installation.
 init_environment() {
@@ -266,9 +266,9 @@ run_python() {
     (( status == 0 )) || die "Python command failed with exit code $status: $1"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# check — read-only preflight
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# check - read-only preflight
+# ===========================================================================
 # A failure stops the build early; this command does not repair or install tools.
 cmd_check() {
     local entries name commit is_linux root path actual dirty allowed
@@ -315,9 +315,9 @@ for name, spec in lock["repositories"].items():
     note "Environment OK; output: $BUILD_ROOT"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# setup — one-time network setup
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# setup - one-time network setup
+# ===========================================================================
 cmd_setup() {
     note 'Fetching pinned source/tools into the project cache. No drivers or global settings are changed.'
     run_python "$(native "$SCRIPT_DIR/setup_dependencies.py")" \
@@ -327,9 +327,9 @@ cmd_setup() {
     cmd_check
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# test — fast host-only tests
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# test - fast host-only tests
+# ===========================================================================
 # Simulated bus transactions, mocked UART, and cache checks. Requires the
 # pinned environment, but does not run Vivado or access the board.
 cmd_test() {
@@ -340,9 +340,9 @@ cmd_test() {
         die 'test_setup.py failed'
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# build — generate the SoC and BIOS
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# build - generate the SoC and BIOS
+# ===========================================================================
 # Vivado runs only with --synthesize-only or --build.
 cmd_build() {
     local do_build=false do_synth=false linux=true
@@ -553,9 +553,9 @@ with open(synth_tcl, "w", encoding="utf-8", newline="") as stream:
         die "Cannot locate synthesis boundary in $full_tcl"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# payload — build the UART boot payload
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# payload - build the UART boot payload
+# ===========================================================================
 # Run after build; output goes under BUILD_ROOT/payload-<configuration>.
 # This does not program the FPGA or open a serial port.
 cmd_payload() {
@@ -588,9 +588,9 @@ cmd_payload() {
         --output-dir "$(native "$output_dir")"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# implement — resume from a synthesis checkpoint
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# implement - resume from a synthesis checkpoint
+# ===========================================================================
 # Reuse the generated Tcl's implementation steps; do not synthesize again.
 # Produces routed reports and a bitstream, then runs the hardware-use validator.
 cmd_implement() {
@@ -650,9 +650,9 @@ with open(resume_tcl, "w", encoding="utf-8", newline="") as stream:
         --uart-name serial --linux --data-rate "$data_rate"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# all — setup through implement in one command
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# all - setup through implement in one command
+# ===========================================================================
 # The documented sequence run end to end: setup, test, generate, payload,
 # synthesize, implement. Each step runs as a separate process, exactly as
 # chaining the commands with && does, so nothing a long build exports can leak
@@ -712,9 +712,9 @@ run_step() {
         die "Step failed: uberddr4.sh $*"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# boot — program, load and check Linux
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# boot - program, load and check Linux
+# ===========================================================================
 # Close other serial terminals first. Default is one trial; --trials 10 repeats
 # the entire cycle. No synthesis or boot-flash programming occurs here.
 cmd_boot() {
@@ -752,9 +752,9 @@ cmd_boot() {
         die "Hardware trials failed with exit code $?"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Shared trial runner
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # boot and campaign differ only in how many batches they run and whether one
 # failed trial ends the batch, so both resolve artifacts, refuse an unchecked
 # build and reach the board through this one function. It returns the runner's
@@ -800,9 +800,9 @@ run_trials() {
         --output-dir "$(native "$BUILD_ROOT/hardware/$label")" "$@"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# campaign — repeat the trial batch to measure reliability
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# campaign - repeat the trial batch to measure reliability
+# ===========================================================================
 # A single passing boot shows the flow works once. Reliability is a rate, so
 # this repeats the whole program/upload/boot/test batch and reports how many
 # rounds and trials passed. By default a failure is recorded and the campaign
@@ -920,9 +920,9 @@ hardware_server_running() {
     fi
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# console — interactive terminal
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# console - interactive terminal
+# ===========================================================================
 # For Linux already loaded by boot. It does not boot, reset or test the board.
 # Ctrl+] releases the serial port before another boot.
 cmd_console() {
@@ -1010,9 +1010,9 @@ finally:
     fi
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# clean — remove local generated files
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# clean - remove local generated files
+# ===========================================================================
 # Default: build/output. --all: build, including downloaded dependencies/tools.
 # Deliberately ignore local.sh and external cache overrides: never recursively
 # delete a user-configured external path. Stop builds and save wanted logs first.
@@ -1091,9 +1091,9 @@ cmd_clean() {
     note "Removed permanently: $target"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # Main
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 show_help() {
     sed -n '3,/^set -o pipefail/{ /^set -o pipefail/d; s/^# \?//p; }' "$0"
 }

@@ -158,7 +158,7 @@ cleanup() {
     (( CLEANUP_RUNNING )) && return
     CLEANUP_RUNNING=1
     trap '' INT TERM HUP
-    echo -e "\n${RED}Interrupted — stopping simulation...${RESET}"
+    echo -e "\n${RED}Interrupted - stopping simulation...${RESET}"
     stop_simulation
     release_lock
     exit "$exit_code"

@@ -1499,7 +1499,7 @@ module ddr4_sim_top;
         // =============================================================
         // CSR 0xC Reset Test - exercises soft reset, auto-reset, BIST restart
         // =============================================================
-        $display("[%0t] === CSR Reset Test: Phase 1 â€�? Soft Reset ===", $realtime);
+        $display("[%0t] === CSR Reset Test: Phase 1 - Soft Reset ===", $realtime);
         begin : csr_soft_reset_test
             reg [31:0] csr0_val, csr5_val;
             integer sr_timeout;
@@ -1538,7 +1538,7 @@ module ddr4_sim_top;
             end
 
             if (sr_timeout >= 300000) begin
-                $display("[%0t] FAIL: soft reset â€�? init_done never re-asserted (timeout)", $realtime);
+                $display("[%0t] FAIL: soft reset - init_done never re-asserted (timeout)", $realtime);
                 rd_err_count = rd_err_count + 1;
             end else begin
                 $display("[%0t]   Soft reset: init_done re-asserted after %0d cycles", $realtime, sr_timeout);
@@ -1549,7 +1549,7 @@ module ddr4_sim_top;
             csr5_val = wb_dbg_rdata;
             wb_dbg_idle;
             if (csr5_val[4] !== 1'b1 || csr5_val[5] !== 1'b0) begin
-                $display("[%0t] FAIL: soft reset â€�? BIST did not pass after re-calib (CSR[5]=0x%0h)", $realtime, csr5_val);
+                $display("[%0t] FAIL: soft reset - BIST did not pass after re-calib (CSR[5]=0x%0h)", $realtime, csr5_val);
                 rd_err_count = rd_err_count + 1;
             end else begin
                 $display("[%0t]   Soft reset: BIST re-passed after re-calibration", $realtime);
@@ -1564,7 +1564,7 @@ module ddr4_sim_top;
         $display("[%0t]   Phase 1 (soft reset) complete", $realtime);
 
         // Phase 2: Auto-reset on BIST failure
-        $display("[%0t] === CSR Reset Test: Phase 2 â€�? Auto-Reset on BIST Fail ===", $realtime);
+        $display("[%0t] === CSR Reset Test: Phase 2 - Auto-Reset on BIST Fail ===", $realtime);
         begin : csr_auto_reset_test
             reg [31:0] csr5_val;
             integer ar_timeout;
@@ -1607,7 +1607,7 @@ module ddr4_sim_top;
                 ar_timeout = ar_timeout + 1;
             end
             if (ar_timeout >= 200000) begin
-                $display("[%0t] FAIL: auto-reset â€�? init_done never dropped", $realtime);
+                $display("[%0t] FAIL: auto-reset - init_done never dropped", $realtime);
                 rd_err_count = rd_err_count + 1;
             end else begin
                 $display("[%0t]   Auto-reset triggered: init_done dropped", $realtime);
@@ -1620,7 +1620,7 @@ module ddr4_sim_top;
                 ar_timeout = ar_timeout + 1;
             end
             if (ar_timeout >= 300000) begin
-                $display("[%0t] FAIL: auto-reset â€�? init_done never re-asserted after recovery", $realtime);
+                $display("[%0t] FAIL: auto-reset - init_done never re-asserted after recovery", $realtime);
                 rd_err_count = rd_err_count + 1;
             end else begin
                 $display("[%0t]   Auto-reset recovery: init_done re-asserted after %0d cycles", $realtime, ar_timeout);
@@ -1631,7 +1631,7 @@ module ddr4_sim_top;
             csr5_val = wb_dbg_rdata;
             wb_dbg_idle;
             if (csr5_val[4] !== 1'b1 || csr5_val[5] !== 1'b0) begin
-                $display("[%0t] FAIL: auto-reset â€�? BIST did not pass after recovery (CSR[5]=0x%0h)", $realtime, csr5_val);
+                $display("[%0t] FAIL: auto-reset - BIST did not pass after recovery (CSR[5]=0x%0h)", $realtime, csr5_val);
                 rd_err_count = rd_err_count + 1;
             end else begin
                 $display("[%0t]   Auto-reset: BIST passed after recovery", $realtime);
@@ -1646,7 +1646,7 @@ module ddr4_sim_top;
         $display("[%0t]   Phase 2 (auto-reset) complete", $realtime);
 
         // Phase 3: BIST restart without reset (verify no re-calibration)
-        $display("[%0t] === CSR Reset Test: Phase 3 â€�? BIST Restart (no reset) ===", $realtime);
+        $display("[%0t] === CSR Reset Test: Phase 3 - BIST Restart (no reset) ===", $realtime);
         begin : csr_bist_restart_test
             reg [31:0] csr5_val;
             integer br_timeout;
@@ -1694,9 +1694,9 @@ module ddr4_sim_top;
 
         // Final verdict
         if (rd_err_count == 0)
-            $display("[%0t] PASS: CSR reset test â€�? all phases passed", $realtime);
+            $display("[%0t] PASS: CSR reset test - all phases passed", $realtime);
         else
-            $display("[%0t] FAIL: CSR reset test â€�? %0d errors", $realtime, rd_err_count);
+            $display("[%0t] FAIL: CSR reset test - %0d errors", $realtime, rd_err_count);
 
         test_phase = "DONE";
         all_tests_done = 1'b1;

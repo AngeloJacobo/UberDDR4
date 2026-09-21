@@ -96,7 +96,7 @@ The failure was specific to that stdout handle, not to the terminal: in the
 same process at the same moment, minutes of `logging` output had reached the
 same console on stderr, and shorter Python steps in the same shell had printed
 to stdout normally. It reproduced on a plain `build` command with no repeat
-runner involved, and never reproduced when stdout was a pipe or a file — four
+runner involved, and never reproduced when stdout was a pipe or a file - four
 such runs, including the identical build step, printed the same line. Probes in
 the failing terminal confirmed `_WindowsConsoleIO` on a `/dev/cons1` console
 under VS Code, and ruled out elapsed time, a child process and
@@ -326,12 +326,12 @@ integration, not physical memory reliability.
   members and does not restore Unix permission bits. README lists the gaps.
 - The local `build/` tree of the checkout that produced the results above was
   found missing later the same day. It held the downloaded dependencies and
-  tools, the generated SoC and BIOS, bitstream `ec1e70de…`, the prepared
+  tools, the generated SoC and BIOS, bitstream `ec1e70de...`, the prepared
   payload and the campaign's evidence directories. Its removal was noticed
   after the campaign was recorded and its cause was not established. The
   campaign's own console transcript survives outside `build/`. The tree has
   since been rebuilt from source, reaching the same routed slack but a
-  different bitstream hash, so the recorded `ec1e70de…` artifact itself can no
+  different bitstream hash, so the recorded `ec1e70de...` artifact itself can no
   longer be rehashed.
 
 Do not call this production-qualified or use Linux boot as proof of peak DDR

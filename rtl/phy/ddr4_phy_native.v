@@ -208,7 +208,7 @@ module ddr4_phy_native #(
     // tCK=1.600 ns configuration.  Using the first form there would produce
     // a 625 MHz VCO, below the PLLE3/PLLE4 750 MHz minimum.  Both forms still
     // deliver the identical 1.25 GHz CLKOUTPHY required at tCK=1.600 ns.
-    localparam integer PLL_USE_VCO_MODE = (DDR4_CLK_PERIOD >= 1_334);
+    localparam PLL_USE_VCO_MODE = (DDR4_CLK_PERIOD >= 1_334);
     localparam integer PLL_MULT = PLL_USE_VCO_MODE ?
                                   (2 * SERDES_RATIO) : SERDES_RATIO;
     // Match the legal UltraScale MIG PLL tuple.  CLKOUT0 is unused by this
@@ -3382,8 +3382,8 @@ module ddr4_phy_native #(
     // DQS Pattern Generation
     //
     // TX_BITSLICE D[7:0] for DQS (8:1 DDR):
-    //   Normal write: 01_01_01_01 → one BL8 toggle word
-    //   Preamble:     00_00_00_00 → LOW during phase-3 ownership
+    //   Normal write: 01_01_01_01 -> one BL8 toggle word
+    //   Preamble:     00_00_00_00 -> LOW during phase-3 ownership
     //   Write Leveling capture: 00_00_00_01 -> one rising edge
     //   Idle: 00_00_00_00
     // -----------------------------------------------------------------

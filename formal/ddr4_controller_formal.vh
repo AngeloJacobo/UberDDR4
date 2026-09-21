@@ -58,7 +58,7 @@
 //  this model. They do not independently validate device-bin parameter choices.
 //
 //  Why not a single "gap >= tXXX" assert? Such an assert would need
-//  a timestamp per bank — but timestamps exceed the induction depth
+//  a timestamp per bank - but timestamps exceed the induction depth
 //  (e.g., tRCD=15 > depth=8), so the solver can't close the proof.
 //  The decomposed approach avoids this by proving each piece locally.
 //
@@ -76,7 +76,7 @@ always @(posedge i_controller_clk) f_past_valid <= 1'b1;
 // Wishbone B4 Rule 3.25: CYC must remain asserted for the duration
 // of a bus cycle. A compliant master only deasserts CYC after all
 // outstanding ACKs are received. We use pipeline occupancy directly
-// When pipeline is idle, solver freely toggles CYC — verifying the
+// When pipeline is idle, solver freely toggles CYC - verifying the
 // RTL's Rule 3.30 ACK gating and stall behavior between sessions.
 always @* begin
     if (reset_done && i_rst_n
@@ -243,7 +243,7 @@ end
 // 4a. ROM Address Induction Invariant
 // Once reset_done is asserted (at ROM addr 32), instruction_address
 // advances to ROM_ADDR_REF_START (33) in the same cycle and never
-// goes below it again (cycles 33→34→35→33).
+// goes below it again (cycles 33->34->35->33).
 // The harness assumes this post-init range to keep the model in the
 // intended operating phase. It does not separately prove the entire ROM
 // startup sequence or this assumed relation from reset.
@@ -797,7 +797,7 @@ end
 //   - Reads insert at [MSB] and reset idx to MSB
 //   - The shift register moves all bits towards [0]
 // ...no newer request can ever be at a LOWER position than an older
-// one. Lower positions exit first → ACKs fire in acceptance order.
+// one. Lower positions exit first -> ACKs fire in acceptance order.
 // ===================================================================
 integer f_order_pos;
 always @* begin
@@ -857,12 +857,12 @@ end
 //
 // Proof strategy (3 layers):
 //  a) Counter bounds: each delay counter never exceeds its max load
-//     value (trivially inductive — decrements each cycle).
+//     value (trivially inductive - decrements each cycle).
 //  b) Progress invariant: f_stall + f_remaining <= F_MAX_STALL.
 //     f_stall counts cycles stalled so far; f_remaining upper-bounds
 //     cycles left until the command fires. Each cycle f_stall goes
 //     up by 1 and f_remaining goes down by at least 1, so the sum
-//     can never grow — it can only shrink or stay flat.
+//     can never grow - it can only shrink or stay flat.
 //  c) Idle assume: when no request is pending, stall counter is
 //     assumed bounded (nothing to prove when pipeline is empty).
 // ===================================================================
@@ -913,7 +913,7 @@ end
 // The key invariant is: f_stall + f_remaining <= F_MAX_STALL.
 // This holds because every cycle, f_stall goes up by 1 while
 // f_remaining goes down by at least 1 (counters always decrement).
-// So the sum never grows — proving stall is always bounded.
+// So the sum never grows - proving stall is always bounded.
 localparam MAX_ACT_EXT = max_fn(max_fn(PRECHARGE_TO_ACTIVATE_DELAY,
                                        MAX_RRD_DELAY),
                                 TFAW_CYCLES);
@@ -1015,16 +1015,16 @@ always @(posedge i_controller_clk) begin
 end
 
 // ===================================================================
-// 23. Write Data Integrity (end-to-end: i_wb_data → o_dfi_wrdata)
+// 23. Write Data Integrity (end-to-end: i_wb_data -> o_dfi_wrdata)
 //
 // Proves the actual payload bits are preserved from Wishbone accept
 // through the 2-stage pipeline and fixed-length shift register to the
 // DFI output. Three layers:
 //   a) Shadow stage1/stage2 registers capture i_wb_data/i_wb_sel at
-//      the same events as the RTL — inductive because both sides are
+//      the same events as the RTL - inductive because both sides are
 //      written identically on the same trigger.
 //   b) Shadow shift register mirrors wr_data_pipe_q, loaded from the
-//      shadow stage2 on sched_write — inductive (same structure).
+//      shadow stage2 on sched_write - inductive (same structure).
 //   c) Assert DFI outputs match shadow pipe output.
 // ===================================================================
 
@@ -1098,7 +1098,7 @@ always @(posedge i_controller_clk) begin
     end
 end
 
-// 23d: Cover — write data actually flows through
+// 23d: Cover - write data actually flows through
 always @(posedge i_controller_clk) begin
     if (f_past_valid && reset_done)
         cover(|o_dfi_wrdata_en && |o_dfi_wrdata);

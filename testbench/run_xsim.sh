@@ -131,7 +131,7 @@ step "Compiling RTL"
 #   DDR4_8G_X8   - 8Gbit x8 density/width (must match DUT DENSITY param)
 #   FIXED_2400   - lock speed grade to DDR4-2400 (834ps tCK)
 #   ALLOW_JITTER - relax Micron model timing checks for sim clock jitter
-#   VCD_DUMP     - tell the TB to dump VCD (very slow — use only for debug)
+#   VCD_DUMP     - tell the TB to dump VCD (very slow - use only for debug)
 VCD_FLAG=""
 if [[ "${DUMP_VCD:-0}" == "1" ]]; then
     VCD_FLAG="-d VCD_DUMP"
