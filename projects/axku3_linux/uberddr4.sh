@@ -776,7 +776,7 @@ run_trials() {
     local payload="$BUILD_ROOT/payload-axku3-uberddr4-${data_rate}${suffix}"
     local boot_json="$payload/boot.json"
     local xsdb="$VIVADO_BIN/xsdb$BAT"
-    local hw_server="$VIVADO_BIN/hw_server$BAT"
+    local hw_server; hw_server="$(hardware_server_launcher)"
     local program_tcl="$SCRIPT_DIR/linux_hardware_trials.tcl"
 
     local path
@@ -898,26 +898,49 @@ cmd_campaign() {
     note 'CAMPAIGN_PASS'
 }
 
+# ===========================================================================
+# hw_server - the JTAG agent XSDB connects to
+# ===========================================================================
+# linux_hardware_trials.tcl connects to this port by URL and never starts a
+# server itself, so one must already be listening before the trials run.
+HW_SERVER_PORT=3121
+
+# On Windows prefer the unwrapped executable. The bin/hw_server.bat launcher
+# chain exits silently about a second after this shell starts it, leaving
+# nothing listening, so it is kept only as a fallback for installs that do
+# not ship the unwrapped tree.
+hardware_server_launcher() {
+    local unwrapped="$VIVADO_BIN/unwrapped/win64.o/hw_server$EXE"
+    if [[ $HOST_OS == windows && -x $unwrapped ]]; then
+        printf '%s' "$unwrapped"
+    else
+        printf '%s' "$VIVADO_BIN/hw_server$BAT"
+    fi
+}
+
+# True once the port actually accepts a connection. Bash opens the socket
+# itself, so this needs no external tool and reads the same on both hosts.
+# A running process is not sufficient evidence: the port opens later, and
+# connecting too early is what XSDB reports as a refused connection.
+hardware_server_running() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$HW_SERVER_PORT") 2>/dev/null
+}
+
 # Reuse an already running hw_server; otherwise start one without a visible
-# window and give it a moment to open its port.
+# window and wait for its port rather than assuming a fixed delay is enough.
 start_hardware_server() {
     local hw_server="$1"
     if hardware_server_running; then return 0; fi
-    if [[ $HOST_OS == windows ]]; then
-        cmd //c "start /b \"\" \"$(native "$hw_server")\" -s tcp::3121" >/dev/null 2>&1
-    else
-        nohup "$hw_server" -s tcp::3121 >/dev/null 2>&1 &
-        disown 2>/dev/null || true
-    fi
-    sleep 2
-}
 
-hardware_server_running() {
-    if [[ $HOST_OS == windows ]]; then
-        tasklist //FI "IMAGENAME eq hw_server.exe" 2>/dev/null | grep -qi 'hw_server.exe'
-    else
-        pgrep -x hw_server >/dev/null 2>&1
-    fi
+    nohup "$hw_server" -s "tcp::$HW_SERVER_PORT" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+
+    local attempt
+    for attempt in $(seq 1 30); do
+        sleep 1
+        hardware_server_running && return 0
+    done
+    die "hw_server did not open port $HW_SERVER_PORT within 30s: $hw_server"
 }
 
 # ===========================================================================
