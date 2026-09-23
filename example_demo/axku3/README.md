@@ -1,4 +1,5 @@
 # AXKU3 standalone DDR4 BIST example
+[<img width="812" height="443" alt="image" src="https://github.com/user-attachments/assets/297231c0-babb-4068-91e5-85a6320c0043" />](https://youtu.be/Y6qFC9ROYH8?si=Y6DaOi6-dCAke-K-)
 
 [Back to the project README](../../README.md). This design connects UberDDR4's
 native PHY to two Micron MT40A512M16LY-062E x16 devices on an ALINX AXKU3
