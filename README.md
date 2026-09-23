@@ -15,6 +15,7 @@ Wishbone word and a physical 1-lane x32 memory uses a 256-bit word.
 
 | What you want to do | Read |
 | --- | --- |
+| Starting on UberDDR4 (blog post) | [UberDDR4: The Open-Source DDR4 Controller](https://www.openiphub.com/post/uberddr4-the-open-source-ddr4-controller) |
 | Run the example UberDDR4 + RISC-V + Linux system on AXKU3 FPGA board| [Linux example](projects/axku3_linux/README.md) |
 | Bring up AXKU3 FPGA board with UberDDR4 | [AXKU3 hardware example](example_demo/axku3/README.md) |
 | Connect your own Wishbone master or adapt a board | [Integration guide](docs/INTEGRATION.md) |
