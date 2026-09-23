@@ -11,6 +11,15 @@ the memory clock is 1.2 GHz and the controller clock is 300 MHz (thus 1:4 ratio)
 transfer carries one complete **BL8 burst**: a one-lane x16 memory has a 128-bit
 Wishbone word and a physical 1-lane x32 memory uses a 256-bit word.
 
+## Table of Contents
+- [Start here](https://github.com/AngeloJacobo/UberDDR4/tree/master#start-here) 
+- [Capabilities and limits](https://github.com/AngeloJacobo/UberDDR4/tree/master#capabilities-and-limits)
+- [Integrate the core](https://github.com/AngeloJacobo/UberDDR4/tree/master#integrate-the-core)
+- [Verify a checkout](https://github.com/AngeloJacobo/UberDDR4/tree/master#verify-a-checkout)
+- [Repository map](https://github.com/AngeloJacobo/UberDDR4/tree/master#repository-map)
+- [License and references](https://github.com/AngeloJacobo/UberDDR4/tree/master#license-and-references)
+- [Acknowledgement](https://github.com/AngeloJacobo/UberDDR4/tree/master#acknowledgement)
+  
 ## Start here
 
 | What you want to do | Read |
@@ -98,7 +107,10 @@ DFI 3.1 and UG571 editions used to review this documentation.
 
 ## Acknowledgement
 
-This project is funded through [NGI0 Entrust](https://nlnet.nl/entrust), a fund
-established by [NLnet](https://nlnet.nl) with financial support from the European
-Commission's [Next Generation Internet](https://ngi.eu) program. See the
-[NLnet project page](https://nlnet.nl/project/UberDDR4).
+[<img src="https://nlnet.nl/logo/banner.svg" alt="NLnet foundation logo" width="20%" />](https://nlnet.nl)
+&nbsp;&nbsp;
+[<img src="https://nlnet.nl/image/logos/NGI0CommonsFund_tag.svg" alt="NGI Zero Commons Fund logo" width="20%" />](https://nlnet.nl/commonsfund)
+
+This project was funded through the [NGI0 Commons Fund](https://nlnet.nl/commonsfund), a fund established by [NLnet](https://nlnet.nl/) with financial support from the European Commission's [Next Generation Internet](https://ngi.eu/) programme, under the aegis of [DG Communications Networks, Content and Technology](https://commission.europa.eu/about-european-commission/departments-and-executive-agencies/communications-networks-content-and-technology_en) under grant agreement N<sup>o</sup> [101135429](https://cordis.europa.eu/project/id/101135429). Additional funding is made available by the [Swiss State Secretariat for Education, Research and Innovation](https://www.sbfi.admin.ch/sbfi/en/home.html) (SERI).
+
+See the [NLnet project page](https://nlnet.nl/project/UberDDR4/) for the funded milestones.
