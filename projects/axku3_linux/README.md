@@ -1,5 +1,7 @@
 # Linux on AXKU3 with UberDDR4
 
+[<img width="812" height="450" alt="image" src="https://github.com/user-attachments/assets/5b2dd61b-9df7-4864-9042-615ed2acf07c" />](https://youtu.be/BuG7Sij6QpU?si=UYbmmnR7TkbpSWEW)
+
 A small RISC-V Linux system with UberDDR4 as its main-memory controller.
 VexRiscv executes the software, LiteX supplies the SoC interconnect and
 peripherals, and UberDDR4 drives the board's external DDR4.
