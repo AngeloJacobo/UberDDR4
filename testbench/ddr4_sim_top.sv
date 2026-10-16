@@ -173,10 +173,10 @@ module ddr4_sim_top;
     import arch_package::*;
 
 `ifdef SIM_DENSITY_4G
-    localparam TB_DENSITY = _4G;
+    localparam UTYPE_density TB_DENSITY = _4G;
     localparam TB_DENSITY_GB = 4;
 `else
-    localparam TB_DENSITY = _8G;
+    localparam UTYPE_density TB_DENSITY = _8G;
     localparam TB_DENSITY_GB = 8;
 `endif
 
@@ -874,6 +874,58 @@ module ddr4_sim_top;
                 3'b111:  dbg_micron_cmd = "NOP";
                 default: dbg_micron_cmd = "???";
             endcase
+        end
+    end
+
+    // ===================================================================
+    // Write ODT Checker (JESD79-4D ODTH8)
+    // Samples the controller-side pins at CK rising edges. A WR must see
+    // ODT high on its own edge and the next ODTH8-1 edges (6 nCK for BL8)
+    // so RTT_NOM, applied ODTLon = WL-2 nCK later, covers the write
+    // preamble and burst. A RD must see ODT low. Each failure prints an
+    // "ODT VIOLATION" line (regression_test.sh fails on any VIOLATION) and
+    // counts against the final PASS verdict.
+    // ===================================================================
+    localparam ODTH8_NCK = 6;
+    localparam ODT_MAX_REPORTS = 10;
+
+    integer odt_err_count, odt_wr_checked, odt_rd_checked;
+    integer odt_hold_left;
+    initial begin
+        odt_err_count = 0; odt_wr_checked = 0; odt_rd_checked = 0;
+        odt_hold_left = 0;
+    end
+
+    wire pin_is_wr = (ddr4_cs_n === 1'b0) && (ddr4_act_n === 1'b1)
+                     && ({ddr4_addr[16], ddr4_addr[15], ddr4_addr[14]} === 3'b100);
+    wire pin_is_rd = (ddr4_cs_n === 1'b0) && (ddr4_act_n === 1'b1)
+                     && ({ddr4_addr[16], ddr4_addr[15], ddr4_addr[14]} === 3'b101);
+
+    always @(posedge ddr4_ck_p) begin
+        if (!rst_n) begin
+            odt_hold_left = 0;
+        end else begin
+            if (pin_is_wr) begin
+                odt_hold_left = ODTH8_NCK;
+                odt_wr_checked = odt_wr_checked + 1;
+            end
+            if (odt_hold_left > 0) begin
+                if (ddr4_odt !== 1'b1) begin
+                    odt_err_count = odt_err_count + 1;
+                    if (odt_err_count <= ODT_MAX_REPORTS)
+                        $display("[%0t] ODT VIOLATION: ODT low %0d nCK after WR (ODTH8 = %0d nCK)",
+                                 $realtime, ODTH8_NCK - odt_hold_left, ODTH8_NCK);
+                end
+                odt_hold_left = odt_hold_left - 1;
+            end
+            if (pin_is_rd) begin
+                odt_rd_checked = odt_rd_checked + 1;
+                if (ddr4_odt !== 1'b0) begin
+                    odt_err_count = odt_err_count + 1;
+                    if (odt_err_count <= ODT_MAX_REPORTS)
+                        $display("[%0t] ODT VIOLATION: ODT high on RD command", $realtime);
+                end
+            end
         end
     end
 
@@ -2805,12 +2857,14 @@ module ddr4_sim_top;
                      $realtime, pq_cycles, pq_ns_per_txn, pq_bw, pq_bw * 100.0 / peak_bw);
         end
         $display("[%0t]", $realtime);
-        if (rd_err_count == 0 && bist_error_int == 0)
+        $display("[%0t] ODT CHECK: %0d WR and %0d RD checked at the pins, %0d violations",
+                 $realtime, odt_wr_checked, odt_rd_checked, odt_err_count);
+        if (rd_err_count == 0 && bist_error_int == 0 && odt_err_count == 0)
             $display("[%0t] PASS: All test phases + BIST + %0d refresh cycles, zero violations",
                      $realtime, ref_count);
         else
-            $display("[%0t] FAIL: rd_err=%0d bist_err=%0d",
-                     $realtime, rd_err_count, bist_error_int);
+            $display("[%0t] FAIL: rd_err=%0d bist_err=%0d odt_err=%0d",
+                     $realtime, rd_err_count, bist_error_int, odt_err_count);
         $display("[%0t] ===============================================", $realtime);
 
         // --- CSR Register Dump ---

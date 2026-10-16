@@ -451,6 +451,15 @@ module ddr4_controller #(
     localparam [1:0] ACTIVATE_SLOT  = get_slot(CMD_ACT);
     localparam [1:0] PRECHARGE_SLOT = get_slot(CMD_PRE);
 
+    // Write ODT window (JESD79-4D ODTH8): ODT must be registered high with
+    // the WR command and held for 6 nCK (BL8). The DRAM applies RTT_NOM
+    // ODTLon = ODTLoff = WL-2 nCK later, so this window covers the write
+    // preamble and burst. The WR sits in WRITE_SLOT, so the window can
+    // spill into the next two controller cycles. Bit k = nCK k counted
+    // from slot 0 of the WR's controller cycle.
+    localparam ODTH8_nCK = 6;
+    localparam [3*SERDES_RATIO-1:0] ODT_WR_MASK = ((1 << ODTH8_nCK) - 1) << WRITE_SLOT;
+
     // =================================================================
     // Computed Delay Counters (controller clock cycles)
     //
@@ -574,10 +583,18 @@ module ddr4_controller #(
     //   addr 33: PRE ALL, wait tRP
     //   addr 34: REF,     wait tRFC
     //   addr 35: NOP,     wait REFRESH_TREFI_TIMER (computed below)
-    // Total period = T_RP + T_RFC + REFRESH_TREFI_TIMER + 3 controller cycles.
+    // Total period = T_RP + T_RFC + REFRESH_TREFI_TIMER + 3 controller cycles,
+    // plus up to MAX_PRECHARGE_DELAY cycles of PRE ALL hold (below).
     // The -3 accounts for the 3 cycles consumed firing each ROM entry
     // (one cycle each for addr 33, 34, 35) before their delay counters run.
-    localparam REFRESH_TREFI_TIMER = tREFI_ps / CONTROLLER_CLK_PERIOD - 3 - ps_to_cycles(tRP_ps) - ps_to_cycles(tRFC_ps);
+    // The -MAX_PRECHARGE_DELAY covers rom_prea_hold: when the tREFI timer
+    // expires, a command scheduled in the last refresh_idle cycle can leave
+    // a bank precharge counter at up to MAX_PRECHARGE_DELAY, and PRE ALL
+    // (addr 33) waits for it to drain before the next interval starts.
+    // That wait is never recovered, so without this margin the average
+    // REF-to-REF interval exceeds tREFI under sustained traffic.
+    localparam REFRESH_TREFI_TIMER = tREFI_ps / CONTROLLER_CLK_PERIOD - 3 - ps_to_cycles(tRP_ps) - ps_to_cycles(tRFC_ps)
+                                     - MAX_PRECHARGE_DELAY;
 
     // ========================================================
     // Mode Register Construction
@@ -1013,13 +1030,18 @@ module ddr4_controller #(
     wire wb_accept = i_wb_cyc && i_wb_stb && !o_wb_stall;
 
     // -- Scheduler decision flags (set in combinational block, used by sequential) --
-    reg cmd_odt;
     reg stage2_update;
     reg sched_precharge;
     reg sched_activate;
     reg sched_write;
     reg sched_read;
     reg sched_anticipate_pre;
+
+    // Per-slot ODT: this cycle's part of any write ODT window, either still
+    // pending from a WR in an earlier cycle or opened by a WR scheduled now.
+    reg [2*SERDES_RATIO-1:0] odt_pending_q;
+    wire [SERDES_RATIO-1:0] cmd_odt = odt_pending_q[SERDES_RATIO-1:0]
+                                    | (sched_write ? ODT_WR_MASK[SERDES_RATIO-1:0] : {SERDES_RATIO{1'b0}});
     reg sched_anticipate_act;
 
     // tFAW check: JEDEC allows at most 4 ACTs in any tFAW window.
@@ -1129,7 +1151,6 @@ module ddr4_controller #(
         // Uses counter_q <= 1 optimization: fire one cycle early
         // because the combinational decrement has already applied.
         // =============================================================
-        cmd_odt = 1'b0;
         stage2_update = !stage2_pending;
         sched_precharge = 1'b0;
         sched_activate  = 1'b0;
@@ -1248,13 +1269,12 @@ module ddr4_controller #(
                 // WRITE path.
                 // Guards: (a) tRCD elapsed (delay_before_write_counter),
                 //         (b) tCCD elapsed (ccd_counter per bank group).
-                // ODT (On-Die Termination) is enabled for writes - the
-                // DRAM switches its termination resistors to transmit mode.
+                // ODT (On-Die Termination) is raised for writes so the
+                // DRAM terminates the write burst with RTT_NOM (cmd_odt).
                 if (stage2_we && (!pipe_stall || !ack_pipe_q[write_ack_idx_q])
                     && (delay_before_write_counter_q[stage2_bank] <= 1)
                     && (ccd_counter_q[stage2_bg] <= 1)) begin
                     sched_write = 1'b1;
-                    cmd_odt = 1'b1;
                     stage2_update = 1'b1;
                     // tWR: minimum WR-to-PRE delay (write recovery time).
                     // Only-raise: don't shorten a pending tRAS.
@@ -1441,6 +1461,7 @@ module ddr4_controller #(
             for (bank_i = 0; bank_i < SERDES_RATIO; bank_i = bank_i + 1) begin
                 cmd_d[bank_i] <= {1'b1, CMD_NOP, 1'b0, 1'b0, 1'b0, 2'b00, 2'b00, 17'b0};
             end
+            odt_pending_q <= {(2*SERDES_RATIO){1'b0}};
             for (bank_i = 0; bank_i < NUM_BANKS; bank_i = bank_i + 1) begin
                 bank_active_row_q[bank_i] <= {ROW_BITS{1'b0}};
                 delay_before_precharge_counter_q[bank_i] <= 0;
@@ -1492,11 +1513,13 @@ module ddr4_controller #(
             // All 4 slots default to DES (cs_n=1, NOP encoding).
             // The ROM controller or scheduler overrides specific slots.
             // =============================================================
+            odt_pending_q <= (odt_pending_q >> SERDES_RATIO)
+                           | (sched_write ? ODT_WR_MASK[3*SERDES_RATIO-1:SERDES_RATIO] : {(2*SERDES_RATIO){1'b0}});
             for (bank_i = 0; bank_i < SERDES_RATIO; bank_i = bank_i + 1) begin
                 cmd_d[bank_i] <= { // "_d" = next-state of registered o_dfi_* (registered pipeline stage for better timing closure)
                     1'b1,       //cs_n = 1 (deselected)
                     CMD_NOP,    //{act_n=1, ras_n=1, cas_n=1, we_n=1}
-                    cmd_odt,    //odt (broadcast to all slots)
+                    cmd_odt[bank_i], //odt (per slot, write ODT window)
                     reset_done ? 1'b1 : init_cke,     //cke (muxed: rom_instruction on fire, hold on countdown)
                     reset_done ? 1'b1 : init_reset_n, //reset_n (muxed: rom_instruction on fire, hold on countdown)
                     2'b00,      //bg
@@ -1600,7 +1623,7 @@ module ddr4_controller #(
                 cmd_d[PRECHARGE_SLOT] <= {
                     1'b0,                  // [28]    cs_n = 0 (chip selected)
                     CMD_PRE,               // [27:24] {act_n=1, ras_n=0, cas_n=1, we_n=0}
-                    cmd_odt, 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
+                    cmd_odt[PRECHARGE_SLOT], 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
                     stage2_bg_padded,      // [20:19] bank group from stage2
                     stage2_ba,             // [18:17] bank address from stage2
                     7'b0, 1'b0, 9'b0      // [16:0]  A10=0 -> single-bank (not PRE ALL)
@@ -1614,7 +1637,7 @@ module ddr4_controller #(
                     stage2_row_padded[16], // [26]    RAS_N pin -> row A16 (DDR4 ACT encoding)
                     stage2_row_padded[15], // [25]    CAS_N pin -> row A15 (DDR4 ACT encoding)
                     stage2_row_padded[14], // [24]    WE_N pin  -> row A14 (DDR4 ACT encoding)
-                    cmd_odt, 1'b1, 1'b1,  // [23:21] odt, cke=1, reset_n=1
+                    cmd_odt[ACTIVATE_SLOT], 1'b1, 1'b1,  // [23:21] odt, cke=1, reset_n=1
                     stage2_bg_padded,      // [20:19] bank group from stage2
                     stage2_ba,             // [18:17] bank address from stage2
                     stage2_row_padded      // [16:0]  full row address (PHY uses A[13:0])
@@ -1625,7 +1648,7 @@ module ddr4_controller #(
                 cmd_d[WRITE_SLOT] <= {
                     1'b0,                  // [28]    cs_n = 0 (chip selected)
                     CMD_WR,                // [27:24] {act_n=1, ras_n=1, cas_n=0, we_n=0}
-                    cmd_odt, 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
+                    cmd_odt[WRITE_SLOT], 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
                     stage2_bg_padded,      // [20:19] bank group from stage2
                     stage2_ba,             // [18:17] bank address from stage2
                     3'b000,                // [16:14] A16:A14 = 0 (unused for col cmds)
@@ -1641,7 +1664,7 @@ module ddr4_controller #(
                 cmd_d[READ_SLOT] <= {
                     1'b0,                  // [28]    cs_n = 0 (chip selected)
                     CMD_RD,                // [27:24] {act_n=1, ras_n=1, cas_n=0, we_n=1}
-                    cmd_odt, 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
+                    cmd_odt[READ_SLOT], 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
                     stage2_bg_padded,      // [20:19] bank group from stage2
                     stage2_ba,             // [18:17] bank address from stage2
                     3'b000,                // [16:14] A16:A14 = 0 (unused for col cmds)
@@ -1657,7 +1680,7 @@ module ddr4_controller #(
                 cmd_d[PRECHARGE_SLOT] <= {
                     1'b0,                  // [28]    cs_n = 0 (chip selected)
                     CMD_PRE,               // [27:24] {act_n=1, ras_n=0, cas_n=1, we_n=0}
-                    cmd_odt, 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
+                    cmd_odt[PRECHARGE_SLOT], 1'b1, 1'b1,   // [23:21] odt, cke=1, reset_n=1
                     stage1_next_bg_padded, // [20:19] bank group from stage1 lookahead
                     stage1_next_bank[BA_BITS-1:0], // [18:17] bank addr from stage1
                     7'b0, 1'b0, 9'b0      // [16:0]  A10=0 -> single-bank (not PRE ALL)
@@ -1671,7 +1694,7 @@ module ddr4_controller #(
                     stage1_next_row_padded[16], // [26]    RAS_N pin -> row A16
                     stage1_next_row_padded[15], // [25]    CAS_N pin -> row A15
                     stage1_next_row_padded[14], // [24]    WE_N pin  -> row A14
-                    cmd_odt, 1'b1, 1'b1,       // [23:21] odt, cke=1, reset_n=1
+                    cmd_odt[ACTIVATE_SLOT], 1'b1, 1'b1,       // [23:21] odt, cke=1, reset_n=1
                     stage1_next_bg_padded,      // [20:19] bank group from stage1
                     stage1_next_bank[BA_BITS-1:0], // [18:17] bank addr from stage1
                     stage1_next_row_padded      // [16:0]  full row address
@@ -2095,7 +2118,7 @@ module ddr4_controller #(
                     cmd_d[READ_SLOT] <= {
                         1'b0,       // cs_n=0: chip selected
                         CMD_RD,     // {act_n, ras_n, cas_n, we_n} = READ
-                        cmd_odt,    // ODT (always 0 during training)
+                        cmd_odt[READ_SLOT], // ODT (always 0 during training)
                         1'b1,       // CKE held high
                         1'b1,       // RESET_N held high
                         2'b00,      // BG[1:0] = 0 (don't-care for MPR)
@@ -2358,6 +2381,10 @@ module ddr4_controller #(
         $display("  Refresh loop period   = %0d ctrl (%0d ps)",
                  ps_to_cycles(tRP_ps) + ps_to_cycles(tRFC_ps) + REFRESH_TREFI_TIMER + 3,
                  (ps_to_cycles(tRP_ps) + ps_to_cycles(tRFC_ps) + REFRESH_TREFI_TIMER + 3)
+                 * CONTROLLER_CLK_PERIOD);
+        $display("  Refresh loop worst    = %0d ctrl (%0d ps, incl. PRE ALL hold)",
+                 ps_to_cycles(tRP_ps) + ps_to_cycles(tRFC_ps) + REFRESH_TREFI_TIMER + 3 + MAX_PRECHARGE_DELAY,
+                 (ps_to_cycles(tRP_ps) + ps_to_cycles(tRFC_ps) + REFRESH_TREFI_TIMER + 3 + MAX_PRECHARGE_DELAY)
                  * CONTROLLER_CLK_PERIOD);
 
         $display("-- Computed Delays (controller cycles)");

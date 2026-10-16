@@ -153,8 +153,10 @@ always @* begin
 end
 
 // ===================================================================
-// 2. CKE / ODT / RESET_N All-Phase Consistency
-// This implementation holds CKE/ODT/RESET_N equal across its four phases.
+// 2. CKE / RESET_N All-Phase Consistency
+// This implementation holds CKE/RESET_N equal across its four phases.
+// ODT is per phase (the write ODT window starts at WRITE_SLOT), so it is
+// checked separately below.
 // That is a controller scheduling choice, not a universal DFI requirement.
 // cmd_d is registered, so we check after at least one
 // sequential evaluation (f_past_valid) to avoid spurious induction
@@ -169,9 +171,6 @@ always @* begin
         assume(cmd_d[0][CMD_CKE] == cmd_d[1][CMD_CKE]);
         assume(cmd_d[1][CMD_CKE] == cmd_d[2][CMD_CKE]);
         assume(cmd_d[2][CMD_CKE] == cmd_d[3][CMD_CKE]);
-        assume(cmd_d[0][CMD_ODT] == cmd_d[1][CMD_ODT]);
-        assume(cmd_d[1][CMD_ODT] == cmd_d[2][CMD_ODT]);
-        assume(cmd_d[2][CMD_ODT] == cmd_d[3][CMD_ODT]);
         assume(cmd_d[0][CMD_RESET_N] == cmd_d[1][CMD_RESET_N]);
         assume(cmd_d[1][CMD_RESET_N] == cmd_d[2][CMD_RESET_N]);
         assume(cmd_d[2][CMD_RESET_N] == cmd_d[3][CMD_RESET_N]);
@@ -184,13 +183,23 @@ always @(posedge i_controller_clk) begin
         assert(o_dfi_cke[0] == o_dfi_cke[1]);
         assert(o_dfi_cke[1] == o_dfi_cke[2]);
         assert(o_dfi_cke[2] == o_dfi_cke[3]);
-        assert(o_dfi_odt[0] == o_dfi_odt[1]);
-        assert(o_dfi_odt[1] == o_dfi_odt[2]);
-        assert(o_dfi_odt[2] == o_dfi_odt[3]);
         assert(o_dfi_reset_n[0] == o_dfi_reset_n[1]);
         assert(o_dfi_reset_n[1] == o_dfi_reset_n[2]);
         assert(o_dfi_reset_n[2] == o_dfi_reset_n[3]);
     end
+end
+
+// Write ODT (JESD79-4D ODTH8): a WRITE is always issued with ODT high in
+// its own slot, and ODT is never high in a slot carrying a READ.
+always @* begin
+    if (i_rst_n && !cmd_d[WRITE_SLOT][CMD_CS_N]
+        && cmd_d[WRITE_SLOT][CMD_ACT_N] && !cmd_d[WRITE_SLOT][CMD_CAS_N]
+        && !cmd_d[WRITE_SLOT][CMD_WE_N])
+        assert(cmd_d[WRITE_SLOT][CMD_ODT]);
+    if (i_rst_n && !cmd_d[READ_SLOT][CMD_CS_N]
+        && cmd_d[READ_SLOT][CMD_ACT_N] && !cmd_d[READ_SLOT][CMD_CAS_N]
+        && cmd_d[READ_SLOT][CMD_WE_N])
+        assert(!cmd_d[READ_SLOT][CMD_ODT]);
 end
 
 // ===================================================================
